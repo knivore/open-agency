@@ -1,0 +1,15 @@
+id: sample-integration
+name: Sample Integration
+version: 0.1.0
+enabled: true
+module_root: integrations.sample_integration
+tool_modules:
+  - integrations.sample_integration.tools
+requirements_file: requirements.txt
+env:
+  - SAMPLE_API_KEY
+capabilities:
+  allow_network: false
+  allow_filesystem: false
+metadata:
+  owner: local

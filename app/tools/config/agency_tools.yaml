@@ -1,0 +1,371 @@
+agency.human.ask:
+  id: "agency.human.ask"
+  name: "ask_human"
+  display_name: "Ask Human"
+  description: "Ask the human operator a focused question when execution is blocked, approval context is missing, or the agent needs a decision that cannot be inferred safely. Use this for clarification, not for routine status updates. Required input: `query`, the exact question to show. Optional runtime inputs may include `process_id` and `timeout`. Output reports whether a response was received or the request timed out. Side effect: pauses automation while waiting for the human reply."
+  created_by: "agency"
+  owned_by: "agency"
+  parameters:
+    query:
+      mandatory: true
+      type: "string"
+      description: "Exact question to ask the human operator."
+    process_id:
+      mandatory: false
+      type: "string"
+      description: "Optional run or process channel used to route the question and reply."
+    timeout:
+      mandatory: false
+      type: "integer"
+      description: "Maximum number of seconds to wait for the human reply. Defaults to 60."
+
+agency.audio.transcribe:
+  id: "agency.audio.transcribe"
+  name: "transcribe_audio"
+  display_name: "Transcribe Audio"
+  description: "Transcribe recorded audio into text with OpenAI speech-to-text. Use this when an agent receives an audio file, voice-note chunk, or base64 audio payload and needs text before planning or tool use. Required input: exactly one of `file_path` or `audio_base64`. Optional inputs: `filename`, `model`, `language`, `prompt`, and `response_format`. Defaults to `whisper-1`, or `OPENAI_AUDIO_TRANSCRIPTION_MODEL` when configured. Side effect: sends audio to OpenAI for transcription."
+  created_by: "agency"
+  owned_by: "agency"
+  parameters:
+    file_path:
+      mandatory: false
+      type: "string"
+      description: "Path to a local audio file accessible to the backend."
+    audio_base64:
+      mandatory: false
+      type: "string"
+      description: "Base64 encoded audio bytes. Data URLs are accepted."
+    filename:
+      mandatory: false
+      type: "string"
+      description: "Filename to use when `audio_base64` is provided. Defaults to `audio.webm`."
+    model:
+      mandatory: false
+      type: "string"
+      description: "OpenAI speech-to-text model such as `whisper-1` or `gpt-4o-mini-transcribe`."
+    language:
+      mandatory: false
+      type: "string"
+      description: "Optional ISO-639-1 language hint such as `en`."
+    prompt:
+      mandatory: false
+      type: "string"
+      description: "Optional prompt or keyword list to guide transcription."
+    response_format:
+      mandatory: false
+      type: "string"
+      description: "Response format: `json`, `text`, or `verbose_json`. Defaults to `json`."
+
+agency.http.request:
+  id: "agency.http.request"
+  name: "send_http_request"
+  display_name: "Send HTTP Request"
+  description: "Send one HTTP request to an explicit URL when an agent needs to call an external API or webhook. Use this only for APIs that are expected by the workflow and whose domain is allowed by the tool security policy. Required inputs: `url` and `method`. Optional inputs: `headers`, `query_params`, `body`, and `verify_ssl`. Output includes the HTTP status code and parsed response body when JSON is returned. Side effect: performs a network call and may mutate external systems depending on the HTTP method."
+  created_by: "agency"
+  owned_by: "agency"
+  parameters:
+    url:
+      mandatory: true
+      type: "string"
+      description: "Absolute API endpoint URL to call."
+    method:
+      mandatory: true
+      type: "string"
+      description: "HTTP method such as GET, POST, PUT, PATCH, or DELETE."
+    headers:
+      mandatory: false
+      type: "object"
+      description: "Optional request headers. Do not embed secrets directly; use configured credentials where available."
+    query_params:
+      mandatory: false
+      type: "object"
+      description: "Optional query-string parameters."
+    body:
+      mandatory: false
+      type: "object"
+      description: "Optional JSON request body."
+    verify_ssl:
+      mandatory: false
+      type: "boolean"
+      description: "Whether TLS certificates should be verified. Defaults to true."
+
+agency.document.markdown-to-word:
+  id: "agency.document.markdown-to-word"
+  name: "convert_markdown_to_word"
+  display_name: "Convert Markdown to Word"
+  description: "Convert markdown text into a Word document and upload the generated `.docx` file to configured storage. Use this when the agent has final markdown content that should become a downloadable Word artifact. Required inputs: `markdown_text`, `filename`, and `img_directory`. Output is a storage location or error message. Side effect: writes a temporary document and uploads a file artifact."
+  created_by: "agency"
+  owned_by: "agency"
+  parameters:
+    markdown_text:
+      mandatory: true
+      type: "string"
+      description: "Markdown-formatted document body to convert."
+    filename:
+      mandatory: true
+      type: "string"
+      description: "Output Word filename, including `.docx` when desired."
+    img_directory:
+      mandatory: true
+      type: "string"
+      cloud_directory: true
+      input_type: "hidden"
+      description: "Storage directory or workflow artifact path for the generated document."
+
+agency.file.write-text:
+  id: "agency.file.write-text"
+  name: "write_text_file"
+  display_name: "Write Text File"
+  description: "Write or append text content to a file under an allowed base folder. Use this for workflow artifacts and controlled local text outputs, not for editing source code or credential files. Required inputs: `base_folder`, `content`, and `mode`. Optional input: `filename`; if omitted, the configured default filename is used. Output includes status, message, and full path. Side effect: creates or modifies a file and requires filesystem permission."
+  created_by: "agency"
+  owned_by: "agency"
+  parameters:
+    base_folder:
+      mandatory: true
+      type: "string"
+      description: "Allowed directory where the file will be written."
+    content:
+      mandatory: true
+      type: "string"
+      description: "Text content to write or append."
+    mode:
+      mandatory: true
+      type: "string"
+      description: "Write mode: `write` replaces the file, `append` adds to the end."
+    filename:
+      mandatory: false
+      type: "string"
+      description: "Optional file name under `base_folder`."
+
+agency.excel.write-image:
+  id: "agency.excel.write-image"
+  name: "excel_write_image"
+  display_name: "Excel Write Image"
+  description: "Embed one screenshot or image into an Excel worksheet for test evidence, visual reports, or audit artifacts. Required inputs: `sheet_name`, `excel_file_path`, `image_path`, and `serial_number`. Optional input: `header_title`. Output reports success or the specific workbook/sheet/file error. Side effect: modifies the target workbook while holding a file lock."
+  created_by: "agency"
+  owned_by: "agency"
+  parameters: {}
+
+agency.excel.write-json:
+  id: "agency.excel.write-json"
+  name: "excel_write_json"
+  display_name: "Excel Write JSON"
+  description: "Read a JSON file and write its keys and values into an Excel worksheet row for structured test or workflow output. Required inputs: `sheet_name`, `excel_file_path`, `json_file_path`, and `serial_number`. Output reports success or the specific JSON/workbook/sheet error. Side effect: modifies the target workbook while holding a file lock."
+  created_by: "agency"
+  owned_by: "agency"
+  parameters: {}
+
+agency.excel.write-text:
+  id: "agency.excel.write-text"
+  name: "excel_write_text"
+  display_name: "Excel Write Text"
+  description: "Read a text file and insert its content into an Excel worksheet row for test evidence, logs, or generated narrative output. Required inputs: `sheet_name`, `excel_file_path`, `text_file_path`, and `serial_number`. Optional input: `header_title`. Output reports success or the specific text/workbook/sheet error. Side effect: modifies the target workbook while holding a file lock."
+  created_by: "agency"
+  owned_by: "agency"
+  parameters: {}
+
+agency.browser.open:
+  id: "agency.browser.open"
+  name: "open_browser"
+  display_name: "Open Browser"
+  description: "Start or reuse a Playwright browser session and navigate to a URL. Use this before screenshot, click, type, select, scroll, extract, or verify browser tools. Optional inputs configure HTTP auth, user agent, browser type, mobile mode, locale, timezone, storage state, video recording, tracing, and extra headers. Output includes navigation status and browser artifacts. Side effect: creates browser session state and may load remote web content."
+  created_by: "agency"
+  owned_by: "agency"
+  parameters:
+    url:
+      mandatory: false
+      type: "string"
+      description: "URL to open. If omitted, the tool may initialize the browser without navigation."
+    http_credentials_username:
+      mandatory: false
+      type: "string"
+      description: "Optional HTTP basic-auth username."
+    http_credentials_password:
+      mandatory: false
+      type: "string"
+      description: "Optional HTTP basic-auth password."
+    user_agent:
+      mandatory: false
+      type: "string"
+      description: "Optional custom browser user agent."
+    browser_type:
+      mandatory: false
+      type: "string"
+      description: "Optional browser family to emulate, such as chrome, firefox, safari, or edge."
+    mobile:
+      mandatory: false
+      type: "boolean"
+      description: "Whether to use mobile viewport and user-agent behavior."
+    locale:
+      mandatory: false
+      type: "string"
+      description: "Optional browser locale, for example en-US."
+    timezone_id:
+      mandatory: false
+      type: "string"
+      description: "Optional browser timezone, for example Asia/Singapore."
+    storage_state_path:
+      mandatory: false
+      type: "string"
+      description: "Optional Playwright storage-state JSON file to preload cookies and local storage."
+    record_video:
+      mandatory: false
+      type: "boolean"
+      description: "Whether to record video artifacts for the session."
+    trace_mode:
+      mandatory: false
+      type: "string"
+      description: "Optional tracing mode such as off, on, or retain-on-failure."
+    extra_http_headers:
+      mandatory: false
+      type: "object"
+      description: "Optional extra HTTP headers sent with browser requests."
+    img_directory:
+      mandatory: true
+      type: "string"
+      cloud_directory: true
+      input_type: "hidden"
+      description: "Artifact directory for screenshots and browser outputs."
+
+agency.browser.screenshot:
+  id: "agency.browser.screenshot"
+  name: "take_screenshot"
+  display_name: "Take Screenshot"
+  description: "Capture a screenshot of the current browser page. Use this after opening or interacting with a page when the agent needs visual evidence or a page-state artifact. Optional input: `full_page_screenshot`. Output includes screenshot artifact metadata. Side effect: writes a screenshot artifact."
+  created_by: "agency"
+  owned_by: "agency"
+  parameters:
+    full_page_screenshot:
+      mandatory: false
+      type: "boolean"
+      description: "Whether to capture the full scrollable page instead of only the viewport."
+    img_directory:
+      mandatory: true
+      type: "string"
+      cloud_directory: true
+      input_type: "hidden"
+      description: "Artifact directory for the screenshot."
+
+agency.browser.analyze-screenshot:
+  id: "agency.browser.analyze-screenshot"
+  name: "analyze_screenshot"
+  display_name: "Analyze Screenshot"
+  description: "Capture the current page screenshot and ask the configured vision model to analyze whether the user's instruction or question can be resolved from the visual state. Required input: `text`, the instruction or question to analyze against the screenshot. Optional input: `full_page_screenshot`. Output includes model analysis and screenshot artifact metadata. Side effect: captures an image and may call a vision model."
+  created_by: "agency"
+  owned_by: "agency"
+  parameters:
+    text:
+      mandatory: true
+      type: "string"
+      description: "Instruction or question to answer from the current screenshot."
+    full_page_screenshot:
+      mandatory: false
+      type: "boolean"
+      description: "Whether to capture the full scrollable page."
+    img_directory:
+      mandatory: true
+      type: "string"
+      cloud_directory: true
+      input_type: "hidden"
+      description: "Artifact directory for the screenshot."
+
+agency.browser.extract-screenshot:
+  id: "agency.browser.extract-screenshot"
+  name: "extract_screenshot"
+  display_name: "Extract Screenshot"
+  description: "Capture the current page screenshot and ask the configured vision model to extract content requested by the agent. Required input: `text`, the extraction instruction. Optional input: `full_page_screenshot`. Output includes extracted content and screenshot artifact metadata. Side effect: captures an image and may call a vision model."
+  created_by: "agency"
+  owned_by: "agency"
+  parameters:
+    text:
+      mandatory: true
+      type: "string"
+      description: "Extraction instruction for the current screenshot."
+    full_page_screenshot:
+      mandatory: false
+      type: "boolean"
+      description: "Whether to capture the full scrollable page."
+    img_directory:
+      mandatory: true
+      type: "string"
+      cloud_directory: true
+      input_type: "hidden"
+      description: "Artifact directory for the screenshot."
+
+agency.browser.scroll:
+  id: "agency.browser.scroll"
+  name: "scroll_browser"
+  display_name: "Scroll Browser"
+  description: "Scroll the current browser page up or down. Use this when visible content is incomplete or the target element is likely off-screen. Required input: `scroll_direction`, such as `scroll down 2 times`. Optional input: `instruction` to describe the target area. Output reports the updated browser state. Side effect: changes page scroll position."
+  created_by: "agency"
+  owned_by: "agency"
+  parameters: {}
+
+agency.browser.click:
+  id: "agency.browser.click"
+  name: "click_browser"
+  display_name: "Click Browser"
+  description: "Click an element on the current page using a natural-language element description or sequence number. Use this for intentional browser interactions after opening the page and inspecting the current state. Required input: `instruction`. Optional input: `sequence_number`. Output reports the click result and updated state. Side effect: mutates browser/page state and may trigger navigation or external actions."
+  created_by: "agency"
+  owned_by: "agency"
+  parameters:
+    img_directory:
+      mandatory: true
+      type: "string"
+      cloud_directory: true
+      input_type: "hidden"
+      description: "Artifact directory for interaction screenshots."
+
+agency.browser.select-option:
+  id: "agency.browser.select-option"
+  name: "select_browser_option"
+  display_name: "Select Browser Option"
+  description: "Select an option from a dropdown on the current page using a natural-language dropdown and option description or sequence number. Required input: `instruction`. Optional input: `sequence_number`. Output reports the selection result. Side effect: mutates browser/page state and may trigger form changes."
+  created_by: "agency"
+  owned_by: "agency"
+  parameters:
+    img_directory:
+      mandatory: true
+      type: "string"
+      cloud_directory: true
+      input_type: "hidden"
+      description: "Artifact directory for interaction screenshots."
+
+agency.browser.type-text:
+  id: "agency.browser.type-text"
+  name: "type_in_browser"
+  display_name: "Type in Browser"
+  description: "Type text into an input field or textarea on the current page using a natural-language field description and quoted text. Required input: `instruction`. Optional input: `sequence_number`. Output reports the typing result. Side effect: mutates browser/page state and may enter sensitive data if the instruction includes it."
+  created_by: "agency"
+  owned_by: "agency"
+  parameters:
+    img_directory:
+      mandatory: true
+      type: "string"
+      cloud_directory: true
+      input_type: "hidden"
+      description: "Artifact directory for interaction screenshots."
+
+agency.browser.verify-content:
+  id: "agency.browser.verify-content"
+  name: "verify_browser_content"
+  display_name: "Verify Browser Content"
+  description: "Compare expected text or requirements against the current page content and return a score with reasoning. Use this after navigation or interactions to verify task completion. Required input: `text`, the expected content or verification instruction. Output includes score and reasoning. Side effect: read-only page inspection."
+  created_by: "agency"
+  owned_by: "agency"
+  parameters:
+    img_directory:
+      mandatory: true
+      type: "string"
+      cloud_directory: true
+      input_type: "hidden"
+      description: "Artifact directory for verification screenshots."
+
+agency.browser.close:
+  id: "agency.browser.close"
+  name: "close_browser"
+  display_name: "Close Browser"
+  description: "Terminate the current headless browser session and release browser resources. Use this when browser work is complete or a workflow needs to reset browser state. Input schema is empty. Output reports termination status. Side effect: closes browser state and invalidates the current page session."
+  created_by: "agency"
+  owned_by: "agency"
+  parameters: {}

@@ -1,0 +1,57 @@
+{
+  "@context": "https://agency.local/tool-contracts/v1",
+  "@type": "ToolContract",
+  "name": "agency.execution.events",
+  "version": "1.0",
+  "description": "Read canonical Agency execution events by execution_id through the contract layer.",
+  "inputs": {
+    "type": "object",
+    "properties": {
+      "execution_id": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Execution id whose events should be inspected."
+      },
+      "after_sequence": {
+        "type": "integer",
+        "minimum": 0,
+        "default": 0
+      },
+      "event_types": {
+        "type": ["array", "null"],
+        "items": { "type": "string" }
+      },
+      "agent_id": {
+        "type": ["string", "null"]
+      },
+      "task_id": {
+        "type": ["string", "null"]
+      },
+      "limit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 1000,
+        "default": 200
+      }
+    },
+    "required": ["execution_id"],
+    "additionalProperties": false
+  },
+  "outputs": {
+    "type": "object",
+    "properties": {
+      "verdict": { "type": "string", "enum": ["ok", "warn", "deny"] },
+      "policyVerdict": { "type": ["object", "null"] },
+      "result": { "type": ["object", "null"], "additionalProperties": true },
+      "patch": { "type": ["string", "null"] },
+      "filesChanged": { "type": "array", "items": { "type": "object" } },
+      "errors": { "type": "array", "items": { "type": "string" } },
+      "dryRun": { "type": "boolean" },
+      "timestamp": { "type": "string" },
+      "actor": { "type": ["string", "null"] },
+      "signature": { "type": ["string", "null"] }
+    },
+    "required": ["verdict", "dryRun", "timestamp"],
+    "additionalProperties": false
+  }
+}

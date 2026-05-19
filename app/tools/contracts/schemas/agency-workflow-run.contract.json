@@ -1,0 +1,70 @@
+{
+  "@context": "https://agency.local/tool-contracts/v1",
+  "@type": "ToolContract",
+  "name": "agency.workflow.run",
+  "version": "1.0",
+  "description": "Create and queue an Agency workflow execution through the contract runtime. Unprotected workflows execute directly; protected workflows create approval requests when conversation_id is supplied.",
+  "inputs": {
+    "type": "object",
+    "properties": {
+      "workflow_id": {
+        "type": "string",
+        "minLength": 1,
+        "description": "ID of the workflow to execute."
+      },
+      "input_payload": {
+        "type": "object",
+        "description": "Workflow input payload keyed by the workflow's expected inputs.",
+        "additionalProperties": true
+      },
+      "runtime_adapter_id": {
+        "type": ["string", "null"],
+        "description": "Optional runtime adapter override."
+      },
+      "conversation_id": {
+        "type": ["string", "null"],
+        "description": "Optional conversation id used to create an approval request for protected workflows."
+      },
+      "origin_message_id": {
+        "type": ["string", "null"],
+        "description": "Optional existing origin message id for the approval request."
+      }
+    },
+    "required": ["workflow_id"],
+    "additionalProperties": false
+  },
+  "outputs": {
+    "type": "object",
+    "properties": {
+      "verdict": { "type": "string", "enum": ["ok", "warn", "deny"] },
+      "policyVerdict": { "type": ["object", "null"] },
+      "result": {
+        "type": ["object", "null"],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": ["queued", "running", "completed", "failed", "cancelled", "approval_requested", "requires_approval_context", "error"]
+          },
+          "workflow_id": { "type": "string" },
+          "workflow_name": { "type": ["string", "null"] },
+          "execution_id": { "type": ["string", "null"] },
+          "execution_status": { "type": ["string", "null"] },
+          "execution": { "type": "object", "additionalProperties": true },
+          "approval_request": { "type": "object", "additionalProperties": true },
+          "assistant_message": { "type": "object", "additionalProperties": true },
+          "error": { "type": "string" }
+        },
+        "additionalProperties": true
+      },
+      "patch": { "type": ["string", "null"] },
+      "filesChanged": { "type": "array", "items": { "type": "object" } },
+      "errors": { "type": "array", "items": { "type": "string" } },
+      "dryRun": { "type": "boolean" },
+      "timestamp": { "type": "string" },
+      "actor": { "type": ["string", "null"] },
+      "signature": { "type": ["string", "null"] }
+    },
+    "required": ["verdict", "dryRun", "timestamp"],
+    "additionalProperties": false
+  }
+}

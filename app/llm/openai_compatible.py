@@ -1,0 +1,202 @@
+from __future__ import annotations
+
+import httpx
+import json
+import time
+from openai import OpenAI
+from typing import Any, Dict, Iterator, List, Optional
+
+from app.domain import ModelProfileDefinition
+from app.llm.base import ModelMessage, ModelResponse, ModelToolCall
+from app.llm.registry import LLMEnvironmentConfig
+
+
+class OpenAICompatibleModelClient:
+    provider_key = "openai_compatible"
+
+    def __init__(self, profile: ModelProfileDefinition, env_config: LLMEnvironmentConfig):
+        self.profile = profile
+        self.env_config = env_config
+        self.base_url = profile.base_url or env_config.local_openai_base_url
+        self.api_key = profile.api_key_ref or env_config.openai_api_key or env_config.local_openai_api_key or "not-required"
+        self.client = OpenAI(base_url=self.base_url, api_key=self.api_key)
+
+    def _to_openai_messages(self, messages: List[ModelMessage]) -> List[Dict[str, Any]]:
+        payload = []
+        for message in messages:
+            item: Dict[str, Any] = {
+                "role": message.role,
+                "content": message.content,
+            }
+            if message.name:
+                item["name"] = message.name
+            if message.tool_call_id:
+                item["tool_call_id"] = message.tool_call_id
+            payload.append(item)
+        return payload
+
+    def _build_response(self, response: Any, started_at: float) -> ModelResponse:
+        choice = response.choices[0].message if response.choices else None
+        tool_calls: List[ModelToolCall] = []
+        if choice and getattr(choice, "tool_calls", None):
+            for tool_call in choice.tool_calls:
+                arguments = tool_call.function.arguments
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except json.JSONDecodeError:
+                        arguments = {"raw": arguments}
+                tool_calls.append(
+                    ModelToolCall(
+                        id=tool_call.id,
+                        name=tool_call.function.name,
+                        arguments=arguments,
+                        raw=tool_call,
+                    )
+                )
+
+        usage = {}
+        if getattr(response, "usage", None):
+            usage = response.usage.model_dump() if hasattr(response.usage, "model_dump") else dict(response.usage)
+
+        content = choice.content if choice else None
+        return ModelResponse(
+            content=content,
+            tool_calls=tool_calls,
+            usage=usage,
+            raw_response=response,
+            provider=self.profile.provider,
+            model=self.profile.model,
+            latency_ms=(time.perf_counter() - started_at) * 1000,
+        )
+
+    def _chat_options(
+            self,
+            *,
+            temperature: Optional[float],
+            max_tokens: Optional[int],
+            stream: bool,
+            **kwargs: Any,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "model": self.profile.model,
+            "stream": stream,
+            **kwargs,
+        }
+        resolved_temperature = temperature if temperature is not None else self.profile.temperature
+        resolved_max_tokens = max_tokens if max_tokens is not None else self.profile.max_tokens
+        if resolved_temperature is not None and not self.profile.model.startswith("gpt-5"):
+            payload["temperature"] = resolved_temperature
+        if resolved_max_tokens is not None:
+            payload["max_tokens"] = resolved_max_tokens
+        return payload
+
+    def generate_text(
+            self,
+            messages: List[ModelMessage],
+            *,
+            temperature: Optional[float] = None,
+            max_tokens: Optional[int] = None,
+            **kwargs: Any,
+    ) -> ModelResponse:
+        started_at = time.perf_counter()
+        response = self.client.chat.completions.create(
+            messages=self._to_openai_messages(messages),
+            **self._chat_options(
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=False,
+                **kwargs,
+            ),
+        )
+        return self._build_response(response, started_at)
+
+    def generate_structured(
+            self,
+            messages: List[ModelMessage],
+            *,
+            schema: Dict[str, Any],
+            temperature: Optional[float] = None,
+            max_tokens: Optional[int] = None,
+            **kwargs: Any,
+    ) -> ModelResponse:
+        started_at = time.perf_counter()
+        response = self.client.chat.completions.create(
+            messages=self._to_openai_messages(messages),
+            **self._chat_options(
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=False,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": kwargs.pop("schema_name", "structured_output"),
+                        "schema": schema,
+                    },
+                },
+                **kwargs,
+            ),
+        )
+        model_response = self._build_response(response, started_at)
+        if isinstance(model_response.content, str):
+            try:
+                model_response.content = json.loads(model_response.content)
+            except json.JSONDecodeError:
+                pass
+        return model_response
+
+    def stream_text(
+            self,
+            messages: List[ModelMessage],
+            *,
+            temperature: Optional[float] = None,
+            max_tokens: Optional[int] = None,
+            **kwargs: Any,
+    ) -> Iterator[str]:
+        stream = self.client.chat.completions.create(
+            messages=self._to_openai_messages(messages),
+            **self._chat_options(
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+                **kwargs,
+            ),
+        )
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            content = getattr(delta, "content", None)
+            if content:
+                yield content
+
+    def count_tokens(self, messages: List[ModelMessage], **kwargs: Any) -> Optional[int]:
+        return None
+
+    def embed_texts(self, texts: List[str], **kwargs: Any) -> List[List[float]]:
+        payload: Dict[str, Any] = {
+            "model": kwargs.get("model") or self.profile.model,
+            "input": texts,
+        }
+        dimensions = kwargs.get("dimensions") or self.profile.parameters.get("embedding_dimensions")
+        if dimensions is not None:
+            payload["dimensions"] = dimensions
+        response = self.client.embeddings.create(**payload)
+        return [list(item.embedding) for item in response.data]
+
+    def health_check(self) -> Dict[str, Any]:
+        if not self.base_url:
+            return {"ok": False, "provider": self.profile.provider, "error": "base_url is not configured"}
+
+        url = self.base_url.rstrip("/") + "/models"
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                response = client.get(url, headers={"Authorization": f"Bearer {self.api_key}"})
+            return {
+                "ok": response.status_code < 500,
+                "provider": self.profile.provider,
+                "base_url": self.base_url,
+                "status_code": response.status_code,
+            }
+        except Exception as exc:
+            return {"ok": False, "provider": self.profile.provider, "base_url": self.base_url, "error": str(exc)}

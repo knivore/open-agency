@@ -1,0 +1,82 @@
+{
+  "@context": "https://agency.local/tool-contracts/v1",
+  "@type": "ToolContract",
+  "name": "agency.document.markdown-to-word",
+  "version": "1.0",
+  "description": "Convert markdown text into a Word document and upload it through the Agency storage abstraction using the policy/runtime layer.",
+  "inputs": {
+    "type": "object",
+    "properties": {
+      "markdown_text": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Markdown-formatted document body to convert."
+      },
+      "filename": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Safe output Word filename, normally ending in .docx."
+      },
+      "img_directory": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Artifact or storage directory for the generated document."
+      },
+      "process_id": {
+        "type": ["string", "null"],
+        "description": "Optional process/run id used by storage path generation."
+      },
+      "run_by": {
+        "type": ["string", "null"],
+        "description": "Optional user or actor id used by storage path generation."
+      }
+    },
+    "required": ["markdown_text", "filename", "img_directory"],
+    "additionalProperties": false
+  },
+  "outputs": {
+    "type": "object",
+    "properties": {
+      "verdict": {
+        "type": "string",
+        "enum": ["ok", "warn", "deny"]
+      },
+      "policyVerdict": {
+        "type": ["object", "null"]
+      },
+      "result": {
+        "type": ["object", "null"],
+        "additionalProperties": true
+      },
+      "patch": {
+        "type": ["string", "null"]
+      },
+      "filesChanged": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      },
+      "errors": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "dryRun": {
+        "type": "boolean"
+      },
+      "timestamp": {
+        "type": "string"
+      },
+      "actor": {
+        "type": ["string", "null"]
+      },
+      "signature": {
+        "type": ["string", "null"]
+      }
+    },
+    "required": ["verdict", "dryRun", "timestamp"],
+    "additionalProperties": false
+  }
+}

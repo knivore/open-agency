@@ -1,0 +1,88 @@
+{
+  "@context": "https://agency.local/tool-contracts/v1",
+  "@type": "ToolContract",
+  "name": "agency.file.write-text",
+  "version": "1.0",
+  "description": "Write or append text content to an allowlisted local file path through the Agency policy/runtime layer.",
+  "inputs": {
+    "type": "object",
+    "properties": {
+      "base_folder": {
+        "type": "string",
+        "description": "Allowlisted base directory where the file will be written."
+      },
+      "filename": {
+        "type": "string",
+        "description": "File name or relative path under base_folder."
+      },
+      "content": {
+        "type": "string",
+        "description": "Text content to write or append."
+      },
+      "mode": {
+        "type": "string",
+        "enum": ["write", "append"],
+        "description": "write replaces the file; append adds to the end."
+      }
+    },
+    "required": ["base_folder", "filename", "content", "mode"],
+    "additionalProperties": false
+  },
+  "outputs": {
+    "type": "object",
+    "properties": {
+      "verdict": {
+        "type": "string",
+        "enum": ["ok", "warn", "deny"]
+      },
+      "policyVerdict": {
+        "type": ["object", "null"]
+      },
+      "result": {
+        "type": ["object", "null"],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": ["success"]
+          },
+          "message": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "patch": {
+        "type": ["string", "null"]
+      },
+      "filesChanged": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      },
+      "errors": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "dryRun": {
+        "type": "boolean"
+      },
+      "timestamp": {
+        "type": "string"
+      },
+      "actor": {
+        "type": ["string", "null"]
+      },
+      "signature": {
+        "type": ["string", "null"]
+      }
+    },
+    "required": ["verdict", "dryRun", "timestamp"],
+    "additionalProperties": false
+  }
+}

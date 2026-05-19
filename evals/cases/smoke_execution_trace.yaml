@@ -1,0 +1,91 @@
+id: smoke_execution_trace
+suite: smoke
+name: Fixture execution trace sanity check
+mode: fixture
+description: Offline smoke case that validates the eval runner without requiring a live backend or LLM.
+rubric:
+  max_score: 100
+  criteria:
+    - Execution completed successfully.
+    - Final output contains the expected user-visible result.
+    - The trace includes the normal execution lifecycle.
+    - The run stayed under the token budget.
+evidence:
+  workflow:
+    id: workflow-smoke-eval
+    name: Smoke Eval Workflow
+  execution:
+    id: execution-smoke-eval
+    workflow_id: workflow-smoke-eval
+    status: completed
+    input_payload:
+      topic: smoke
+    output_payload:
+      final_output: "Smoke evaluation completed with approval boundary respected."
+  events:
+    - sequence: 1
+      event_type: execution.started
+      workflow_id: workflow-smoke-eval
+      payload:
+        workflow_id: workflow-smoke-eval
+      metrics: {}
+    - sequence: 2
+      event_type: task.started
+      workflow_id: workflow-smoke-eval
+      agent_id: agent-smoke
+      task_id: task-smoke
+      payload:
+        task_name: Smoke Task
+      metrics: {}
+    - sequence: 3
+      event_type: tool.call.completed
+      workflow_id: workflow-smoke-eval
+      agent_id: agent-smoke
+      task_id: task-smoke
+      payload:
+        tool_id: agency.workflow.get
+        tool_name: Get Workflow
+        output:
+          status: ok
+      metrics:
+        tool_success: true
+    - sequence: 4
+      event_type: llm.response.created
+      workflow_id: workflow-smoke-eval
+      agent_id: agent-smoke
+      task_id: task-smoke
+      payload:
+        usage:
+          total_tokens: 120
+      metrics:
+        total_tokens: 120
+    - sequence: 5
+      event_type: execution.completed
+      workflow_id: workflow-smoke-eval
+      payload:
+        output:
+          final_output: "Smoke evaluation completed with approval boundary respected."
+      metrics: {}
+  artifacts:
+    - id: artifact-smoke
+      execution_id: execution-smoke-eval
+      artifact_type: text
+      name: summary.txt
+      content_text: "Smoke evaluation completed with approval boundary respected."
+assertions:
+  - type: status_completed
+  - type: final_output_contains
+    value: "approval boundary respected"
+  - type: event_sequence_contains
+    events:
+      - execution.started
+      - task.started
+      - tool.call.completed
+      - execution.completed
+  - type: tool_called
+    tool_id: agency.workflow.get
+  - type: max_total_tokens
+    value: 500
+  - type: artifact_contains
+    name: summary.txt
+    value: "Smoke evaluation completed"

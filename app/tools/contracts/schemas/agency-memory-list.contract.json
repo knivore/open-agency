@@ -1,0 +1,43 @@
+{
+  "@context": "https://agency.local/tool-contracts/v1",
+  "@type": "ToolContract",
+  "name": "agency.memory.list",
+  "version": "1.0",
+  "description": "List durable memories visible to the current authenticated actor through the Agency memory service.",
+  "inputs": {
+    "type": "object",
+    "properties": {
+      "scope": {
+        "type": ["string", "null"],
+        "enum": ["user", "workspace", "conversation", "workflow", "global", null]
+      },
+      "query": {
+        "type": ["string", "null"]
+      },
+      "limit": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 50,
+        "default": 20
+      }
+    },
+    "additionalProperties": false
+  },
+  "outputs": {
+    "type": "object",
+    "properties": {
+      "verdict": { "type": "string", "enum": ["ok", "warn", "deny"] },
+      "policyVerdict": { "type": ["object", "null"] },
+      "result": { "type": ["object", "null"], "additionalProperties": true },
+      "patch": { "type": ["string", "null"] },
+      "filesChanged": { "type": "array", "items": { "type": "object" } },
+      "errors": { "type": "array", "items": { "type": "string" } },
+      "dryRun": { "type": "boolean" },
+      "timestamp": { "type": "string" },
+      "actor": { "type": ["string", "null"] },
+      "signature": { "type": ["string", "null"] }
+    },
+    "required": ["verdict", "dryRun", "timestamp"],
+    "additionalProperties": false
+  }
+}

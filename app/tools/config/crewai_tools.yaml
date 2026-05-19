@@ -1,0 +1,100 @@
+#crewai.website-scraper:
+#  id: "crewai.website-scraper"
+#  name: "Scrape Website Tool"
+#  description: "A tool that can be used to read website content."
+#  created_by: "CrewAI"
+#  owned_by: "agency"
+#  parameters:
+#    website_url:
+#      mandatory: false
+
+#crewai.file-read:
+#  id: "crewai.file-read"
+#  name: "File Read Tool"
+#  description: "A tool that can be used to read a file's content."
+#  created_by: "CrewAI"
+#  owned_by: "agency"
+#  parameters:
+#    file_path:
+#      mandatory: true
+#      file_upload: true
+#
+#crewai.directory-search:
+#  id: "crewai.directory-search"
+#  name: "Directory Search Tool"
+#  description: "A tool that can be used to semantic search a query from a directory's content."
+#  created_by: "CrewAI"
+#  owned_by: "agency"
+#  parameters:
+#    directory:
+#      mandatory: false
+#
+#crewai.directory-read:
+#  id: "crewai.directory-read"
+#  name: "Directory Read Tool"
+#  description: "A tool to list the contents of the specified directory"
+#  created_by: "CrewAI"
+#  owned_by: "agency"
+#  parameters:
+#    directory_contents:
+#      mandatory: true
+#
+#crewai.csv-search:
+#  id: "crewai.csv-search"
+#  name: "CSV Search Tool"
+#  description: "A tool that can be used to semantic search a query from a CSV's content."
+#  created_by: "CrewAI"
+#  owned_by: "agency"
+#  parameters:
+#    csv:
+#      mandatory: true
+#      file_upload: true
+#      file_type: ".csv"
+#
+#crewai.docx-search:
+#  id: "crewai.docx-search"
+#  name: "DOCX Search Tool"
+#  description: "A tool that can be used to semantic search a query from a DOCX's content."
+#  created_by: "CrewAI"
+#  owned_by: "agency"
+#  parameters:
+#    docx:
+#      mandatory: true
+#      file_upload: true
+#      file_type: ".docx"
+#
+#crewai.json-search:
+#  id: "crewai.json-search"
+#  name: "JSON Search Tool"
+#  description: "A tool that can be used to semantic search a query from a JSON's content."
+#  created_by: "CrewAI"
+#  owned_by: "agency"
+#  parameters:
+#    json_path:
+#      mandatory: true
+#      file_upload: true
+#      file_type: ".json"
+#
+#crewai.pdf-search:
+#  id: "crewai.pdf-search"
+#  name: "PDF Search Tool"
+#  description: "A tool that can be used to semantic search a query from a PDF's content."
+#  created_by: "CrewAI"
+#  owned_by: "agency"
+#  parameters:
+#    pdf:
+#      mandatory: true
+#      file_upload: true
+#      file_type: ".pdf"
+#
+#crewai.txt-search:
+#  id: "crewai.txt-search"
+#  name: "TXT Search Tool"
+#  description: "A tool that can be used to semantic search a query from a TXT's content."
+#  created_by: "CrewAI"
+#  owned_by: "agency"
+#  parameters:
+#    txt:
+#      mandatory: true
+#      file_upload: true
+#      file_type: ".txt"

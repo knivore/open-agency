@@ -1,0 +1,32 @@
+{
+  "@context": "https://agency.local/tool-contracts/v1",
+  "@type": "ToolContract",
+  "name": "agency.memory.delete",
+  "version": "1.0",
+  "description": "Delete a durable memory through the Agency memory service, preserving ownership policy.",
+  "inputs": {
+    "type": "object",
+    "properties": {
+      "memory_id": { "type": "string", "minLength": 1 }
+    },
+    "required": ["memory_id"],
+    "additionalProperties": false
+  },
+  "outputs": {
+    "type": "object",
+    "properties": {
+      "verdict": { "type": "string", "enum": ["ok", "warn", "deny"] },
+      "policyVerdict": { "type": ["object", "null"] },
+      "result": { "type": ["object", "null"], "additionalProperties": true },
+      "patch": { "type": ["string", "null"] },
+      "filesChanged": { "type": "array", "items": { "type": "object" } },
+      "errors": { "type": "array", "items": { "type": "string" } },
+      "dryRun": { "type": "boolean" },
+      "timestamp": { "type": "string" },
+      "actor": { "type": ["string", "null"] },
+      "signature": { "type": ["string", "null"] }
+    },
+    "required": ["verdict", "dryRun", "timestamp"],
+    "additionalProperties": false
+  }
+}

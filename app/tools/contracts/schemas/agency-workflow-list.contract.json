@@ -1,0 +1,57 @@
+{
+  "@context": "https://agency.local/tool-contracts/v1",
+  "@type": "ToolContract",
+  "name": "agency.workflow.list",
+  "version": "1.0",
+  "description": "List workflow definitions visible to the Agency runtime through the contract layer.",
+  "inputs": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "outputs": {
+    "type": "object",
+    "properties": {
+      "verdict": {
+        "type": "string",
+        "enum": ["ok", "warn", "deny"]
+      },
+      "policyVerdict": {
+        "type": ["object", "null"]
+      },
+      "result": {
+        "type": ["object", "null"],
+        "additionalProperties": true
+      },
+      "patch": {
+        "type": ["string", "null"]
+      },
+      "filesChanged": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      },
+      "errors": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "dryRun": {
+        "type": "boolean"
+      },
+      "timestamp": {
+        "type": "string"
+      },
+      "actor": {
+        "type": ["string", "null"]
+      },
+      "signature": {
+        "type": ["string", "null"]
+      }
+    },
+    "required": ["verdict", "dryRun", "timestamp"],
+    "additionalProperties": false
+  }
+}

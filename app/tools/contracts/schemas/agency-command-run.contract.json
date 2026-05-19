@@ -1,0 +1,119 @@
+{
+  "@context": "https://agency.local/tool-contracts/v1",
+  "@type": "ToolContract",
+  "name": "agency.command.run",
+  "version": "1.0",
+  "description": "Run one policy-mediated shell command through the Agency runtime. This preserves stdout, stderr, exit code, duration, truncation metadata, signed output, and execution-store records.",
+  "inputs": {
+    "type": "object",
+    "properties": {
+      "command": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Shell command or shell chain to run after policy checks."
+      },
+      "mode": {
+        "type": ["string", "null"],
+        "enum": ["auto", "bash", "sh", "zsh", "powershell", "pwsh", "cmd", null],
+        "default": "auto",
+        "description": "Shell mode. Use auto unless a specific shell is required."
+      },
+      "cwd": {
+        "type": ["string", "null"],
+        "description": "Optional working directory for the command."
+      },
+      "timeout_seconds": {
+        "type": ["integer", "null"],
+        "minimum": 1,
+        "maximum": 7200,
+        "description": "Optional timeout override in seconds."
+      }
+    },
+    "required": ["command"],
+    "additionalProperties": false
+  },
+  "outputs": {
+    "type": "object",
+    "properties": {
+      "verdict": {
+        "type": "string",
+        "enum": ["ok", "warn", "deny"]
+      },
+      "policyVerdict": {
+        "type": ["object", "null"]
+      },
+      "result": {
+        "type": ["object", "null"],
+        "properties": {
+          "status": {
+            "type": "string",
+            "description": "ok for exit code 0, error for non-zero exit."
+          },
+          "command": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "shell": {
+            "type": "string"
+          },
+          "stdout": {
+            "type": "string"
+          },
+          "stderr": {
+            "type": "string"
+          },
+          "returncode": {
+            "type": "integer"
+          },
+          "exit_code": {
+            "type": "integer"
+          },
+          "duration_ms": {
+            "type": "integer"
+          },
+          "output_text": {
+            "type": "string"
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "overflow_path": {
+            "type": ["string", "null"]
+          }
+        },
+        "additionalProperties": true
+      },
+      "patch": {
+        "type": ["string", "null"]
+      },
+      "filesChanged": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      },
+      "errors": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "dryRun": {
+        "type": "boolean"
+      },
+      "timestamp": {
+        "type": "string"
+      },
+      "actor": {
+        "type": ["string", "null"]
+      },
+      "signature": {
+        "type": ["string", "null"]
+      }
+    },
+    "required": ["verdict", "dryRun", "timestamp"],
+    "additionalProperties": false
+  }
+}

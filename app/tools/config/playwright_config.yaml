@@ -1,0 +1,18 @@
+headless: false
+browser: chromium
+viewport:
+  width: 1920
+  height: 1080
+full_page_screenshot: true
+timeout: 30000
+trace: retain-on-failure
+ignore_https_errors: true
+retry_times: 2
+record_video: false
+accept_downloads: true
+bypass_csp: true
+java_script_enabled: true
+locale: en-US
+timezone_id:
+slow_mo: 0
+launch_args: [ ]

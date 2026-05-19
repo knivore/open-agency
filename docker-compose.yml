@@ -1,0 +1,258 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    container_name: agency-backend
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      APP_ENV: development
+      REQUIRE_DATABASE: "true"
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/agency
+      DATABASE_HOST: postgres
+      DATABASE_PORT: "5432"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OBSERVABILITY_EXPORTERS: ${OBSERVABILITY_EXPORTERS:-jsonl}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-http://langfuse-web:3001}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      OTEL_SDK_DISABLED: "true"
+      BACKEND_RELOAD: ${BACKEND_RELOAD:-true}
+      WORKFLOW_SCHEDULER_ENABLED: ${WORKFLOW_SCHEDULER_ENABLED:-false}
+      WORKFLOW_SCHEDULER_INTERVAL_SECONDS: ${WORKFLOW_SCHEDULER_INTERVAL_SECONDS:-30}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      LLM_REQUEST_TIMEOUT_SECONDS: ${LLM_REQUEST_TIMEOUT_SECONDS:-180}
+      CODEX_CLI_TIMEOUT_SECONDS: ${CODEX_CLI_TIMEOUT_SECONDS:-600}
+      CODEX_HOME: /codex
+      CODEX_HOME_VOLUME: ${CODEX_HOME_VOLUME:-agency_codex_home}
+      CODEX_CLI_CWD: /workspace/agency
+      CODEX_CLI_SANDBOX: ${CODEX_CLI_SANDBOX:-danger-full-access}
+      EXECUTION_RUNTIME_BASE_IMAGE: ${EXECUTION_RUNTIME_BASE_IMAGE:-agency-backend:latest}
+      EXECUTION_CONTAINER_NETWORK: ${EXECUTION_CONTAINER_NETWORK:-agency_default}
+      EXECUTION_CONTAINER_WORKDIR: ${EXECUTION_CONTAINER_WORKDIR:-/app}
+      TZ: ${AGENCY_TIMEZONE:-Asia/Singapore}
+      MEMORY_DAILY_SUMMARY_TIMEZONE: ${MEMORY_DAILY_SUMMARY_TIMEZONE:-Asia/Singapore}
+      AGENCY_BACKEND_WORKSPACE: /workspace/agency
+      AGENCY_BACKEND_HOST_WORKSPACE: ${AGENCY_BACKEND_HOST_WORKSPACE:-${PWD}}
+      AGENCY_FRONTEND_WORKSPACE: /workspace/agency-fe
+      AGENCY_FRONTEND_HOST_WORKSPACE: ${AGENCY_FRONTEND_HOST_WORKSPACE:-${PWD}/../agency-fe}
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/workspace/agency
+      - ${AGENCY_FE_DIR:-../agency-fe}:/workspace/agency-fe
+      - ./app:/app/app
+      - ./alembic:/app/alembic
+      - ./scripts:/app/scripts
+      - ./alembic.ini:/app/alembic.ini
+      - ./docs:/app/docs
+      - codex_home:/codex
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  postgres:
+    build:
+      context: .
+      dockerfile: docker/postgres/Dockerfile
+    container_name: agency-postgres
+    environment:
+      POSTGRES_DB: agency
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d agency" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    build:
+      context: .
+      dockerfile: docker/redis/Dockerfile
+    container_name: agency-redis
+    ports:
+      - "${REDIS_HOST_PORT:-6380}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  langfuse-web:
+    image: docker.io/langfuse/langfuse:3
+    container_name: agency-langfuse-web
+    restart: unless-stopped
+    depends_on:
+      langfuse-worker:
+        condition: service_started
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+    environment: &langfuse-env
+      NEXTAUTH_URL: ${LANGFUSE_NEXTAUTH_URL:-http://localhost:3001}
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-change-me-langfuse-nextauth-secret}
+      DATABASE_URL: ${LANGFUSE_DATABASE_URL:-postgresql://postgres:postgres@langfuse-postgres:5432/postgres}
+      SALT: ${LANGFUSE_SALT:-change-me-langfuse-salt}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+      TELEMETRY_ENABLED: ${LANGFUSE_TELEMETRY_ENABLED:-false}
+      CLICKHOUSE_MIGRATION_URL: ${LANGFUSE_CLICKHOUSE_MIGRATION_URL:-clickhouse://langfuse-clickhouse:9000}
+      CLICKHOUSE_URL: ${LANGFUSE_CLICKHOUSE_URL:-http://langfuse-clickhouse:8123}
+      CLICKHOUSE_USER: ${LANGFUSE_CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-clickhouse}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_HOST: ${LANGFUSE_REDIS_HOST:-langfuse-redis}
+      REDIS_PORT: ${LANGFUSE_REDIS_PORT:-6379}
+      REDIS_AUTH: ${LANGFUSE_REDIS_AUTH:-change-me-langfuse-redis-password}
+      REDIS_TLS_ENABLED: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ${LANGFUSE_S3_EVENT_UPLOAD_BUCKET:-langfuse}
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: ${LANGFUSE_S3_EVENT_UPLOAD_REGION:-auto}
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_ACCESS_KEY_ID:-minio}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_SECRET_ACCESS_KEY:-change-me-langfuse-minio-password}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: ${LANGFUSE_S3_INTERNAL_ENDPOINT:-http://langfuse-minio:9000}
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: ${LANGFUSE_S3_EVENT_UPLOAD_PREFIX:-events/}
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: ${LANGFUSE_S3_MEDIA_UPLOAD_BUCKET:-langfuse}
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: ${LANGFUSE_S3_MEDIA_UPLOAD_REGION:-auto}
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_ACCESS_KEY_ID:-minio}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_SECRET_ACCESS_KEY:-change-me-langfuse-minio-password}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${LANGFUSE_S3_INTERNAL_ENDPOINT:-http://langfuse-minio:9000}
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: ${LANGFUSE_S3_MEDIA_UPLOAD_PREFIX:-media/}
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:-}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-}
+    ports:
+      - "3001:3001"
+
+  langfuse-worker:
+    image: docker.io/langfuse/langfuse-worker:3
+    container_name: agency-langfuse-worker
+    restart: unless-stopped
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+    environment:
+      <<: *langfuse-env
+
+  langfuse-clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:25.4
+    container_name: agency-langfuse-clickhouse
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: ${LANGFUSE_CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-clickhouse}
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: [ "CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:8123/ping || exit 1" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  langfuse-minio:
+    image: cgr.dev/chainguard/minio:latest
+    container_name: agency-langfuse-minio
+    restart: unless-stopped
+    entrypoint: sh
+    command:
+      - -c
+      - mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data
+    environment:
+      MINIO_ROOT_USER: ${LANGFUSE_S3_ACCESS_KEY_ID:-minio}
+      MINIO_ROOT_PASSWORD: ${LANGFUSE_S3_SECRET_ACCESS_KEY:-change-me-langfuse-minio-password}
+    ports:
+      - "9090:9000"
+      - "9091:9001"
+    volumes:
+      - langfuse_minio_data:/data
+    healthcheck:
+      test: [ "CMD", "mc", "ready", "local" ]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      start_period: 3s
+
+  langfuse-redis:
+    image: docker.io/redis:7
+    container_name: agency-langfuse-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --requirepass
+      - ${LANGFUSE_REDIS_AUTH:-change-me-langfuse-redis-password}
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - langfuse_redis_data:/data
+    healthcheck:
+      test: [ "CMD-SHELL", "redis-cli -a ${LANGFUSE_REDIS_AUTH:-change-me-langfuse-redis-password} ping | grep PONG" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  langfuse-postgres:
+    image: docker.io/postgres:17
+    container_name: agency-langfuse-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${LANGFUSE_POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${LANGFUSE_POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${LANGFUSE_POSTGRES_DB:-postgres}
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${LANGFUSE_POSTGRES_USER:-postgres} -d ${LANGFUSE_POSTGRES_DB:-postgres}" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  codex_home:
+  postgres_data:
+  redis_data:
+  langfuse_postgres_data:
+  langfuse_clickhouse_data:
+  langfuse_clickhouse_logs:
+  langfuse_minio_data:
+  langfuse_redis_data:

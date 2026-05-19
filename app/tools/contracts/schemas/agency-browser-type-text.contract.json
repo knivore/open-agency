@@ -1,0 +1,42 @@
+{
+  "@context": "https://agency.local/tool-contracts/v1",
+  "@type": "ToolContract",
+  "name": "agency.browser.type-text",
+  "version": "1.0",
+  "description": "Type text into an input element on the active browser page. Mutating browser actions are policy-mediated and warn unless actor is explicitly approved.",
+  "inputs": {
+    "type": "object",
+    "properties": {
+      "instruction": { "type": "string", "minLength": 1, "description": "Description of the input element and text to type." },
+      "sequence_number": { "type": ["integer", "null"], "description": "Optional sequence number of the input element." }
+    },
+    "required": ["instruction"],
+    "additionalProperties": false
+  },
+  "outputs": {
+    "type": "object",
+    "properties": {
+      "verdict": { "type": "string", "enum": ["ok", "warn", "deny"] },
+      "policyVerdict": { "type": ["object", "null"] },
+      "result": {
+        "type": ["object", "null"],
+        "properties": {
+          "status": { "type": "string", "enum": ["ok", "error"] },
+          "tool": { "type": "string", "const": "agency.browser.type-text" },
+          "output": {},
+          "error": { "type": "string" }
+        },
+        "additionalProperties": true
+      },
+      "patch": { "type": ["string", "null"] },
+      "filesChanged": { "type": "array", "items": { "type": "object" } },
+      "errors": { "type": "array", "items": { "type": "string" } },
+      "dryRun": { "type": "boolean" },
+      "timestamp": { "type": "string" },
+      "actor": { "type": ["string", "null"] },
+      "signature": { "type": ["string", "null"] }
+    },
+    "required": ["verdict", "dryRun", "timestamp"],
+    "additionalProperties": false
+  }
+}

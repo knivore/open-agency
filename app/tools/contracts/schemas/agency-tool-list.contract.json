@@ -1,0 +1,69 @@
+{
+  "@context": "https://agency.local/tool-contracts/v1",
+  "@type": "ToolContract",
+  "name": "agency.tool.list",
+  "version": "1.0",
+  "description": "List built-in Agency tool definitions through the contract runtime. This is read-only and does not execute tools.",
+  "inputs": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "outputs": {
+    "type": "object",
+    "properties": {
+      "verdict": {
+        "type": "string",
+        "enum": ["ok", "warn", "deny"]
+      },
+      "policyVerdict": {
+        "type": ["object", "null"]
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "count": {
+            "type": "integer"
+          }
+        },
+        "required": ["items", "count"],
+        "additionalProperties": false
+      },
+      "patch": {
+        "type": ["string", "null"]
+      },
+      "filesChanged": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      },
+      "errors": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "dryRun": {
+        "type": "boolean"
+      },
+      "timestamp": {
+        "type": "string"
+      },
+      "actor": {
+        "type": ["string", "null"]
+      },
+      "signature": {
+        "type": ["string", "null"]
+      }
+    },
+    "required": ["verdict", "result", "dryRun", "timestamp"],
+    "additionalProperties": false
+  }
+}

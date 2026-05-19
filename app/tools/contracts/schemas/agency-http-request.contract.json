@@ -1,0 +1,100 @@
+{
+  "@context": "https://agency.local/tool-contracts/v1",
+  "@type": "ToolContract",
+  "name": "agency.http.request",
+  "version": "1.0",
+  "description": "Send one policy-mediated HTTP request through the Agency runtime and return the status code plus parsed response payload.",
+  "inputs": {
+    "type": "object",
+    "properties": {
+      "url": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Absolute HTTP or HTTPS URL to call."
+      },
+      "method": {
+        "type": "string",
+        "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "get", "post", "put", "patch", "delete", "head", "options"],
+        "description": "HTTP method to use."
+      },
+      "headers": {
+        "type": ["object", "null"],
+        "additionalProperties": {
+          "type": "string"
+        },
+        "description": "Optional HTTP headers."
+      },
+      "query_params": {
+        "type": ["object", "null"],
+        "description": "Optional query-string parameters."
+      },
+      "body": {
+        "description": "Optional JSON request body."
+      },
+      "verify_ssl": {
+        "type": "boolean",
+        "default": true,
+        "description": "Whether TLS certificates should be verified."
+      }
+    },
+    "required": ["url", "method"],
+    "additionalProperties": false
+  },
+  "outputs": {
+    "type": "object",
+    "properties": {
+      "verdict": {
+        "type": "string",
+        "enum": ["ok", "warn", "deny"]
+      },
+      "policyVerdict": {
+        "type": ["object", "null"]
+      },
+      "result": {
+        "type": ["object", "null"],
+        "properties": {
+          "status_code": {
+            "type": "integer"
+          },
+          "response": {},
+          "method": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "patch": {
+        "type": ["string", "null"]
+      },
+      "filesChanged": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      },
+      "errors": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "dryRun": {
+        "type": "boolean"
+      },
+      "timestamp": {
+        "type": "string"
+      },
+      "actor": {
+        "type": ["string", "null"]
+      },
+      "signature": {
+        "type": ["string", "null"]
+      }
+    },
+    "required": ["verdict", "dryRun", "timestamp"],
+    "additionalProperties": false
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "@context": "https://agency.local/tool-contracts/v1",
+  "@type": "ToolContract",
+  "name": "agency.browser.screenshot",
+  "version": "1.0",
+  "description": "Capture a browser screenshot through the active browser session and return a signed structured result.",
+  "inputs": {
+    "type": "object",
+    "properties": {
+      "full_page_screenshot": { "type": "boolean", "default": false },
+      "img_directory": { "type": "string" }
+    },
+    "additionalProperties": false
+  },
+  "outputs": {
+    "type": "object",
+    "properties": {
+      "verdict": { "type": "string", "enum": ["ok", "warn", "deny"] },
+      "policyVerdict": { "type": ["object", "null"] },
+      "result": {
+        "type": ["object", "null"],
+        "properties": {
+          "status": { "type": "string", "enum": ["ok", "error"] },
+          "tool": { "type": "string", "const": "agency.browser.screenshot" },
+          "output": {},
+          "error": { "type": "string" }
+        },
+        "additionalProperties": true
+      },
+      "patch": { "type": ["string", "null"] },
+      "filesChanged": { "type": "array", "items": { "type": "object" } },
+      "errors": { "type": "array", "items": { "type": "string" } },
+      "dryRun": { "type": "boolean" },
+      "timestamp": { "type": "string" },
+      "actor": { "type": ["string", "null"] },
+      "signature": { "type": ["string", "null"] }
+    },
+    "required": ["verdict", "dryRun", "timestamp"],
+    "additionalProperties": false
+  }
+}

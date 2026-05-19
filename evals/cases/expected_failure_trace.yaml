@@ -1,0 +1,72 @@
+id: expected_failure_trace
+suite: smoke
+name: Expected runtime failure keeps diagnostic evidence
+mode: fixture
+description: Offline fixture that verifies failed executions can still be evaluated through deterministic evidence.
+rubric:
+  max_score: 100
+  criteria:
+    - Execution failed with a clear runtime error.
+    - Failure event preserved a diagnostic error payload.
+    - The trace shows that no post-failure write tool ran.
+evidence:
+  workflow:
+    id: workflow-expected-failure
+    name: Expected Failure Workflow
+  execution:
+    id: execution-expected-failure
+    workflow_id: workflow-expected-failure
+    status: failed
+    input_payload:
+      request: load missing artifact
+    output_payload:
+      final_output: "Execution failed because required artifact missing-input.csv was not found."
+    error: "required artifact missing-input.csv was not found"
+  events:
+    - sequence: 1
+      event_type: execution.started
+      workflow_id: workflow-expected-failure
+      payload:
+        workflow_id: workflow-expected-failure
+      metrics: {}
+    - sequence: 2
+      event_type: task.started
+      workflow_id: workflow-expected-failure
+      agent_id: agent-failure
+      task_id: task-failure
+      payload:
+        task_name: Load Artifact
+      metrics: {}
+    - sequence: 3
+      event_type: execution.failed
+      workflow_id: workflow-expected-failure
+      agent_id: agent-failure
+      task_id: task-failure
+      payload:
+        error: "required artifact missing-input.csv was not found"
+      metrics: {}
+  artifacts:
+    - id: artifact-failure-log
+      execution_id: execution-expected-failure
+      artifact_type: text
+      name: failure-log.txt
+      content_text: "Missing required artifact: missing-input.csv"
+assertions:
+  - type: status_equals
+    value: failed
+  - type: final_output_contains
+    value: "missing-input.csv"
+  - type: event_sequence_contains
+    events:
+      - execution.started
+      - task.started
+      - execution.failed
+  - type: event_contains
+    event_type: execution.failed
+    payload_path: error
+    value: "required artifact missing-input.csv was not found"
+  - type: tool_not_called
+    tool_id: agency.memory.write
+  - type: artifact_contains
+    name: failure-log.txt
+    value: "Missing required artifact"

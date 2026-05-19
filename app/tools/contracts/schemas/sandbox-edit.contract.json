@@ -1,0 +1,91 @@
+{
+  "@context": "https://agency.local/tool-contracts/v1",
+  "@type": "ToolContract",
+  "name": "sandbox-edit",
+  "version": "1.0",
+  "description": "Safely propose code changes in an allowed repository and return a structured dry-run patch response.",
+  "inputs": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Allowed local repository path to inspect or patch."
+      },
+      "ref": {
+        "type": "string",
+        "description": "Base git ref or branch for the proposed change."
+      },
+      "changes": {
+        "type": "array",
+        "description": "Unified diffs to apply relative to the repository root.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Repository-relative file path affected by the patch."
+            },
+            "patch": {
+              "type": "string",
+              "description": "Unified diff content for this file."
+            }
+          },
+          "required": ["path", "patch"],
+          "additionalProperties": false
+        },
+        "default": []
+      },
+      "dryRun": {
+        "type": "boolean",
+        "default": true,
+        "description": "When true, validate and preview without applying persistent changes."
+      }
+    },
+    "required": ["repo", "ref"],
+    "additionalProperties": false
+  },
+  "outputs": {
+    "type": "object",
+    "properties": {
+      "verdict": {
+        "type": "string",
+        "enum": ["ok", "warn", "deny"]
+      },
+      "policyVerdict": {
+        "type": ["object", "null"]
+      },
+      "result": {
+        "type": ["object", "null"]
+      },
+      "patch": {
+        "type": ["string", "null"]
+      },
+      "filesChanged": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      },
+      "errors": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "dryRun": {
+        "type": "boolean"
+      },
+      "timestamp": {
+        "type": "string"
+      },
+      "actor": {
+        "type": ["string", "null"]
+      },
+      "signature": {
+        "type": ["string", "null"]
+      }
+    },
+    "required": ["verdict", "dryRun", "timestamp"],
+    "additionalProperties": false
+  }
+}

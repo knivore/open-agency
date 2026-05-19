@@ -1,0 +1,16 @@
+.git
+.gitignore
+.idea
+.venv
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.db
+.DS_Store
+.env
+alembic/versions/__pycache__/
+app/__pycache__/
+docs/archive/
+logs/
+local_storage/
+tests/__pycache__/

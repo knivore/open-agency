@@ -1,0 +1,42 @@
+{
+  "@context": "https://agency.local/tool-contracts/v1",
+  "@type": "ToolContract",
+  "name": "agency.tool.propose-create",
+  "version": "1.0",
+  "description": "Propose creating a tool definition. Direct contract runs are context-bound and require conversation approval context.",
+  "inputs": {
+    "type": "object",
+    "properties": {
+      "summary": { "type": "string" },
+      "diff_summary": { "type": ["string", "null"] },
+      "tool": { "type": "object", "additionalProperties": true },
+      "conversation_id": {
+        "type": ["string", "null"],
+        "description": "Conversation id used to create and publish a real approval request."
+      },
+      "origin_message_id": {
+        "type": ["string", "null"],
+        "description": "Optional existing origin message id for the approval request."
+      }
+    },
+    "required": ["tool"],
+    "additionalProperties": false
+  },
+  "outputs": {
+    "type": "object",
+    "properties": {
+      "verdict": { "type": "string", "enum": ["ok", "warn", "deny"] },
+      "policyVerdict": { "type": ["object", "null"] },
+      "result": { "type": ["object", "null"], "additionalProperties": true },
+      "patch": { "type": ["string", "null"] },
+      "filesChanged": { "type": "array", "items": { "type": "object" } },
+      "errors": { "type": "array", "items": { "type": "string" } },
+      "dryRun": { "type": "boolean" },
+      "timestamp": { "type": "string" },
+      "actor": { "type": ["string", "null"] },
+      "signature": { "type": ["string", "null"] }
+    },
+    "required": ["verdict", "dryRun", "timestamp"],
+    "additionalProperties": false
+  }
+}
