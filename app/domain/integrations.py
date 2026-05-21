@@ -32,6 +32,20 @@ class ConnectorMetadataRequirementDefinition(DomainModel):
     description: str
 
 
+class ConnectorSetupGuideFieldDefinition(DomainModel):
+    key: str
+    label: str
+    secret: bool = True
+    description: str
+
+
+class ConnectorSetupGuideDefinition(DomainModel):
+    storagePath: str
+    fields: list[ConnectorSetupGuideFieldDefinition] = Field(default_factory=list)
+    agencyStores: list[str] = Field(default_factory=list)
+    completionSignal: str
+
+
 class ConnectorCapabilityDefinition(DomainModel):
     backendKey: str
     displayName: str
@@ -40,6 +54,7 @@ class ConnectorCapabilityDefinition(DomainModel):
     healthSupported: bool = False
     requiredMetadata: list[ConnectorMetadataRequirementDefinition] = Field(default_factory=list)
     supportedSecretRefSchemes: list[str] = Field(default_factory=list)
+    onecliSetupGuide: ConnectorSetupGuideDefinition | None = None
 
 
 class ConnectorCapabilitiesPayload(DomainModel):

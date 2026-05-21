@@ -40,6 +40,9 @@ start:
   Starts Postgres, Redis, and supporting containers; writes ../agency-fe/.env.local
   LAN proxy settings; applies migrations; runs agent setup; starts FastAPI on the
   host; and starts the frontend on 0.0.0.0.
+
+Environment:
+  AGENCY_REQUIRE_FRONTEND=true  Fail startup when the sibling frontend cannot be started.
 EOF
 }
 
@@ -459,6 +462,7 @@ run_agent_setup() {
 start_all() {
   local lan_host=""
   local python_bin=""
+  local frontend_started="true"
 
   ensure_run_dir
   cd "${ROOT_DIR}"
@@ -489,11 +493,22 @@ start_all() {
   run_agent_setup "${python_bin}"
 
   start_backend "${python_bin}"
-  start_frontend
+  if ! start_frontend; then
+    frontend_started="false"
+    echo "Warning: frontend startup did not complete." >&2
+    echo "Backend is running; fix frontend directory permissions and rerun start to launch the frontend." >&2
+    if [ "${AGENCY_REQUIRE_FRONTEND:-false}" = "true" ]; then
+      return 1
+    fi
+  fi
 
   echo
   echo "Agency is starting."
-  echo "Frontend: http://${lan_host}:${FRONTEND_PORT}"
+  if [ "${frontend_started}" = "true" ]; then
+    echo "Frontend: http://${lan_host}:${FRONTEND_PORT}"
+  else
+    echo "Frontend: skipped; see warning above"
+  fi
   echo "Backend:  http://127.0.0.1:${BACKEND_PORT}"
   echo "Logs:     ${RUN_DIR}"
 }

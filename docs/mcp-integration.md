@@ -13,7 +13,6 @@ executed through the same native tool path as any other tool.
 - `tool_adapter.py`: converts discovered MCP tools into `ToolDefinition`.
 - `resource_adapter.py`: normalizes discovered MCP resources.
 - `prompt_adapter.py`: normalizes discovered MCP prompts.
-- `server.py`: optional internal MCP exposure for tools where `tool.mcp_exposure.expose_as_mcp_tool = true`.
 - `schemas.py`: internal discovery descriptors for tools, resources, and prompts.
 
 ## Domain Model
@@ -73,11 +72,3 @@ This keeps MCP as an adapter layer, not a new execution model.
 - High-risk MCP tools are inferred from MCP annotations and metadata, and they default to `requires_approval = true`.
 - MCP tool calls are logged as normal `ExecutionEvent` records.
 - When `redaction_enabled` is set, event payloads are redacted using configured rules before logging.
-
-## Internal Exposure
-
-Internal tools can be exposed as MCP tools through `InternalMCPServer`, but only if:
-
-- `tool.mcp_exposure.expose_as_mcp_tool = true`
-
-This keeps MCP exposure explicit and opt-in.

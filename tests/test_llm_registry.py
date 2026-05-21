@@ -153,6 +153,7 @@ class ModelProviderRegistryTests(unittest.TestCase):
 
         self.assertEqual(result.content, "hello")
         self.assertEqual(post.call_args.kwargs["timeout"], 3.0)
+        self.assertIs(post.call_args.kwargs["trust_env"], False)
 
     @patch("app.llm.ollama.httpx.post")
     def test_ollama_generate_text_passes_thinking_flag(self, post):
@@ -171,6 +172,7 @@ class ModelProviderRegistryTests(unittest.TestCase):
 
         self.assertEqual(result.content, "hello")
         self.assertIs(post.call_args.kwargs["json"]["think"], False)
+        self.assertIs(post.call_args.kwargs["trust_env"], False)
 
 
 if __name__ == "__main__":

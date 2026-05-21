@@ -53,11 +53,19 @@ class IntegrationsRegistryApiTests(unittest.TestCase):
         self.assertEqual(telegram["displayName"], "Telegram")
         self.assertEqual(telegram["authModel"], "bot token")
         self.assertTrue(telegram["healthSupported"])
-        self.assertEqual(telegram["supportedSecretRefSchemes"], ["env://", "env:"])
+        self.assertEqual(telegram["supportedSecretRefSchemes"], ["onecli://", "env://", "env:"])
+        self.assertEqual(
+            telegram["onecliSetupGuide"]["storagePath"],
+            "onecli://users/{agency_user_id}/telegram-bot/default",
+        )
+        self.assertEqual(telegram["onecliSetupGuide"]["fields"][0]["key"], "bot_token")
+        self.assertTrue(telegram["onecliSetupGuide"]["fields"][0]["secret"])
+        self.assertIn("installation status", telegram["onecliSetupGuide"]["agencyStores"])
 
         whatsapp = payload["connectors"]["whatsapp-cloud-api"]
         self.assertEqual(whatsapp["requiredMetadata"][0]["key"], "phone_number_id")
         self.assertIn("phone_number_id", whatsapp["requiredMetadata"][0]["description"])
+        self.assertIn("active", whatsapp["onecliSetupGuide"]["completionSignal"])
 
 
 if __name__ == "__main__":

@@ -65,7 +65,6 @@ Main areas:
 
 - `main.py`
 - `context.py`
-- `dependencies.py`
 - `routes/`
 - `schemas/`
 
@@ -102,6 +101,14 @@ Main areas:
 - `validation.py`
 - `executors/`
 - `implementations/`
+
+Executor imports should resolve to the `app/tools/executors/` package. Do not add a sibling `app/tools/executors.py`
+compatibility file.
+
+## Migrations
+
+Schema migrations live in the top-level `alembic/` tree. Do not add a parallel empty `app/migrations` package unless it
+contains an actual app-owned migration workflow.
 
 ## app/llm
 

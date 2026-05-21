@@ -65,8 +65,6 @@ Core reference docs:
 Documentation state:
 
 - the active source of truth is `README.md` plus the current developer docs under `docs/`
-- TODO playbooks, archive snapshots, migration reports, and one-off implementation notes are intentionally excluded from
-  the maintained docs set
 - keep future docs focused on setup, architecture, API contracts, runtime behavior, persistence, tools/integrations, and
   testing
 
@@ -347,6 +345,9 @@ LAN_HOST=192.168.68.62 ./run.sh start
 ```
 
 The script writes `../agency-fe/.env.local` with backend proxy and local development settings.
+
+If the sibling frontend checkout is not writable, the Windows script keeps the backend running and prints a warning.
+Set `AGENCY_REQUIRE_FRONTEND=true` when you want startup to fail unless the frontend also launches successfully.
 
 Stop the LAN frontend and backend stack with the same script:
 

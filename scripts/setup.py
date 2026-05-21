@@ -147,6 +147,9 @@ async def _find_agent_by_name(context: ApiContext, name: str) -> AgentDefinition
 async def _find_codex_model_profile_id(context: ApiContext) -> str | None:
     profiles = await context.model_profile_repo.list()
     for profile in profiles:
+        if str(profile.provider or "").strip().lower().replace("_", "-") == "openai-codex":
+            return profile.id
+    for profile in profiles:
         haystack = " ".join(
             str(part or "")
             for part in [profile.id, profile.name, profile.provider, profile.model]
@@ -353,6 +356,15 @@ async def setup_embedding_agent(
     )
     saved_agent = await context.agent_repo.save(agent)
     return EmbeddingAgentSetupResult(provider=provider, model_profile=model_profile, agent=saved_agent)
+
+
+async def sync_embedding_agent_tool_access(context: ApiContext | None = None) -> AgentDefinition | None:
+    context = context or get_default_api_context()
+    existing = await _find_agent_by_name(context, EMBEDDING_DEFAULT_NAME)
+    if existing is None:
+        return None
+    synced = existing.model_copy(update={"tool_ids": []})
+    return await context.agent_repo.save(synced)
 
 
 def _agent_kind(agent: AgentDefinition) -> str:

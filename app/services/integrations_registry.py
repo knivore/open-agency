@@ -7,6 +7,8 @@ from app.domain import (
     ConnectorCapabilitiesPayload,
     ConnectorCapabilityDefinition,
     ConnectorMetadataRequirementDefinition,
+    ConnectorSetupGuideDefinition,
+    ConnectorSetupGuideFieldDefinition,
     IntegrationRegistryCategoryDefinition,
     IntegrationRegistryPayload,
     PlannedIntegrationDefinition,
@@ -14,6 +16,75 @@ from app.domain import (
 from app.integrations import get_connector_definition
 
 REGISTRY_UPDATED_AT = datetime(2026, 5, 7, 0, 0, tzinfo=UTC)
+
+
+def _setup_guide(provider: str, auth_model: str) -> ConnectorSetupGuideDefinition:
+    fields_by_provider: dict[str, list[ConnectorSetupGuideFieldDefinition]] = {
+        "telegram-bot": [
+            ConnectorSetupGuideFieldDefinition(
+                key="bot_token",
+                label="Bot token",
+                secret=True,
+                description="Paste the Telegram Bot API token from BotFather into OneCLI.",
+            ),
+        ],
+        "discord-bot": [
+            ConnectorSetupGuideFieldDefinition(
+                key="bot_token",
+                label="Bot token",
+                secret=True,
+                description="Paste the Discord bot token from the application bot settings into OneCLI.",
+            ),
+        ],
+        "whatsapp-cloud-api": [
+            ConnectorSetupGuideFieldDefinition(
+                key="access_token",
+                label="Access token",
+                secret=True,
+                description="Paste the Meta WhatsApp Cloud API access token into OneCLI.",
+            ),
+            ConnectorSetupGuideFieldDefinition(
+                key="phone_number_id",
+                label="Phone number id",
+                secret=False,
+                description="Store the delivery phone number id as Agency metadata.",
+            ),
+        ],
+    }
+    default_secret_label = {
+        "api key": "API key",
+        "access key": "Access key",
+        "access token": "Access token",
+        "bot token": "Bot token",
+        "oauth": "OAuth token set",
+    }.get(auth_model.lower(), "Credential")
+    fields = fields_by_provider.get(
+        provider,
+        [
+            ConnectorSetupGuideFieldDefinition(
+                key=default_secret_label.lower().replace(" ", "_"),
+                label=default_secret_label,
+                secret=auth_model.lower() != "public api",
+                description=f"Store the {auth_model} credential in OneCLI for this connector.",
+            )
+        ],
+    )
+    return ConnectorSetupGuideDefinition(
+        storagePath=f"onecli://users/{{agency_user_id}}/{provider}/default",
+        fields=fields,
+        agencyStores=[
+            "installation id",
+            "provider key",
+            "display name",
+            "onecli credential ref",
+            "non-secret metadata",
+            "installation status",
+        ],
+        completionSignal=(
+            "OneCLI completes the Agency installation with only the onecli:// credential ref "
+            "and non-secret metadata; Agency then marks the installation active."
+        ),
+    )
 
 
 @dataclass(slots=True)
@@ -24,7 +95,7 @@ class IntegrationsRegistryService:
                 IntegrationRegistryCategoryDefinition(
                     id="communications",
                     name="Communications",
-                    description="Messaging, chat, and email connectors staged while connector-specific CRUD and health flows are rolled out.",
+                    description="Messaging, chat, and email connectors that can be connected through Agency-owned OneCLI setup sessions.",
                     providers={
                         "Telegram": PlannedIntegrationDefinition(
                             backendKey="telegram-bot",
@@ -87,7 +158,7 @@ class IntegrationsRegistryService:
                 IntegrationRegistryCategoryDefinition(
                     id="productivity",
                     name="Productivity",
-                    description="Work management and office-suite connectors that need backend route groups and credential lifecycle support.",
+                    description="Work management and office-suite connectors available for Agency-owned OneCLI credential setup.",
                     providers={
                         "Notion": PlannedIntegrationDefinition(
                             backendKey="notion",
@@ -143,7 +214,7 @@ class IntegrationsRegistryService:
                 IntegrationRegistryCategoryDefinition(
                     id="developer",
                     name="Developer",
-                    description="Engineering-facing connectors planned after the backend exposes credentialed provider route groups beyond tools and MCP servers.",
+                    description="Engineering-facing connectors available for Agency-owned OneCLI credential setup.",
                     providers={
                         "GitHub": PlannedIntegrationDefinition(
                             backendKey="github",
@@ -178,7 +249,7 @@ class IntegrationsRegistryService:
                 IntegrationRegistryCategoryDefinition(
                     id="media-creative",
                     name="Media & Creative",
-                    description="Creative and publishing connectors that remain backend-visible as planned metadata until dedicated connector operations exist.",
+                    description="Creative and publishing connectors available for Agency-owned OneCLI credential setup.",
                     providers={
                         "Figma": PlannedIntegrationDefinition(
                             backendKey="figma",
@@ -213,7 +284,7 @@ class IntegrationsRegistryService:
                 IntegrationRegistryCategoryDefinition(
                     id="search-knowledge",
                     name="Search / Knowledge",
-                    description="Retrieval and external knowledge connectors planned outside the current tool and MCP server route groups.",
+                    description="Retrieval and external knowledge connectors available for Agency-owned OneCLI credential setup.",
                     providers={
                         "Perplexity": PlannedIntegrationDefinition(
                             backendKey="perplexity",
@@ -240,7 +311,7 @@ class IntegrationsRegistryService:
                 IntegrationRegistryCategoryDefinition(
                     id="storage",
                     name="Storage",
-                    description="File and object-store connectors that need backend credential and file-operation routes before they become configurable.",
+                    description="File and object-store connectors available for Agency-owned OneCLI credential setup.",
                     providers={
                         "S3": PlannedIntegrationDefinition(
                             backendKey="s3",
@@ -301,6 +372,7 @@ class IntegrationsRegistryService:
                         )
                         for requirement in (definition.required_metadata if definition else ())
                     ],
-                    supportedSecretRefSchemes=["env://", "env:"],
+                    supportedSecretRefSchemes=["onecli://", "env://", "env:"],
+                    onecliSetupGuide=_setup_guide(planned.backendKey, planned.authModel),
                 )
         return ConnectorCapabilitiesPayload(connectors=connectors, updated_at=REGISTRY_UPDATED_AT)

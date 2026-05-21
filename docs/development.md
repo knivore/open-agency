@@ -101,3 +101,8 @@ Important boundaries:
 Use browser tools when the task is clearly webpage-centric and DOM/browser semantics matter.
 Use Computer Use when the task is desktop-native, cross-application, OS-dialog-driven, or otherwise not well represented
 as a browser session.
+
+## Cleanup Boundaries
+
+- Tool executor code belongs under `app/tools/executors/`; avoid restoring a sibling `app/tools/executors.py` shim.
+- Database schema migrations belong under `alembic/`; avoid adding empty placeholder migration packages under `app/`.

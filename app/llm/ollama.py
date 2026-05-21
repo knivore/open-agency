@@ -96,6 +96,7 @@ class OllamaModelClient:
                 format_schema=format_schema,
             ),
             timeout=self.timeout_seconds,
+            trust_env=False,
         )
         response.raise_for_status()
         data = response.json()
@@ -147,6 +148,7 @@ class OllamaModelClient:
                 self.base_url.rstrip("/") + "/api/chat",
                 json=self._payload(messages, temperature=temperature, max_tokens=max_tokens, stream=True),
                 timeout=self.timeout_seconds,
+                trust_env=False,
         ) as response:
             response.raise_for_status()
             for line in response.iter_lines():

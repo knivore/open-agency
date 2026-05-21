@@ -948,9 +948,9 @@ class ConversationService:
         create_request = self._workflow_create_proposal_payload(origin_message)
         update_request = self._workflow_update_proposal_payload(origin_message)
         if infer_plain_text and create_request is None and update_request is None:
-            update_request = await self._workflow_update_request_from_plain_text(origin_message)
-        if infer_plain_text and create_request is None and update_request is None:
             create_request = self._workflow_create_request_from_plain_text(origin_message)
+        if infer_plain_text and create_request is None and update_request is None:
+            update_request = await self._workflow_update_request_from_plain_text(origin_message)
         if create_request is None and update_request is None:
             return None
 
@@ -2056,6 +2056,21 @@ class ConversationService:
         )
         if outcome.get("assistant_message") is not None:
             return outcome
+        latest_user_message = next(
+            (item for item in reversed(history) if item.role == ConversationRole.USER and item.plain_text),
+            None,
+        )
+        if latest_user_message is not None:
+            create_request = self._workflow_create_request_from_plain_text(latest_user_message)
+            if create_request is not None:
+                proposal = await self._create_workflow_create_proposal(
+                    profile=profile,
+                    conversation_id=conversation_id,
+                    origin_message_id=latest_user_message.id,
+                    request=create_request,
+                )
+                if proposal.get("approval_request") is not None:
+                    return proposal
         text = outcome.get("text") or self._fallback_reply("How can I help?")
         metadata = {"profile_id": profile.id, "delivery": "direct"}
         if isinstance(outcome.get("metadata"), dict):
