@@ -1,0 +1,78 @@
+id: persona_personal_sensitive
+suite: persona_distillation
+name: Persona personal sensitive extraction
+mode: persona_distillation_fixture
+description: Checks personal persona extraction with review-heavy guardrails.
+persona_distillation:
+  source_memories:
+    - id: sensitive-style-note
+      title: Sensitive coaching note
+      content: |
+        The user asks for a direct caring style in coaching conversations.
+        The source does not state private medical, family, or emotional facts.
+        No unsupported private facts should be inferred from this note.
+      tags: ["persona-live-eval", "sensitive", "guardrail"]
+  expected_items:
+    - id: caring_style
+      item_type: writing_style
+      memory_layer: persona
+      content_keywords: ["direct caring style"]
+      evidence: "direct caring style"
+    - id: private_fact_guardrail
+      item_type: guardrail
+      memory_layer: persona
+      content_keywords: ["no unsupported private facts"]
+      evidence: "No unsupported private facts"
+  results:
+    deterministic:
+      items:
+        - title: Caring style
+          content: "Use a direct caring style."
+          item_type: writing_style
+          memory_layer: persona
+          source_evidence: "direct caring style"
+          evidence_verified: true
+      metrics: {latency_ms: 6, cost_usd: 0.0}
+    llm:
+      items:
+        - title: Direct caring style
+          content: "Use a direct caring style."
+          item_type: writing_style
+          memory_layer: persona
+          source_evidence: "direct caring style"
+          evidence_verified: true
+          needs_review: true
+        - title: No unsupported private facts
+          content: "No unsupported private facts."
+          item_type: guardrail
+          memory_layer: persona
+          source_evidence: "No unsupported private facts"
+          evidence_verified: true
+          needs_review: true
+      metrics: {latency_ms: 121, cost_usd: 0.016}
+    hybrid:
+      items:
+        - title: Direct caring style
+          content: "Use a direct caring style."
+          item_type: writing_style
+          memory_layer: persona
+          source_evidence: "direct caring style"
+          evidence_verified: true
+          needs_review: true
+        - title: No unsupported private facts
+          content: "No unsupported private facts."
+          item_type: guardrail
+          memory_layer: persona
+          source_evidence: "No unsupported private facts"
+          evidence_verified: true
+          needs_review: true
+      metrics: {latency_ms: 128, cost_usd: 0.016}
+assertions:
+  - type: persona_metric_min
+    mode: hybrid
+    metric: recall
+    value: 1.0
+  - type: persona_metric_max
+    mode: hybrid
+    metric: review_burden
+    value: 1.0

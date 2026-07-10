@@ -1,3 +1,11 @@
+"""Docker container manager for isolated execution workers.
+
+The manager builds runtime images, creates worker containers with constrained
+mounts and environment variables, inspects lifecycle state, streams logs, and
+removes stale resources. Keep credential and mount policy checks here so the
+control plane can request containers without duplicating Docker safety rules.
+"""
+
 from __future__ import annotations
 
 import os
@@ -17,6 +25,23 @@ except Exception:  # pragma: no cover
 
 class ContainerRuntimeError(RuntimeError):
     """Raised when the Docker-backed runtime manager cannot complete an action."""
+
+
+SENSITIVE_MOUNT_PATH_MARKERS = (
+    ".env",
+    "api_key",
+    "apikey",
+    "credential",
+    "credentials",
+    "key",
+    "keys",
+    "secret",
+    "secrets",
+    "token",
+    "tokens",
+)
+
+WRITE_PROBE_FILENAME = ".agency-workspace-write-test"
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,10 +96,12 @@ class RuntimeContainerSpec:
     workflow_id: str
     runtime_revision_id: str
     image: str
+    goal_id: str | None = None
     command: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     mounts: list[RuntimeMount] = field(default_factory=list)
     labels: dict[str, str] = field(default_factory=dict)
+    network_name: str | None = None
     name: str | None = None
 
 
@@ -108,6 +135,7 @@ def managed_container_labels(
         execution_id: str,
         workflow_id: str,
         runtime_revision_id: str,
+        goal_id: str | None = None,
         extra: dict[str, str] | None = None,
 ) -> dict[str, str]:
     labels = {
@@ -116,9 +144,66 @@ def managed_container_labels(
         "agency.workflow_id": workflow_id,
         "agency.runtime_revision_id": runtime_revision_id,
     }
+    if goal_id:
+        labels["agency.goal_id"] = goal_id
     if extra:
         labels.update(extra)
     return labels
+
+
+def onecli_isolated_mount_lockdown_enabled(settings) -> bool:
+    return bool(settings.onecli_enabled and settings.onecli_force_for_isolated_workers)
+
+
+def sensitive_mount_path_reason(source: str, target: str) -> str | None:
+    normalized = f"{source} {target}".lower()
+    path_parts = []
+    for value in (source, target):
+        path_parts.extend(part.lower() for part in Path(value).parts if part)
+    for marker in SENSITIVE_MOUNT_PATH_MARKERS:
+        if marker == ".env":
+            if any(part == ".env" or part.startswith(".env.") for part in path_parts):
+                return marker
+            continue
+        if marker in normalized:
+            return marker
+    return None
+
+
+def _is_path_writable(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / WRITE_PROBE_FILENAME
+        probe.write_text("ok", encoding="ascii")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _workspace_write_probe_path(source: str, target: str) -> Path | None:
+    source_path = Path(source).expanduser()
+    if source_path.exists():
+        return source_path
+
+    target_path = Path(target)
+    if target_path.exists():
+        return target_path
+
+    return None
+
+
+def require_read_write_mount_writable(source: str, target: str, *, env_name: str) -> None:
+    probe_path = _workspace_write_probe_path(source, target)
+    if probe_path is None or _is_path_writable(probe_path):
+        return
+
+    raise ContainerRuntimeError(
+        f"Workflow mount '{source}' -> '{target}' is configured read-write, "
+        f"but Agency cannot write to '{probe_path}'. Ask the user to approve filesystem "
+        "write access or fix the host directory permissions, then retry. "
+        f"Check {env_name} and the Docker mount for this path."
+    )
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -179,21 +264,27 @@ class DockerRuntimeManager:
             if not source or not target:
                 continue
             source_path = Path(source).expanduser().resolve()
-            mounts.append(RuntimeMount(source=str(source_path), target=target, read_only=True))
+            # Trusted local dev workers need write access for repo-editing agents.
+            # Probe when the path is visible here so permission problems fail
+            # before Codex reports a lower-level read-only filesystem error.
+            require_read_write_mount_writable(str(source_path), target, env_name=host_env)
+            mounts.append(RuntimeMount(source=str(source_path), target=target, read_only=False))
         return mounts
 
     def _codex_home_mount(self) -> RuntimeMount | None:
         source = os.getenv("CODEX_HOME_VOLUME")
-        target = os.getenv("CODEX_HOME")
-        if not source or not target:
+        if not source:
             return None
+        target = os.getenv("EXECUTION_CODEX_HOME") or os.getenv("CODEX_HOME") or "/codex"
         return RuntimeMount(source=source, target=target, read_only=False)
 
     def default_mounts(self) -> list[RuntimeMount]:
+        settings = get_settings()
+        onecli_mount_lockdown = onecli_isolated_mount_lockdown_enabled(settings)
         integrations_dir = self._default_integrations_source()
-        mounts = self._workspace_mounts()
+        mounts = [] if onecli_mount_lockdown else self._workspace_mounts()
         codex_home_mount = self._codex_home_mount()
-        if codex_home_mount is not None:
+        if codex_home_mount is not None and not onecli_mount_lockdown:
             mounts.append(codex_home_mount)
         if os.getenv("AGENCY_BACKEND_HOST_WORKSPACE") or integrations_dir.exists():
             mounts.append(
@@ -203,13 +294,32 @@ class DockerRuntimeManager:
                     read_only=self.config.bind_integrations_read_only,
                 )
             )
-        settings = get_settings()
         for mount in settings.parsed_execution_container_extra_mounts:
+            if onecli_mount_lockdown:
+                reason = sensitive_mount_path_reason(str(mount["source"]), str(mount["target"]))
+                if reason:
+                    raise ContainerRuntimeError(
+                        "Sensitive execution container extra mount is not allowed when "
+                        "ONECLI_FORCE_FOR_ISOLATED_WORKERS is true: "
+                        f"{mount['source']} -> {mount['target']} matched '{reason}'"
+                    )
             mounts.append(
                 RuntimeMount(
                     source=str(mount["source"]),
                     target=str(mount["target"]),
                     read_only=bool(mount["read_only"]),
+                )
+            )
+        if (
+                settings.onecli_enabled
+                and settings.onecli_force_for_isolated_workers
+                and settings.onecli_gateway_ca_bundle_path
+        ):
+            mounts.append(
+                RuntimeMount(
+                    source=str(Path(settings.onecli_gateway_ca_bundle_path).expanduser().resolve()),
+                    target=settings.onecli_gateway_ca_bundle_container_path,
+                    read_only=True,
                 )
             )
         return mounts
@@ -237,11 +347,18 @@ class DockerRuntimeManager:
             execution_id=spec.execution_id,
             workflow_id=spec.workflow_id,
             runtime_revision_id=spec.runtime_revision_id,
+            goal_id=spec.goal_id,
             extra=spec.labels,
         )
         mounts = spec.mounts or self.default_mounts()
         volumes: dict[str, dict[str, str | bool]] = {}
         for mount in mounts:
+            if not mount.read_only:
+                require_read_write_mount_writable(
+                    mount.source,
+                    mount.target,
+                    env_name="EXECUTION_CONTAINER_EXTRA_MOUNTS or workspace env",
+                )
             volumes[mount.source] = {"bind": mount.target, "mode": "ro" if mount.read_only else "rw"}
         nano_cpus = int(self.config.cpu_limit * 1_000_000_000)
         return {
@@ -250,7 +367,7 @@ class DockerRuntimeManager:
             "command": spec.command or None,
             "environment": spec.env,
             "labels": labels,
-            "network": self.config.network_name,
+            "network": spec.network_name or self.config.network_name,
             "detach": True,
             "working_dir": self.config.workdir,
             "auto_remove": self.config.auto_remove,

@@ -13,7 +13,7 @@ JSON_VARIANT = JSON().with_variant(JSONB, "postgresql")
 class _PGVector(UserDefinedType):
     cache_ok = True
 
-    def get_col_spec(self, **kw: Any) -> str:
+    def get_col_spec(self, **_kw: Any) -> str:
         return "vector"
 
 

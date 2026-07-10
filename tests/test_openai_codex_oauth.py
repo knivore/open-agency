@@ -1,12 +1,14 @@
 import asyncio
+import os
 import time
 import unittest
 from unittest.mock import MagicMock, patch
 
+from app.core.config import reset_settings_cache
 from app.domain import ModelProfileDefinition
 from app.llm.openai_codex import OpenAICodexModelClient
 from app.llm.registry import LLMEnvironmentConfig
-from app.utils.oauth_pkce import OAuthPKCEHandler
+from app.utils.oauth_pkce import OAuthPKCEHandler, _oauth_async_client
 
 
 class TestOpenAICodexOAuth(unittest.TestCase):
@@ -48,6 +50,16 @@ class TestOpenAICodexOAuth(unittest.TestCase):
         )
         self.assertEqual(parsed["code"], "abc123")
         self.assertEqual(parsed["state"], "state456")
+
+    def test_oauth_client_uses_certifi_when_ca_env_path_is_missing(self):
+        with (
+            patch.dict(os.environ, {"SSL_CERT_FILE": "/missing/agency-ca.pem"}, clear=False),
+            patch("app.utils.oauth_pkce.certifi.where", return_value="/certifi/cacert.pem"),
+            patch("app.utils.oauth_pkce.httpx.AsyncClient") as mock_client,
+        ):
+            _oauth_async_client()
+
+        mock_client.assert_called_once_with(verify="/certifi/cacert.pem")
 
     @patch("httpx.AsyncClient.post")
     def test_token_exchange(self, mock_post):
@@ -93,23 +105,60 @@ class TestOpenAICodexOAuth(unittest.TestCase):
         self.assertEqual(client.access_token, "new_access_token")
         self.assertEqual(client.client.api_key, "new_access_token")
 
-    def test_codex_cli_timeout_prefers_profile_then_environment(self):
-        env = LLMEnvironmentConfig()
-        profile = ModelProfileDefinition(
-            id="test_profile",
-            name="Test Codex",
-            provider="openai_codex",
-            model="gpt-5.3-codex",
-            parameters={"codex_cli_timeout_seconds": "300"},
-        )
-        client = OpenAICodexModelClient(profile, env)
+    def test_codex_cli_timeout_uses_settings_floor_for_profile(self):
+        with patch.dict("os.environ", {}, clear=True):
+            reset_settings_cache()
+            env = LLMEnvironmentConfig()
+            profile = ModelProfileDefinition(
+                id="test_profile",
+                name="Test Codex",
+                provider="openai_codex",
+                model="gpt-5.3-codex",
+                parameters={"codex_cli_timeout_seconds": "300"},
+            )
+            client = OpenAICodexModelClient(profile, env)
 
-        self.assertEqual(client._codex_cli_timeout_seconds(), 300)
+            self.assertEqual(client._codex_cli_timeout_seconds(), 1800)
 
-        profile = profile.model_copy(update={"parameters": {}})
-        client = OpenAICodexModelClient(profile, env)
+            profile = profile.model_copy(update={"parameters": {"codex_cli_timeout_seconds": "2400"}})
+            client = OpenAICodexModelClient(profile, env)
+            self.assertEqual(client._codex_cli_timeout_seconds(), 2400)
+
         with patch.dict("os.environ", {"CODEX_CLI_TIMEOUT_SECONDS": "450"}, clear=False):
             self.assertEqual(client._codex_cli_timeout_seconds(), 450)
+        reset_settings_cache()
+
+    def test_codex_cli_timeout_respects_llm_timeout_when_no_explicit_cli_override(self):
+        with patch.dict("os.environ", {"LLM_REQUEST_TIMEOUT_SECONDS": "15"}, clear=True):
+            reset_settings_cache()
+            env = LLMEnvironmentConfig()
+            profile = ModelProfileDefinition(
+                id="test_profile",
+                name="Test Codex",
+                provider="openai_codex",
+                model="gpt-5.3-codex",
+                parameters={"codex_cli_timeout_seconds": "300"},
+            )
+            client = OpenAICodexModelClient(profile, env)
+
+            self.assertEqual(client._codex_cli_timeout_seconds(), 15)
+            reset_settings_cache()
+
+    def test_codex_cli_timeout_uses_settings_default(self):
+        with patch.dict("os.environ", {}, clear=True):
+            reset_settings_cache()
+            env = LLMEnvironmentConfig()
+            profile = ModelProfileDefinition(
+                id="test_profile",
+                name="Test Codex",
+                provider="openai_codex",
+                model="gpt-5.3-codex",
+                parameters={},
+            )
+            client = OpenAICodexModelClient(profile, env)
+
+            self.assertEqual(client._codex_cli_timeout_seconds(), 1800)
+            reset_settings_cache()
 
 
 if __name__ == "__main__":

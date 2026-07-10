@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
+from dataclasses import dataclass
 from typing import Any
 
+from app.core.config import get_settings
 from app.domain import AgentDefinition, Execution, TaskDefinition, UserDefinition, WorkflowDefinition
 from app.runtime.native.state import NativeExecutionState
 
@@ -45,7 +46,36 @@ class SharedMemoryPromptBuilder:
             current_user=current_user,
             limit_per_layer=self._limit_per_layer(config),
         )
-        return service.format_operational_context_for_prompt(operational_context)
+        prompt_parts: list[str] = []
+        if get_settings().memory_context_pack_enabled and self._context_packs_enabled(config):
+            context_packs = []
+            selected_context_pack_id = self._selected_context_pack_id(execution)
+            if selected_context_pack_id:
+                selected_context_pack = await service.get_context_pack_by_id(
+                    selected_context_pack_id,
+                    current_user=current_user,
+                )
+                if selected_context_pack is not None:
+                    context_packs.append(selected_context_pack)
+            scoped_context_packs = await service.list_context_packs_for_agent_scope(
+                agent_id=agent.id,
+                workflow_id=workflow.id,
+                workspace_id=workspace_id,
+                user_id=user_id,
+                mode=self._context_pack_mode(config),
+                query=query,
+                limit=self._context_pack_limit(config),
+                current_user=current_user,
+            )
+            seen_context_pack_ids = {item.id for item in context_packs}
+            context_packs.extend(item for item in scoped_context_packs if item.id not in seen_context_pack_ids)
+            context_pack_prompt = service.format_context_packs_for_prompt(context_packs)
+            if context_pack_prompt:
+                prompt_parts.append(context_pack_prompt)
+        operational_prompt = service.format_operational_context_for_prompt(operational_context)
+        if operational_prompt:
+            prompt_parts.append(operational_prompt)
+        return "\n\n".join(prompt_parts)
 
     @staticmethod
     def _shared_memory_config(*, workflow: WorkflowDefinition, agent: AgentDefinition) -> dict[str, Any]:
@@ -129,3 +159,34 @@ class SharedMemoryPromptBuilder:
             except (TypeError, ValueError):
                 continue
         return limits or None
+
+    @staticmethod
+    def _context_packs_enabled(config: dict[str, Any]) -> bool:
+        if "context_packs_enabled" in config:
+            return bool(config.get("context_packs_enabled"))
+        return True
+
+    @staticmethod
+    def _context_pack_mode(config: dict[str, Any]) -> str | None:
+        raw_mode = config.get("context_pack_mode")
+        if not isinstance(raw_mode, str) or not raw_mode.strip():
+            return None
+        return raw_mode.strip().lower()
+
+    @staticmethod
+    def _context_pack_limit(config: dict[str, Any]) -> int:
+        raw_limit = config.get("context_pack_limit", 2)
+        if not isinstance(raw_limit, int):
+            return 2
+        return max(min(raw_limit, 10), 0)
+
+    @staticmethod
+    def _selected_context_pack_id(execution: Execution) -> str | None:
+        for container in (execution.trigger_payload, execution.input_payload):
+            if not isinstance(container, dict):
+                continue
+            for key in ("context_pack_id", "contextPackId"):
+                value = container.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return None

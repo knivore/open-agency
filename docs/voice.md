@@ -3,7 +3,7 @@
 Agency exposes voice input in two layers:
 
 - `agency.audio.transcribe` is a built-in agent tool for recorded audio files, voice-note chunks, or base64 audio payloads. It calls OpenAI speech-to-text and returns normalized text plus optional verbose metadata.
-- `POST /voice/realtime/transcription-session` creates an OpenAI Realtime transcription client secret for a transcription session. Browser clients should use this for live microphone streaming, then send completed transcript turns into the normal conversation API.
+- `POST /speech/realtime/transcription-session` creates an OpenAI Realtime transcription client secret for a transcription session. Browser clients should use this for live microphone streaming, then send completed transcript turns into the normal conversation API.
 
 ## Configuration
 
@@ -35,7 +35,7 @@ Exactly one of `file_path` or `audio_base64` is required.
 
 ## Realtime Flow
 
-1. The authenticated frontend calls `POST /voice/realtime/transcription-session`.
+1. The authenticated frontend calls `POST /speech/realtime/transcription-session`.
 2. The backend returns OpenAI's realtime client-secret payload, including an ephemeral `value` and the configured transcription session.
 3. The frontend streams microphone audio to OpenAI Realtime using that ephemeral secret.
 4. Completed transcript turns are submitted to Agency conversations as user messages.

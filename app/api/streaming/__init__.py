@@ -1,6 +1,4 @@
-from .runtime_sse import create_runtime_sse_router, runtime_event_sse_stream
+"""API streaming package.
 
-__all__ = [
-    "create_runtime_sse_router",
-    "runtime_event_sse_stream",
-]
+Import SSE routers from their concrete modules.
+"""

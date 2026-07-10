@@ -1,7 +1,7 @@
 import asyncio
 import time
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from app.domain import ModelProfileDefinition
 from app.llm.azure import AzureOpenAIModelClient

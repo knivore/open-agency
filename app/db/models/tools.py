@@ -1,3 +1,5 @@
+"""ORM mapping for built-in and user-defined tool contracts."""
+
 from __future__ import annotations
 
 from sqlalchemy import Boolean, Index, String, Text

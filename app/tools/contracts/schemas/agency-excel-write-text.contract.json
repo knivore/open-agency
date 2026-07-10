@@ -24,11 +24,19 @@
         "description": "Row serial number used by the workbook writer."
       },
       "header_title": {
-        "type": ["string", "null"],
+        "type": [
+          "string",
+          "null"
+        ],
         "description": "Optional column header title."
       }
     },
-    "required": ["sheet_name", "excel_file_path", "text_file_path", "serial_number"],
+    "required": [
+      "sheet_name",
+      "excel_file_path",
+      "text_file_path",
+      "serial_number"
+    ],
     "additionalProperties": false
   },
   "outputs": {
@@ -36,17 +44,30 @@
     "properties": {
       "verdict": {
         "type": "string",
-        "enum": ["ok", "warn", "deny"]
+        "enum": [
+          "ok",
+          "warn",
+          "deny"
+        ]
       },
       "policyVerdict": {
-        "type": ["object", "null"]
+        "type": [
+          "object",
+          "null"
+        ]
       },
       "result": {
-        "type": ["object", "null"],
+        "type": [
+          "object",
+          "null"
+        ],
         "additionalProperties": true
       },
       "patch": {
-        "type": ["string", "null"]
+        "type": [
+          "string",
+          "null"
+        ]
       },
       "filesChanged": {
         "type": "array",
@@ -67,13 +88,23 @@
         "type": "string"
       },
       "actor": {
-        "type": ["string", "null"]
+        "type": [
+          "string",
+          "null"
+        ]
       },
       "signature": {
-        "type": ["string", "null"]
+        "type": [
+          "string",
+          "null"
+        ]
       }
     },
-    "required": ["verdict", "dryRun", "timestamp"],
+    "required": [
+      "verdict",
+      "dryRun",
+      "timestamp"
+    ],
     "additionalProperties": false
   }
 }

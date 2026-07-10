@@ -18,53 +18,156 @@
         "additionalProperties": true
       },
       "runtime_adapter_id": {
-        "type": ["string", "null"],
+        "type": [
+          "string",
+          "null"
+        ],
         "description": "Optional runtime adapter override."
       },
+      "goal_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Optional durable goal id to associate with the created workflow execution."
+      },
       "conversation_id": {
-        "type": ["string", "null"],
+        "type": [
+          "string",
+          "null"
+        ],
         "description": "Optional conversation id used to create an approval request for protected workflows."
       },
       "origin_message_id": {
-        "type": ["string", "null"],
+        "type": [
+          "string",
+          "null"
+        ],
         "description": "Optional existing origin message id for the approval request."
       }
     },
-    "required": ["workflow_id"],
+    "required": [
+      "workflow_id"
+    ],
     "additionalProperties": false
   },
   "outputs": {
     "type": "object",
     "properties": {
-      "verdict": { "type": "string", "enum": ["ok", "warn", "deny"] },
-      "policyVerdict": { "type": ["object", "null"] },
+      "verdict": {
+        "type": "string",
+        "enum": [
+          "ok",
+          "warn",
+          "deny"
+        ]
+      },
+      "policyVerdict": {
+        "type": [
+          "object",
+          "null"
+        ]
+      },
       "result": {
-        "type": ["object", "null"],
+        "type": [
+          "object",
+          "null"
+        ],
         "properties": {
           "status": {
             "type": "string",
-            "enum": ["queued", "running", "completed", "failed", "cancelled", "approval_requested", "requires_approval_context", "error"]
+            "enum": [
+              "queued",
+              "running",
+              "completed",
+              "failed",
+              "cancelled",
+              "approval_requested",
+              "requires_approval_context",
+              "error"
+            ]
           },
-          "workflow_id": { "type": "string" },
-          "workflow_name": { "type": ["string", "null"] },
-          "execution_id": { "type": ["string", "null"] },
-          "execution_status": { "type": ["string", "null"] },
-          "execution": { "type": "object", "additionalProperties": true },
-          "approval_request": { "type": "object", "additionalProperties": true },
-          "assistant_message": { "type": "object", "additionalProperties": true },
-          "error": { "type": "string" }
+          "workflow_id": {
+            "type": "string"
+          },
+          "workflow_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "execution_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "execution_status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "execution": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "approval_request": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "assistant_message": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "error": {
+            "type": "string"
+          }
         },
         "additionalProperties": true
       },
-      "patch": { "type": ["string", "null"] },
-      "filesChanged": { "type": "array", "items": { "type": "object" } },
-      "errors": { "type": "array", "items": { "type": "string" } },
-      "dryRun": { "type": "boolean" },
-      "timestamp": { "type": "string" },
-      "actor": { "type": ["string", "null"] },
-      "signature": { "type": ["string", "null"] }
+      "patch": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "filesChanged": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      },
+      "errors": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "dryRun": {
+        "type": "boolean"
+      },
+      "timestamp": {
+        "type": "string"
+      },
+      "actor": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "signature": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
     },
-    "required": ["verdict", "dryRun", "timestamp"],
+    "required": [
+      "verdict",
+      "dryRun",
+      "timestamp"
+    ],
     "additionalProperties": false
   }
 }

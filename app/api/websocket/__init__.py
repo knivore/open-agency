@@ -1,5 +1,4 @@
-from .runtime_ws import create_runtime_websocket_router
+"""API WebSocket package.
 
-__all__ = [
-    "create_runtime_websocket_router",
-]
+Import WebSocket routers from their concrete modules.
+"""

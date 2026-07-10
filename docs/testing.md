@@ -55,6 +55,12 @@ Or directly:
 ./.venv/bin/python -m unittest
 ```
 
+Windows PowerShell equivalent:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest
+```
+
 ## Run database and migration tests
 
 Database foundation and repository tests:
@@ -69,10 +75,34 @@ Alembic migration validation is covered by:
 ./.venv/bin/python -m unittest tests.test_postgres_schema
 ```
 
+Optional module persistence manifests can be validated without applying
+migrations. The validator reports migration source and removal policy, and
+fails on invalid manifest, ref, path, ordering, or expected-module metadata:
+
+```bash
+make check-optional-modules
+./.venv/bin/python scripts/validate_optional_module_persistence.py --check-paths
+AGENCY_OPTIONAL_MODULE_SPEC_REFS=tests.fixtures.external_module_pack.manifest:module_spec AGENCY_EXPECTED_OPTIONAL_MODULES=external_example_pack ./.venv/bin/python scripts/validate_optional_module_persistence.py --check-paths
+AGENCY_OPTIONAL_MODULE_SPEC_REFS=tests.fixtures.external_module_pack.manifest:module_spec ./.venv/bin/python scripts/validate_optional_module_persistence.py --check-paths --expect-module external_example_pack
+./.venv/bin/python -m unittest tests.test_optional_module_registry tests.test_optional_module_persistence_validator
+```
+
+Generic CI should run `make check-optional-modules` to validate discovered
+module manifests without requiring every optional pack to be installed.
+Deployment or release jobs that require specific packs should also set
+`AGENCY_EXPECTED_OPTIONAL_MODULES` or pass `--expect-module`.
+
 ## Run API and runtime tests
 
 ```bash
 ./.venv/bin/python -m unittest tests.test_api_main tests.test_workflow_builder_api tests.test_execution_control_plane tests.test_native_execution_engine tests.test_scheduler
+```
+
+Workflow and tool-registry focused checks:
+
+```bash
+make check-tool-registry
+./.venv/bin/python -m unittest tests.test_tool_contract_runtime tests.test_tool_migration tests.test_tool_cli
 ```
 
 ## Run architecture checks
@@ -84,7 +114,13 @@ make check-architecture
 Or directly:
 
 ```bash
-./.venv/bin/python -m unittest tests.test_legacy_import_check tests.test_architecture_validation
+./.venv/bin/python -m unittest tests.test_documentation_consistency tests.test_legacy_import_check tests.test_architecture_validation
+```
+
+Windows PowerShell equivalent:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest tests.test_documentation_consistency tests.test_legacy_import_check tests.test_architecture_validation
 ```
 
 ## Run compile and architecture validation
@@ -96,7 +132,21 @@ make lint
 This currently performs:
 
 - Python bytecode compilation for `app` and `tests`
-- architecture guard checks
+- documentation consistency and architecture guard checks
+- optional module persistence manifest validation for discovered module packs
+
+For a lightweight dead-code pass during local cleanup work, use:
+
+```bash
+./.venv/bin/python -m vulture app/tools app/services/agent_tools.py app/api/context.py app/cli.py --min-confidence 90
+```
+
+Windows PowerShell equivalent:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall app tests
+.\.venv\Scripts\python.exe -m unittest tests.test_documentation_consistency tests.test_legacy_import_check tests.test_architecture_validation
+```
 
 ## Run Evaluation Smoke Suite
 
@@ -170,6 +220,21 @@ Examples:
 
 ```bash
 ./.venv/bin/python scripts/validate_runtime_paths.py --runtime crewai --provider ollama --model gpt-oss:20b --model-base-url http://host.docker.internal:11434 --exercise-hitl
+```
+
+## Run isolated runtime integration tests
+
+Docker-backed isolated runtime tests are opt-in:
+
+```bash
+ENABLE_DOCKER_INTEGRATION_TESTS=1 ./.venv/bin/python -m unittest tests.test_docker_worker_integration
+```
+
+Windows PowerShell equivalent:
+
+```powershell
+$env:ENABLE_DOCKER_INTEGRATION_TESTS = "1"
+.\.venv\Scripts\python.exe -m unittest tests.test_docker_worker_integration
 ```
 
 ## Notes

@@ -7,20 +7,23 @@ ModelRole = Literal["system", "user", "assistant", "tool"]
 
 
 @dataclass(slots=True)
-class ModelMessage:
-    role: ModelRole
-    content: Any
-    name: Optional[str] = None
-    tool_call_id: Optional[str] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(slots=True)
 class ModelToolCall:
     id: Optional[str]
     name: str
     arguments: Dict[str, Any] = field(default_factory=dict)
     raw: Any = None
+
+
+@dataclass(slots=True)
+class ModelMessage:
+    role: ModelRole
+    content: Any
+    name: Optional[str] = None
+    tool_call_id: Optional[str] = None
+    # OpenAI-compatible chat APIs require tool results to follow an assistant message
+    # carrying the exact tool_calls they answer.
+    tool_calls: List[ModelToolCall] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

@@ -1,3 +1,5 @@
+"""Execution creation, control, events, artifacts, and runtime operations routes."""
+
 from __future__ import annotations
 
 import uuid
@@ -11,13 +13,19 @@ from app.api.identity import resolve_current_user, resolve_current_user_if_prese
 from app.domain import ModelProfileDefinition, UserDefinition, WorkflowDefinition
 from app.runtime.containers import ContainerRuntimeError
 from app.runtime.native.errors import ExecutionNotFoundError, WorkflowNotFoundError
-from app.services import ExecutionService
+from app.services.executions import ExecutionService
+from app.services.goals import GoalNotFoundError
 
 
 class CreateExecutionRequest(BaseModel):
     workflow_id: str = Field(alias="workflowId")
+    goal_id: Optional[str] = Field(default=None, validation_alias=AliasChoices("goalId", "goal_id"))
     input: dict[str, Any] = Field(default_factory=dict)
     trigger: dict[str, Any] = Field(default_factory=dict)
+    context_pack_id: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("contextPackId", "context_pack_id"),
+    )
     runtime_adapter_id: Optional[str] = Field(
         default=None,
         validation_alias=AliasChoices("runtimeAdapterId", "runtime_adapter_id"),
@@ -31,8 +39,13 @@ class CreateExecutionRequest(BaseModel):
 
 
 class WorkflowExecutionRequest(BaseModel):
+    goal_id: Optional[str] = Field(default=None, validation_alias=AliasChoices("goalId", "goal_id"))
     input: dict[str, Any] = Field(default_factory=dict)
     trigger: dict[str, Any] = Field(default_factory=dict)
+    context_pack_id: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("contextPackId", "context_pack_id"),
+    )
     runtime_adapter_id: Optional[str] = Field(
         default=None,
         validation_alias=AliasChoices("runtimeAdapterId", "runtime_adapter_id"),
@@ -47,6 +60,14 @@ class WorkflowExecutionRequest(BaseModel):
 
 class ApprovalRequest(BaseModel):
     tool_id: str = Field(alias="toolId")
+    reason: Optional[str] = None
+
+
+class TaskRetryRequest(BaseModel):
+    reason: Optional[str] = None
+
+
+class CheckpointResumeRequest(BaseModel):
     reason: Optional[str] = None
 
 
@@ -101,8 +122,9 @@ async def _require_workflow_run_access_for_request(
         context: ApiContext,
         *,
         workflow_definition: WorkflowDefinition | None = None,
+        current_user: UserDefinition | None = None,
 ) -> WorkflowDefinition | None:
-    current_user = await resolve_current_user(request, context, required_scopes=["workflows:run"])
+    current_user = current_user or await resolve_current_user(request, context, required_scopes=["workflows:run"])
     if workflow_definition is not None:
         owner_ids = _workflow_owner_ids(workflow_definition)
         created_by = workflow_definition.metadata.get("created_by")
@@ -178,26 +200,33 @@ def create_executions_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @execution_router.post("", summary="Create Execution")
     async def create_execution(request: CreateExecutionRequest, http_request: Request):
+        current_user = await resolve_current_user(http_request, context, required_scopes=["workflows:run"])
         await _require_workflow_run_access_for_request(
             request.workflow_id,
             http_request,
             context,
             workflow_definition=request.workflow_definition,
+            current_user=current_user,
         )
         try:
             return await service.create_execution(
                 workflow_id=request.workflow_id,
+                goal_id=request.goal_id,
                 input_payload=request.input,
                 trigger=request.trigger,
+                context_pack_id=request.context_pack_id,
                 runtime_adapter_id=request.runtime_adapter_id,
                 execution_host=request.execution_host,
                 workflow_definition=request.workflow_definition,
                 model_profiles=request.model_profiles,
+                current_user=current_user,
             )
-        except WorkflowNotFoundError as exc:
+        except (GoalNotFoundError, WorkflowNotFoundError) as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
         except KeyError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
     @execution_router.post("/{execution_id}/start", summary="Start Execution")
     async def start_execution(execution_id: str, request: Request):
@@ -222,6 +251,35 @@ def create_executions_router(context: Optional[ApiContext] = None) -> APIRouter:
             return await service.resume(execution_id)
         except (ExecutionNotFoundError, WorkflowNotFoundError) as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    @execution_router.post("/{execution_id}/tasks/{task_id}/retry", summary="Retry Failed Execution Task")
+    async def retry_execution_task(execution_id: str, task_id: str, payload: TaskRetryRequest, request: Request):
+        current_user = await resolve_current_user_if_present(request, context, required_scopes=["executions:write"])
+        try:
+            return await service.retry_task(
+                execution_id,
+                task_id,
+                reason=payload.reason,
+                actor=current_user.id if current_user else None,
+            )
+        except (ExecutionNotFoundError, WorkflowNotFoundError) as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+
+    @execution_router.post("/{execution_id}/resume-from-checkpoint", summary="Resume Execution From Checkpoint")
+    async def resume_execution_from_checkpoint(execution_id: str, payload: CheckpointResumeRequest, request: Request):
+        current_user = await resolve_current_user_if_present(request, context, required_scopes=["executions:write"])
+        try:
+            return await service.resume_from_checkpoint(
+                execution_id,
+                reason=payload.reason,
+                actor=current_user.id if current_user else None,
+            )
+        except (ExecutionNotFoundError, WorkflowNotFoundError) as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
     @execution_router.post("/{execution_id}/cancel", summary="Cancel Execution")
     async def cancel_execution(execution_id: str, request: Request):
@@ -266,10 +324,37 @@ def create_executions_router(context: Optional[ApiContext] = None) -> APIRouter:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     @execution_router.get("/{execution_id}/events", summary="List Execution Events")
-    async def list_execution_events(execution_id: str, request: Request, after_sequence: int = 0):
+    async def list_execution_events(
+            execution_id: str,
+            request: Request,
+            after_sequence: int = 0,
+            event_type: list[str] | None = Query(default=None),
+            event_types: str | None = Query(default=None),
+    ):
         await resolve_current_user_if_present(request, context, required_scopes=["executions:read"])
         try:
-            return await service.list_execution_events(execution_id, after_sequence)
+            requested_event_types = list(event_type or [])
+            if event_types:
+                requested_event_types.append(event_types)
+            return await service.list_execution_events(execution_id, after_sequence, requested_event_types)
+        except ExecutionNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    @execution_router.get("/{execution_id}/usage", summary="Get Execution Token Usage")
+    async def get_execution_usage(execution_id: str, request: Request):
+        await resolve_current_user_if_present(request, context, required_scopes=["executions:read"])
+        try:
+            return await service.get_execution_usage(execution_id)
+        except ExecutionNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    @execution_router.get("/{execution_id}/context-usage", summary="Get Execution Context Usage")
+    async def get_execution_context_usage(execution_id: str, request: Request):
+        await resolve_current_user_if_present(request, context, required_scopes=["executions:read"])
+        try:
+            return await service.get_execution_context_usage(execution_id)
         except ExecutionNotFoundError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
@@ -278,6 +363,14 @@ def create_executions_router(context: Optional[ApiContext] = None) -> APIRouter:
         await resolve_current_user_if_present(request, context, required_scopes=["executions:read"])
         try:
             return await service.list_execution_artifacts(execution_id)
+        except ExecutionNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    @execution_router.get("/{execution_id}/approvals", summary="List Execution Approval Requests")
+    async def list_execution_approvals(execution_id: str, request: Request):
+        await resolve_current_user_if_present(request, context, required_scopes=["executions:read"])
+        try:
+            return await service.list_execution_approvals(execution_id)
         except ExecutionNotFoundError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
@@ -353,44 +446,56 @@ def create_executions_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @workflow_execution_router.post("/{workflow_id}/executions", summary="Create Workflow Execution")
     async def create_workflow_execution(workflow_id: str, request: WorkflowExecutionRequest, http_request: Request):
+        current_user = await resolve_current_user(http_request, context, required_scopes=["workflows:run"])
         await _require_workflow_run_access_for_request(
             workflow_id,
             http_request,
             context,
             workflow_definition=request.workflow_definition,
+            current_user=current_user,
         )
         try:
             return await service.create_execution(
                 workflow_id=workflow_id,
+                goal_id=request.goal_id,
                 input_payload=request.input,
                 trigger=request.trigger,
+                context_pack_id=request.context_pack_id,
                 runtime_adapter_id=request.runtime_adapter_id,
                 execution_host=request.execution_host,
                 workflow_definition=request.workflow_definition,
                 model_profiles=request.model_profiles,
+                current_user=current_user,
             )
-        except WorkflowNotFoundError as exc:
+        except (GoalNotFoundError, WorkflowNotFoundError) as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
         except KeyError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
     @workflow_execution_router.post("/{workflow_id}/executions/start", summary="Create And Start Workflow Execution")
     async def start_workflow_execution(workflow_id: str, request: WorkflowExecutionRequest, http_request: Request):
+        current_user = await resolve_current_user(http_request, context, required_scopes=["workflows:run"])
         await _require_workflow_run_access_for_request(
             workflow_id,
             http_request,
             context,
             workflow_definition=request.workflow_definition,
+            current_user=current_user,
         )
         try:
             execution = await service.create_execution(
                 workflow_id=workflow_id,
+                goal_id=request.goal_id,
                 input_payload=request.input,
                 trigger=request.trigger,
+                context_pack_id=request.context_pack_id,
                 runtime_adapter_id=request.runtime_adapter_id,
                 execution_host=request.execution_host,
                 workflow_definition=request.workflow_definition,
                 model_profiles=request.model_profiles,
+                current_user=current_user,
             )
             queued = await service.queue_start(execution["id"])
             return {
@@ -398,10 +503,12 @@ def create_executions_router(context: Optional[ApiContext] = None) -> APIRouter:
                 "process_id": queued["id"],
                 "status": queued.get("status", "queued"),
             }
-        except (ExecutionNotFoundError, WorkflowNotFoundError) as exc:
+        except (ExecutionNotFoundError, GoalNotFoundError, WorkflowNotFoundError) as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
         except KeyError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
     router.include_router(workflow_execution_router)
     return router

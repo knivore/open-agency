@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 
-from app.api.schemas import PreSignedUrlRequest
+from app.api.schemas.storage import PreSignedUrlRequest
 from app.core.storage import generate_presigned_url
 
 

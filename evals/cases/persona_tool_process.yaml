@@ -1,0 +1,76 @@
+id: persona_tool_process
+suite: persona_distillation
+name: Persona tool and process extraction
+mode: persona_distillation_fixture
+description: Checks tool usage remains reviewable and separate from workflow.
+persona_distillation:
+  source_memories:
+    - id: jira-evidence-process
+      title: Evidence tracking process
+      content: |
+        The team tracks Jira evidence tickets for each audit observation.
+        Evidence workflow: link the Jira ticket, attach the workpaper, validate the owner response, and close only after review.
+        Jira is a tracking tool reference, not an authorization to use or grant tool access automatically.
+      tags: ["persona-live-eval", "tool-process", "jira"]
+  expected_items:
+    - id: jira_tool
+      item_type: tool_usage
+      memory_layer: tool
+      content_keywords: ["jira", "evidence tickets"]
+      evidence: "tracks Jira evidence tickets"
+    - id: evidence_workflow
+      item_type: workflow
+      memory_layer: procedural
+      content_keywords: ["link the jira ticket", "attach the workpaper", "validate the owner response"]
+      evidence: "link the Jira ticket, attach the workpaper, validate the owner response"
+  results:
+    deterministic:
+      items:
+        - title: Evidence workflow
+          content: "Link the Jira ticket, attach the workpaper, validate the owner response, and close only after review."
+          item_type: workflow
+          memory_layer: procedural
+          source_evidence: "link the Jira ticket, attach the workpaper, validate the owner response"
+          evidence_verified: true
+      metrics: {latency_ms: 7, cost_usd: 0.0}
+    llm:
+      items:
+        - title: Jira evidence tracking
+          content: "Jira tracks evidence tickets for each audit observation."
+          item_type: tool_usage
+          memory_layer: tool
+          source_evidence: "tracks Jira evidence tickets"
+          evidence_verified: true
+          needs_review: true
+        - title: Evidence workflow
+          content: "Link the Jira ticket, attach the workpaper, validate the owner response, and close only after review."
+          item_type: workflow
+          memory_layer: procedural
+          source_evidence: "link the Jira ticket, attach the workpaper, validate the owner response"
+          evidence_verified: true
+      metrics: {latency_ms: 119, cost_usd: 0.017}
+    hybrid:
+      items:
+        - title: Jira evidence tracking
+          content: "Jira tracks evidence tickets for each audit observation."
+          item_type: tool_usage
+          memory_layer: tool
+          source_evidence: "tracks Jira evidence tickets"
+          evidence_verified: true
+          needs_review: true
+        - title: Evidence workflow
+          content: "Link the Jira ticket, attach the workpaper, validate the owner response, and close only after review."
+          item_type: workflow
+          memory_layer: procedural
+          source_evidence: "link the Jira ticket, attach the workpaper, validate the owner response"
+          evidence_verified: true
+      metrics: {latency_ms: 126, cost_usd: 0.017}
+assertions:
+  - type: persona_metric_min
+    mode: llm
+    metric: recall
+    value: 1.0
+  - type: persona_metric_max
+    mode: hybrid
+    metric: review_burden
+    value: 0.6

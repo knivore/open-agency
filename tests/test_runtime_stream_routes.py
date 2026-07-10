@@ -10,14 +10,10 @@ from fastapi.testclient import TestClient
 
 from app.api.streaming.runtime_sse import create_runtime_sse_router, runtime_event_sse_stream
 from app.api.websocket.runtime_ws import create_runtime_websocket_router
-from app.runtime.streaming import (
-    RUNTIME_STREAM_AUTH_ENV,
-    RuntimeEventFilter,
-    RuntimeEventBus,
-    RuntimeEventType,
-    RuntimeStreamEvent,
-    set_default_runtime_event_bus,
-)
+from app.runtime.streaming.event_bus import RuntimeEventBus, set_default_runtime_event_bus
+from app.runtime.streaming.runtime_event_models import RuntimeEventType, RuntimeStreamEvent
+from app.runtime.streaming.stream_filters import RuntimeEventFilter
+from app.runtime.streaming.stream_serialization import RUNTIME_STREAM_AUTH_ENV
 
 
 class _ConnectedRequest:

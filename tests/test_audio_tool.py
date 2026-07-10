@@ -33,14 +33,14 @@ class _FakeOpenAIClient:
 
 class AudioToolTests(unittest.TestCase):
     def test_audio_tool_is_in_builtin_catalog(self):
-        spec = get_tool_catalog_specs()["agency.audio.transcribe"]
+        spec = get_tool_catalog_specs()["agency.speech.listen"]
         tool = spec.tool_definition
 
-        self.assertEqual(tool.name, "transcribe_audio")
+        self.assertEqual(tool.name, "listen_speech")
         self.assertTrue(tool.security.allow_network)
         self.assertTrue(tool.security.read_only)
-        self.assertEqual(tool.implementation.module, "app.tools.implementations.audio")
-        self.assertEqual(tool.implementation.function, "transcribe_audio")
+        self.assertEqual(tool.implementation.module, "app.tools.implementations.speech")
+        self.assertEqual(tool.implementation.function, "listen_speech")
 
     def test_transcribe_audio_calls_openai_with_file_path(self):
         previous_api_key = os.environ.get("OPENAI_API_KEY")

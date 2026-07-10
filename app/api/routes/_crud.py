@@ -1,3 +1,10 @@
+"""Shared CRUD router factory for catalog-style resources.
+
+The concrete route modules pass repositories, domain models, scopes, and optional
+hooks here. Keep resource-specific behavior in those modules and reserve this
+file for common validation, redaction, ownership, and response-shaping behavior.
+"""
+
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -6,7 +13,6 @@ from typing import Any, Awaitable, Callable, Iterable, Optional
 
 from app.api.context import ApiContext
 from app.api.identity import resolve_current_user, resolve_current_user_if_present
-
 
 REDACTED_SECRET_VALUE = "[REDACTED]"
 SECRET_RESPONSE_KEYS = {
@@ -85,6 +91,7 @@ def build_crud_router(
         require_read_auth: bool = False,
         require_write_auth: bool = False,
         before_list: Callable[[], Awaitable[None]] | None = None,
+        response_filter: Callable[[Any], bool] | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix=prefix, tags=[tag])
     protected = set(protected_ids or [])
@@ -117,6 +124,8 @@ def build_crud_router(
         if before_list is not None:
             await before_list()
         items = await repo.list()
+        if response_filter is not None:
+            items = [item for item in items if response_filter(item)]
         return {"items": [dump_response(item) for item in items]}
 
     @router.get("/{item_id}", summary=f"Get {summary_name} By Id")
@@ -127,7 +136,7 @@ def build_crud_router(
             else:
                 await resolve_current_user_if_present(request, context, required_scopes=read_scope_list)
         item = await repo.get(item_id)
-        if item is None:
+        if item is None or (response_filter is not None and not response_filter(item)):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"{summary_name} '{item_id}' not found")
         return dump_response(item)
 

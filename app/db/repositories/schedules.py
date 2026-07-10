@@ -4,7 +4,6 @@ from uuid import uuid4
 from app.core.time import ensure_utc, utc_now
 from app.db.models import ScheduleORM
 from app.domain import ScheduleDefinition
-
 from .catalog import InMemoryCatalogRepository, MongoCatalogRepository
 from .sql import SQLAlchemyRepository
 

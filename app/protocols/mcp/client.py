@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from itertools import count
+from pathlib import Path
 from typing import Any
 
+from app.core.config import get_settings
 from app.domain import MCPServerDefinition, MCPTransportType
+from app.integrations.secrets import resolve_secret_ref
 from .schemas import MCPDiscoverySnapshot, MCPPromptDescriptor, MCPResourceDescriptor, MCPToolDescriptor
 
 
@@ -21,6 +25,104 @@ class BaseMCPClient:
         raise NotImplementedError
 
 
+DEFAULT_MCP_PROCESS_PATHS = (
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+)
+
+SAFE_MCP_PROCESS_ENV_VARS = (
+    "HOME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "LC_ALL",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+)
+
+
+def _split_paths(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item for item in value.split(os.pathsep) if item]
+
+
+def _mcp_process_path() -> str:
+    configured_paths = _split_paths(os.getenv("MCP_SERVER_EXTRA_PATHS") or get_settings().mcp_server_extra_paths)
+    existing_paths = _split_paths(os.getenv("PATH"))
+    paths = [*configured_paths, *DEFAULT_MCP_PROCESS_PATHS, *existing_paths]
+    return os.pathsep.join(dict.fromkeys(paths))
+
+
+def _env_name_for_ref(secret_ref: Any) -> str | None:
+    if secret_ref.key and secret_ref.key.strip():
+        return secret_ref.key.strip()
+    if secret_ref.ref.startswith("env://"):
+        return secret_ref.ref[len("env://"):].strip() or None
+    if secret_ref.ref.startswith("env:"):
+        return secret_ref.ref[len("env:"):].strip() or None
+    return None
+
+
+def _settings_env_fallback(env_name: str) -> str | None:
+    mapping = {
+        "FIRECRAWL_API_KEY": "firecrawl_api_key",
+        "CONTEXT7_API_KEY": "context7_api_key",
+    }
+    setting_name = mapping.get(env_name)
+    if setting_name is None:
+        return None
+    value = getattr(get_settings(), setting_name, None)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value
+
+
+def build_mcp_process_environment(definition: MCPServerDefinition) -> dict[str, str]:
+    env = {
+        key: value
+        for key in SAFE_MCP_PROCESS_ENV_VARS
+        if (value := os.getenv(key)) is not None
+    }
+    env["PATH"] = _mcp_process_path()
+    for secret_ref in definition.env_refs:
+        env_name = _env_name_for_ref(secret_ref)
+        if not env_name:
+            raise MCPClientError(
+                f"MCP server '{definition.id}' has env ref '{secret_ref.ref}' without a target env var key"
+            )
+        resolved = resolve_secret_ref(secret_ref.ref)
+        if resolved.error:
+            fallback_value = _settings_env_fallback(env_name)
+            if fallback_value is None:
+                raise MCPClientError(
+                    f"MCP server '{definition.id}' could not resolve env ref for '{env_name}': {resolved.error}"
+                )
+            env[env_name] = fallback_value
+            continue
+        env[env_name] = resolved.value or ""
+    return env
+
+
+def resolve_mcp_command(command: str, env: dict[str, str]) -> str:
+    if os.path.sep in command:
+        return command
+    for directory in _split_paths(env.get("PATH")):
+        candidate = Path(directory) / command
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return command
+
+
 class StdioMCPClient(BaseMCPClient):
     def __init__(self, definition: MCPServerDefinition):
         self.definition = definition
@@ -33,11 +135,14 @@ class StdioMCPClient(BaseMCPClient):
             "method": method,
             "params": params or {},
         }
+        env = build_mcp_process_environment(self.definition)
+        command = resolve_mcp_command(self.definition.command, env)
         process = subprocess.Popen(  # noqa: S603
-            [self.definition.command, *self.definition.args],
+            [command, *self.definition.args],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=env,
             text=True,
         )
         try:

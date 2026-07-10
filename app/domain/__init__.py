@@ -1,4 +1,7 @@
-from .agents import AgentDefinition, FrameworkHints, GuardrailDefinition, MemorySettings
+from .agents import AgentDefinition, FrameworkHints, GraphContextSettings, GuardrailDefinition, MemorySettings
+from .ambient_actions import AmbientActionAuditRecord, PendingAmbientAction
+from .api_tokens import API_TOKEN_SCOPE_DEFINITIONS, ApiTokenDefinition, ApiTokenPublicDefinition, \
+    ApiTokenScopeDefinition
 from .conversations import (
     ApprovalRequest,
     ApprovalStatus,
@@ -14,6 +17,7 @@ from .conversations import (
     MainAgentProfile,
 )
 from .credentials import (
+    ConnectorBindingDefinition,
     CredentialDefinition,
     CredentialReference,
     CredentialStatus,
@@ -21,8 +25,11 @@ from .credentials import (
     ProviderEndpointDefinition,
     SecretReference,
 )
+from .documents import DocumentUploadMode, UploadedDocument, UploadedDocumentStatus
 from .events import ExecutionEvent, ExecutionEventType
 from .executions import Execution, ExecutionArtifact, ExecutionStatus
+from .goals import GoalDefinition, GoalStatus
+from .graph_projection import GraphProjectionEvent
 from .integrations import (
     ConnectorCapabilitiesPayload,
     ConnectorCapabilityDefinition,
@@ -32,20 +39,68 @@ from .integrations import (
     ConnectorHealthHistoryPrunePayload,
     ConnectorHealthRetentionRunPayload,
     ConnectorHealthRetentionStatusPayload,
+    ConnectorInstallation,
+    ConnectorInstallationStatus,
     ConnectorMetadataRequirementDefinition,
     ConnectorSetupGuideDefinition,
     ConnectorSetupGuideFieldDefinition,
+    ConnectorSetupGuideOptionDefinition,
+    ConnectorSetupSessionPayload,
     IntegrationRegistryCategoryDefinition,
     IntegrationRegistryPayload,
     PlannedIntegrationDefinition,
 )
-from .memory import MemoryKind, MemoryRecord, MemoryScope, MemoryStatus
-from .models import ModelProfileDefinition, ModelProviderDefinition, ModelProviderType
+from .memory import MemoryType, MemoryRecord, MemoryScope, MemoryStatus
+from .models import ModelFallbackPolicy, ModelFallbackTarget, ModelProfileDefinition, ModelProviderDefinition, \
+    ModelProviderType
+from .onecli import (
+    OneCLIIdentityMapping,
+    OneCLIIdentityMappingStatus,
+    OneCLIRateLimitWindow,
+    OneCLIRuleAction,
+    OneCLIRuleProfile,
+    OneCLIRuleScope,
+    OneCLIRuleTemplate,
+)
+from .personas import (
+    PersonaDefinition,
+    PersonaDistillationItem,
+    PersonaDistillationItemReviewStatus,
+    PersonaDistillationMode,
+    PersonaDistillationItemType,
+    PersonaDistillationRun,
+    PersonaDistillationStatus,
+    PersonaLLMModelSource,
+    PersonaMemoryLayer,
+    PersonaSource,
+    PersonaSourceType,
+    PersonaStatus,
+    PersonaVersion,
+    PersonaVersionStatus,
+)
 from .protocols import MCPServerDefinition, MCPTransportType
+from .public_endpoints import PublicEndpointRecord
+from .runtime_governance import (
+    ContextCompactionRecord,
+    ContextHealth,
+    SubAgentStatusUpdate,
+    SupervisorSteeringDecision,
+    TokenBudgetPolicy,
+    TokenBudgetStatus,
+    TokenUsage,
+)
 from .runtime_revisions import RuntimeRevision, RuntimeRevisionStatus
 from .schedules import ScheduleDefinition, ScheduleType
+from .speech import (
+    SpeechAnnouncementRequest,
+    SpeechAnnouncementResponse,
+    SpeechAnnouncementTargetKind,
+    SpeechContinuationRequest,
+    SpeechContinuationResponse,
+)
 from .tools import MCPExposureSettings, SecuritySettings, ToolDefinition, ToolImplementationReference, ToolType
 from .users import UserDefinition, UserStatus
+from .webhooks import OutboundWebhookAttempt
 from .workflows import (
     EdgeType,
     NodeType,
@@ -57,17 +112,26 @@ from .workflows import (
     WorkflowEdgeDefinition,
     WorkflowNodeDefinition,
 )
+from .xr import XRSession, XRSessionStatus
 
 __all__ = [
     "AgentDefinition",
+    "AmbientActionAuditRecord",
+    "ApiTokenDefinition",
+    "ApiTokenPublicDefinition",
+    "ApiTokenScopeDefinition",
+    "API_TOKEN_SCOPE_DEFINITIONS",
     "ApprovalRequest",
     "ApprovalStatus",
     "ApprovalTargetType",
     "ApprovalType",
     "ChannelIdentityMapping",
+    "ConnectorBindingDefinition",
     "CredentialDefinition",
     "CredentialReference",
     "CredentialStatus",
+    "ContextCompactionRecord",
+    "ContextHealth",
     "Conversation",
     "ConversationChannelType",
     "ConversationMessage",
@@ -82,10 +146,15 @@ __all__ = [
     "ConnectorHealthHistoryPrunePayload",
     "ConnectorHealthRetentionRunPayload",
     "ConnectorHealthRetentionStatusPayload",
+    "ConnectorInstallation",
+    "ConnectorInstallationStatus",
     "ConnectorMetadataRequirementDefinition",
     "ConnectorSetupGuideDefinition",
     "ConnectorSetupGuideFieldDefinition",
+    "ConnectorSetupGuideOptionDefinition",
+    "ConnectorSetupSessionPayload",
     "DomainModel",
+    "DocumentUploadMode",
     "EdgeType",
     "Execution",
     "ExecutionArtifact",
@@ -93,6 +162,10 @@ __all__ = [
     "ExecutionEventType",
     "ExecutionStatus",
     "FrameworkHints",
+    "GraphContextSettings",
+    "GoalDefinition",
+    "GoalStatus",
+    "GraphProjectionEvent",
     "GuardrailDefinition",
     "IntegrationRegistryCategoryDefinition",
     "IntegrationRegistryPayload",
@@ -102,31 +175,71 @@ __all__ = [
     "MemorySettings",
     "MainAgentProfile",
     "MemoryRecord",
-    "MemoryKind",
+    "MemoryType",
+    "ModelFallbackPolicy",
+    "ModelFallbackTarget",
     "ModelProfileDefinition",
     "ModelProviderDefinition",
     "ModelProviderType",
     "MemoryScope",
     "MemoryStatus",
     "NodeType",
+    "OneCLIIdentityMapping",
+    "OneCLIIdentityMappingStatus",
+    "OneCLIRateLimitWindow",
+    "OneCLIRuleAction",
+    "OneCLIRuleProfile",
+    "OneCLIRuleScope",
+    "OneCLIRuleTemplate",
+    "OutboundWebhookAttempt",
     "ProviderEndpointDefinition",
+    "PublicEndpointRecord",
     "PlannedIntegrationDefinition",
+    "PendingAmbientAction",
     "RuntimeRevision",
     "RuntimeAdapterDefinition",
     "RuntimeAdapterType",
+    "SubAgentStatusUpdate",
+    "SupervisorSteeringDecision",
+    "TokenBudgetPolicy",
+    "TokenBudgetStatus",
+    "TokenUsage",
     "RuntimeRevisionStatus",
     "ScheduleDefinition",
     "ScheduleType",
     "SecretReference",
     "SecuritySettings",
+    "PersonaDefinition",
+    "PersonaDistillationItem",
+    "PersonaDistillationItemReviewStatus",
+    "PersonaDistillationMode",
+    "PersonaDistillationItemType",
+    "PersonaDistillationRun",
+    "PersonaDistillationStatus",
+    "PersonaLLMModelSource",
+    "PersonaMemoryLayer",
+    "PersonaSource",
+    "PersonaSourceType",
+    "PersonaStatus",
+    "PersonaVersion",
+    "PersonaVersionStatus",
     "TaskDefinition",
     "ToolImplementationReference",
     "ToolType",
     "ToolDefinition",
+    "UploadedDocument",
+    "UploadedDocumentStatus",
     "UserDefinition",
     "UserStatus",
+    "SpeechAnnouncementRequest",
+    "SpeechAnnouncementResponse",
+    "SpeechAnnouncementTargetKind",
+    "SpeechContinuationRequest",
+    "SpeechContinuationResponse",
     "VersionDefinition",
     "WorkflowDefinition",
     "WorkflowEdgeDefinition",
     "WorkflowNodeDefinition",
+    "XRSession",
+    "XRSessionStatus",
 ]

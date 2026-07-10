@@ -1,52 +1,76 @@
+"""SQL repositories that translate ORM rows into domain models.
+
+These classes provide the production persistence boundary for catalogs, users,
+credentials, conversations, schedules, runtime adapters, revisions, MCP servers,
+and workflows. API services should depend on these repository interfaces rather
+than on ORM rows directly.
+"""
+
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
-from uuid import uuid4
-
 from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 from typing import Any, Protocol, TypeVar
+from uuid import uuid4
 
+from app.core.config import get_settings
 from app.core.time import ensure_utc, utc_now
 from app.db.models import (
     AgentORM,
+    ApiTokenORM,
     ChannelIdentityMappingORM,
     ConversationApprovalRequestORM,
     ConversationMessageORM,
     ConversationORM,
+    ConnectorInstallationORM,
     CredentialORM,
+    GoalORM,
     MainAgentProfileORM,
     MCPServerORM,
     ModelProfileORM,
     ModelProviderORM,
+    OneCLIIdentityMappingORM,
+    PublicEndpointORM,
     RuntimeRevisionORM,
     RuntimeAdapterORM,
     ScheduleFireClaimORM,
     ScheduleORM,
     ToolORM,
+    UserORM,
     WorkflowORM,
     WorkflowVersionORM,
 )
 from app.domain import (
     AgentDefinition,
+    ApiTokenDefinition,
     ApprovalRequest,
     ChannelIdentityMapping,
     Conversation,
     ConversationMessage,
+    ConnectorInstallation,
     CredentialDefinition,
+    GoalDefinition,
+    GoalStatus,
     MainAgentProfile,
     MCPServerDefinition,
     ModelProfileDefinition,
     ModelProviderDefinition,
+    OneCLIIdentityMapping,
+    PublicEndpointRecord,
+    GraphProjectionEvent,
     RuntimeRevision,
     RuntimeAdapterDefinition,
     ScheduleDefinition,
     ToolDefinition,
+    UserDefinition,
     WorkflowDefinition,
 )
 
 T = TypeVar("T")
+logger = logging.getLogger(__name__)
 
 
 class DomainRepository(Protocol):
@@ -75,6 +99,8 @@ class SQLDomainRepositoryBase:
 
 class SQLAgentRepository(SQLDomainRepositoryBase):
     def _to_domain(self, orm: AgentORM) -> AgentDefinition:
+        metadata = dict(orm.metadata_json or {})
+        metadata["enabled"] = orm.enabled
         return AgentDefinition.model_validate(
             {
                 "id": orm.id,
@@ -90,11 +116,12 @@ class SQLAgentRepository(SQLDomainRepositoryBase):
                 "guardrails": orm.guardrails_json,
                 "memory": orm.memory_json,
                 "framework_hints": orm.framework_hints_json,
-                "metadata": {"enabled": orm.enabled},
+                "metadata": metadata,
             }
         )
 
     def _to_orm(self, item: AgentDefinition) -> AgentORM:
+        metadata = {key: value for key, value in item.metadata.items() if key != "enabled"}
         return AgentORM(
             id=item.id,
             name=item.name,
@@ -109,6 +136,7 @@ class SQLAgentRepository(SQLDomainRepositoryBase):
             guardrails_json=[guardrail.model_dump(mode="json") for guardrail in item.guardrails],
             memory_json=item.memory.model_dump(mode="json"),
             framework_hints_json=item.framework_hints.model_dump(mode="json"),
+            metadata_json=metadata,
             enabled=item.metadata.get("enabled", True),
         )
 
@@ -141,6 +169,7 @@ class SQLAgentRepository(SQLDomainRepositoryBase):
                         "guardrails_json",
                         "memory_json",
                         "framework_hints_json",
+                        "metadata_json",
                         "enabled",
                 ):
                     setattr(entity, field, getattr(source, field))
@@ -170,14 +199,126 @@ class SQLAgentRepository(SQLDomainRepositoryBase):
             return None
         merged = current.model_dump(mode="json")
         metadata = dict(current.metadata)
+        patch_metadata = patch.get("metadata")
+        if isinstance(patch_metadata, dict):
+            metadata.update(patch_metadata)
         if "enabled" in patch:
             metadata["enabled"] = patch["enabled"]
-        merged.update({k: v for k, v in patch.items() if k != "enabled"})
+        merged.update({k: v for k, v in patch.items() if k not in {"enabled", "metadata"}})
         merged["metadata"] = metadata
         return await self.save(AgentDefinition.model_validate(merged))
 
     async def soft_delete(self, item_id: str) -> bool:
         updated = await self.update(item_id, {"enabled": False})
+        return updated is not None
+
+
+class SQLGoalRepository(SQLDomainRepositoryBase):
+    def _to_domain(self, orm: GoalORM) -> GoalDefinition:
+        return GoalDefinition.model_validate(
+            {
+                "id": orm.id,
+                "objective": orm.objective,
+                "status": orm.status,
+                "priority": orm.priority,
+                "owner_actor": orm.owner_actor,
+                "parent_goal_id": orm.parent_goal_id,
+                "success_criteria": orm.success_criteria_json or [],
+                "constraints": orm.constraints_json or {},
+                "execution_ids": orm.execution_ids_json or [],
+                "evidence": orm.evidence_json or [],
+                "evaluation": orm.evaluation_json,
+                "deadline_at": orm.deadline_at,
+                "completed_at": orm.completed_at,
+                "created_at": orm.created_at,
+                "updated_at": orm.updated_at,
+                "metadata": orm.metadata_json or {},
+            }
+        )
+
+    def _to_orm(self, item: GoalDefinition) -> GoalORM:
+        return GoalORM(
+            id=item.id,
+            objective=item.objective,
+            status=item.status.value,
+            priority=item.priority,
+            owner_actor=item.owner_actor,
+            parent_goal_id=item.parent_goal_id,
+            success_criteria_json=item.success_criteria,
+            constraints_json=item.constraints,
+            execution_ids_json=item.execution_ids,
+            evidence_json=item.evidence,
+            evaluation_json=item.evaluation,
+            deadline_at=item.deadline_at,
+            completed_at=item.completed_at,
+            created_at=item.created_at,
+            updated_at=item.updated_at,
+            metadata_json=item.metadata,
+        )
+
+    async def create(self, item: GoalDefinition) -> GoalDefinition:
+        async with self.session_factory() as session:
+            entity = self._to_orm(item)
+            session.add(entity)
+            entity = await self._commit_and_refresh(session, entity)
+            return self._to_domain(entity)
+
+    async def save(self, item: GoalDefinition) -> GoalDefinition:
+        async with self.session_factory() as session:
+            existing = await session.get(GoalORM, item.id)
+            if existing is None:
+                entity = self._to_orm(item)
+                session.add(entity)
+            else:
+                entity = existing
+                source = self._to_orm(item)
+                for field in (
+                        "objective",
+                        "status",
+                        "priority",
+                        "owner_actor",
+                        "parent_goal_id",
+                        "success_criteria_json",
+                        "constraints_json",
+                        "execution_ids_json",
+                        "evidence_json",
+                        "evaluation_json",
+                        "deadline_at",
+                        "completed_at",
+                        "metadata_json",
+                ):
+                    setattr(entity, field, getattr(source, field))
+            entity = await self._commit_and_refresh(session, entity)
+            return self._to_domain(entity)
+
+    async def list(self, *, include_deleted: bool = False) -> list[GoalDefinition]:
+        async with self.session_factory() as session:
+            stmt = select(GoalORM)
+            if not include_deleted:
+                stmt = stmt.where(GoalORM.status != GoalStatus.ABANDONED.value)
+            result = await session.execute(stmt.order_by(GoalORM.created_at.desc()))
+            return [self._to_domain(item) for item in result.scalars().all()]
+
+    async def get(self, item_id: str, *, include_deleted: bool = False) -> GoalDefinition | None:
+        async with self.session_factory() as session:
+            item = await session.get(GoalORM, item_id)
+            if item is None:
+                return None
+            if not include_deleted and item.status == GoalStatus.ABANDONED.value:
+                return None
+            return self._to_domain(item)
+
+    async def update(self, item_id: str, patch: dict[str, Any]) -> GoalDefinition | None:
+        current = await self.get(item_id, include_deleted=True)
+        if current is None:
+            return None
+        merged = current.model_dump(mode="json")
+        merged.update(patch)
+        merged["id"] = item_id
+        return await self.save(GoalDefinition.model_validate(merged))
+
+    async def soft_delete(self, item_id: str) -> bool:
+        updated = await self.update(item_id, {"status": GoalStatus.ABANDONED.value})
         return updated is not None
 
 
@@ -965,6 +1106,9 @@ class SQLModelProfileRepository(SQLDomainRepositoryBase):
                 "supports_vision": orm.supports_vision,
                 "supports_streaming": orm.supports_streaming,
                 "parameters": config.get("parameters", {}),
+                "fallback_strategy": config.get("fallback_strategy", "auto"),
+                "fallback_models": config.get("fallback_models", []),
+                "fallback_policy": config.get("fallback_policy", {}),
                 "framework_hints": config.get("framework_hints", {}),
                 "base_url": config.get("base_url"),
                 "api_key_ref": config.get("api_key_ref"),
@@ -988,6 +1132,9 @@ class SQLModelProfileRepository(SQLDomainRepositoryBase):
             supports_streaming=item.supports_streaming,
             config_json={
                 "parameters": item.parameters,
+                "fallback_strategy": item.fallback_strategy,
+                "fallback_models": [target.model_dump(mode="json") for target in item.fallback_models],
+                "fallback_policy": item.fallback_policy.model_dump(mode="json"),
                 "framework_hints": item.framework_hints.model_dump(mode="json"),
                 "base_url": item.base_url,
                 "api_key_ref": item.api_key_ref,
@@ -1453,6 +1600,554 @@ class SQLCredentialRepository(SQLDomainRepositoryBase):
             return True
 
 
+class SQLConnectorInstallationRepository(SQLDomainRepositoryBase):
+    def _to_domain(self, orm: ConnectorInstallationORM) -> ConnectorInstallation:
+        return ConnectorInstallation.model_validate(
+            {
+                "id": orm.id,
+                "owner_user_id": orm.owner_user_id,
+                "workflow_id": orm.workflow_id,
+                "provider": orm.provider,
+                "name": orm.name,
+                "onecli_credential_ref": orm.onecli_credential_ref,
+                "runtime_secret_encrypted": orm.runtime_secret_encrypted,
+                "status": orm.status,
+                "setup_session_id": orm.setup_session_id,
+                "last_rotated_at": orm.last_rotated_at,
+                "revoked_at": orm.revoked_at,
+                "metadata": orm.metadata_json or {},
+            }
+        )
+
+    def _to_orm(self, item: ConnectorInstallation) -> ConnectorInstallationORM:
+        return ConnectorInstallationORM(
+            id=item.id,
+            owner_user_id=item.owner_user_id,
+            workflow_id=item.workflow_id,
+            provider=item.provider,
+            name=item.name,
+            onecli_credential_ref=item.onecli_credential_ref,
+            runtime_secret_encrypted=item.runtime_secret_encrypted,
+            status=item.status,
+            setup_session_id=item.setup_session_id,
+            last_rotated_at=item.last_rotated_at,
+            revoked_at=item.revoked_at,
+            metadata_json=item.metadata,
+        )
+
+    async def create(self, item: ConnectorInstallation) -> ConnectorInstallation:
+        async with self.session_factory() as session:
+            entity = self._to_orm(item)
+            session.add(entity)
+            entity = await self._commit_and_refresh(session, entity)
+            return self._to_domain(entity)
+
+    async def save(self, item: ConnectorInstallation) -> ConnectorInstallation:
+        async with self.session_factory() as session:
+            existing = await session.get(ConnectorInstallationORM, item.id)
+            if existing is None:
+                entity = self._to_orm(item)
+                session.add(entity)
+            else:
+                source = self._to_orm(item)
+                entity = existing
+                for field in (
+                        "owner_user_id",
+                        "workflow_id",
+                        "provider",
+                        "name",
+                        "onecli_credential_ref",
+                        "runtime_secret_encrypted",
+                        "status",
+                        "setup_session_id",
+                        "last_rotated_at",
+                        "revoked_at",
+                        "metadata_json",
+                ):
+                    setattr(entity, field, getattr(source, field))
+            entity = await self._commit_and_refresh(session, entity)
+            return self._to_domain(entity)
+
+    async def list(self, *, include_deleted: bool = False) -> list[ConnectorInstallation]:
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ConnectorInstallationORM).order_by(ConnectorInstallationORM.name.asc())
+            )
+            return [self._to_domain(item) for item in result.scalars().all()]
+
+    async def list_by_owner(self, owner_user_id: str) -> list[ConnectorInstallation]:
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ConnectorInstallationORM)
+                .where(ConnectorInstallationORM.owner_user_id == owner_user_id)
+                .order_by(ConnectorInstallationORM.name.asc())
+            )
+            return [self._to_domain(item) for item in result.scalars().all()]
+
+    async def get(self, item_id: str, *, include_deleted: bool = False) -> ConnectorInstallation | None:
+        async with self.session_factory() as session:
+            item = await session.get(ConnectorInstallationORM, item_id)
+            return None if item is None else self._to_domain(item)
+
+    async def update(self, item_id: str, patch: dict[str, Any]) -> ConnectorInstallation | None:
+        current = await self.get(item_id, include_deleted=True)
+        if current is None:
+            return None
+        merged = current.model_dump(mode="json")
+        merged["runtime_secret_encrypted"] = current.runtime_secret_encrypted
+        merged.update(patch)
+        return await self.save(ConnectorInstallation.model_validate(merged))
+
+
+class SQLPublicEndpointRepository(SQLDomainRepositoryBase):
+    def _to_domain(self, orm: PublicEndpointORM) -> PublicEndpointRecord:
+        return PublicEndpointRecord.model_validate(
+            {
+                "id": orm.id,
+                "endpoint_type": orm.endpoint_type,
+                "provider": orm.provider,
+                "url": orm.url,
+                "status": orm.status,
+                "source": orm.source,
+                "metadata": orm.metadata_json or {},
+                "last_seen_at": orm.last_seen_at,
+            }
+        )
+
+    def _to_orm(self, item: PublicEndpointRecord) -> PublicEndpointORM:
+        return PublicEndpointORM(
+            id=item.id,
+            endpoint_type=item.endpoint_type,
+            provider=item.provider,
+            url=item.url,
+            status=item.status,
+            source=item.source,
+            metadata_json=item.metadata,
+            last_seen_at=item.last_seen_at,
+        )
+
+    async def create(self, item: PublicEndpointRecord) -> PublicEndpointRecord:
+        async with self.session_factory() as session:
+            entity = self._to_orm(item)
+            session.add(entity)
+            entity = await self._commit_and_refresh(session, entity)
+            return self._to_domain(entity)
+
+    async def save(self, item: PublicEndpointRecord) -> PublicEndpointRecord:
+        async with self.session_factory() as session:
+            existing = await session.get(PublicEndpointORM, item.id)
+            if existing is None:
+                entity = self._to_orm(item)
+                session.add(entity)
+            else:
+                source = self._to_orm(item)
+                entity = existing
+                for field in (
+                        "endpoint_type",
+                        "provider",
+                        "url",
+                        "status",
+                        "source",
+                        "metadata_json",
+                        "last_seen_at",
+                ):
+                    setattr(entity, field, getattr(source, field))
+            entity = await self._commit_and_refresh(session, entity)
+            return self._to_domain(entity)
+
+    async def list(self, *, include_deleted: bool = False) -> list[PublicEndpointRecord]:
+        async with self.session_factory() as session:
+            result = await session.execute(select(PublicEndpointORM).order_by(PublicEndpointORM.created_at.asc()))
+            return [self._to_domain(item) for item in result.scalars().all()]
+
+    async def get(self, item_id: str, *, include_deleted: bool = False) -> PublicEndpointRecord | None:
+        async with self.session_factory() as session:
+            item = await session.get(PublicEndpointORM, item_id)
+            return None if item is None else self._to_domain(item)
+
+    async def update(self, item_id: str, patch: dict[str, Any]) -> PublicEndpointRecord | None:
+        current = await self.get(item_id, include_deleted=True)
+        if current is None:
+            return None
+        merged = current.model_dump(mode="json")
+        merged.update(patch)
+        return await self.save(PublicEndpointRecord.model_validate(merged))
+
+    async def soft_delete(self, item_id: str) -> bool:
+        return False
+
+    async def get_latest_active(self, endpoint_type: str) -> PublicEndpointRecord | None:
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(PublicEndpointORM)
+                .where(
+                    PublicEndpointORM.endpoint_type == endpoint_type,
+                    PublicEndpointORM.status == "active",
+                )
+                .order_by(PublicEndpointORM.last_seen_at.desc(), PublicEndpointORM.created_at.desc())
+                .limit(1)
+            )
+            item = result.scalars().first()
+            return None if item is None else self._to_domain(item)
+
+    async def deactivate_active(self, endpoint_type: str) -> None:
+        async with self.session_factory() as session:
+            await session.execute(
+                update(PublicEndpointORM)
+                .where(
+                    PublicEndpointORM.endpoint_type == endpoint_type,
+                    PublicEndpointORM.status == "active",
+                )
+                .values(status="inactive")
+            )
+            await session.commit()
+
+    async def soft_delete(self, item_id: str) -> bool:
+        async with self.session_factory() as session:
+            item = await session.get(ConnectorInstallationORM, item_id)
+            if item is None:
+                return False
+            await session.delete(item)
+            await session.commit()
+            return True
+        return None
+
+
+class SQLApiTokenRepository(SQLDomainRepositoryBase):
+    def _to_domain(self, orm: ApiTokenORM) -> ApiTokenDefinition:
+        return ApiTokenDefinition.model_validate(
+            {
+                "id": orm.id,
+                "owner_user_id": orm.owner_user_id,
+                "name": orm.name,
+                "token_hash": orm.token_hash,
+                "prefix": orm.prefix,
+                "last4": orm.last4,
+                "scopes": orm.scopes_json or [],
+                "expires_at": orm.expires_at,
+                "revoked_at": orm.revoked_at,
+                "last_used_at": orm.last_used_at,
+                "metadata": orm.metadata_json or {},
+            }
+        )
+
+    def _to_orm(self, item: ApiTokenDefinition) -> ApiTokenORM:
+        return ApiTokenORM(
+            id=item.id,
+            owner_user_id=item.owner_user_id,
+            name=item.name,
+            token_hash=item.token_hash,
+            prefix=item.prefix,
+            last4=item.last4,
+            scopes_json=item.scopes,
+            expires_at=item.expires_at,
+            revoked_at=item.revoked_at,
+            last_used_at=item.last_used_at,
+            metadata_json=item.metadata,
+        )
+
+    async def create(self, item: ApiTokenDefinition) -> ApiTokenDefinition:
+        async with self.session_factory() as session:
+            entity = self._to_orm(item)
+            session.add(entity)
+            entity = await self._commit_and_refresh(session, entity)
+            return self._to_domain(entity)
+
+    async def save(self, item: ApiTokenDefinition) -> ApiTokenDefinition:
+        async with self.session_factory() as session:
+            existing = await session.get(ApiTokenORM, item.id)
+            if existing is None:
+                entity = self._to_orm(item)
+                session.add(entity)
+            else:
+                source = self._to_orm(item)
+                entity = existing
+                for field in (
+                        "owner_user_id",
+                        "name",
+                        "token_hash",
+                        "prefix",
+                        "last4",
+                        "scopes_json",
+                        "expires_at",
+                        "revoked_at",
+                        "last_used_at",
+                        "metadata_json",
+                ):
+                    setattr(entity, field, getattr(source, field))
+            entity = await self._commit_and_refresh(session, entity)
+            return self._to_domain(entity)
+
+    async def list(self, *, include_deleted: bool = False) -> list[ApiTokenDefinition]:
+        async with self.session_factory() as session:
+            result = await session.execute(select(ApiTokenORM).order_by(ApiTokenORM.name.asc()))
+            return [self._to_domain(item) for item in result.scalars().all()]
+
+    async def list_by_owner(self, owner_user_id: str) -> list[ApiTokenDefinition]:
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ApiTokenORM)
+                .where(ApiTokenORM.owner_user_id == owner_user_id)
+                .order_by(ApiTokenORM.name.asc())
+            )
+            return [self._to_domain(item) for item in result.scalars().all()]
+
+    async def get(self, item_id: str, *, include_deleted: bool = False) -> ApiTokenDefinition | None:
+        async with self.session_factory() as session:
+            item = await session.get(ApiTokenORM, item_id)
+            return None if item is None else self._to_domain(item)
+
+    async def find_by_hash(self, token_hash: str) -> ApiTokenDefinition | None:
+        async with self.session_factory() as session:
+            result = await session.execute(select(ApiTokenORM).where(ApiTokenORM.token_hash == token_hash))
+            item = result.scalars().first()
+            return None if item is None else self._to_domain(item)
+
+    async def update(self, item_id: str, patch: dict[str, Any]) -> ApiTokenDefinition | None:
+        current = await self.get(item_id, include_deleted=True)
+        if current is None:
+            return None
+        merged = current.model_dump(mode="json")
+        merged.update(patch)
+        return await self.save(ApiTokenDefinition.model_validate(merged))
+
+    async def soft_delete(self, item_id: str) -> bool:
+        item = await self.get(item_id)
+        if item is None:
+            return False
+        await self.update(item_id, {"revoked_at": utc_now()})
+        return True
+
+
+class SQLUserRepository(SQLDomainRepositoryBase):
+    def _to_domain(self, orm: UserORM) -> UserDefinition:
+        return UserDefinition.model_validate(
+            {
+                "id": orm.id,
+                "email": orm.email,
+                "display_name": orm.display_name,
+                "avatar_url": orm.avatar_url,
+                "status": orm.status,
+                "roles": orm.roles_json or [],
+                "provider": orm.provider,
+                "provider_subject": orm.provider_subject,
+                "provider_account_id": orm.provider_account_id,
+                "metadata": orm.metadata_json or {},
+            }
+        )
+
+    def _to_orm(self, item: UserDefinition) -> UserORM:
+        return UserORM(
+            id=item.id,
+            email=item.email.lower(),
+            display_name=item.display_name,
+            avatar_url=item.avatar_url,
+            status=item.status.value if hasattr(item.status, "value") else str(item.status),
+            roles_json=item.roles,
+            provider=item.provider,
+            provider_subject=item.provider_subject,
+            provider_account_id=item.provider_account_id,
+            metadata_json=item.metadata,
+        )
+
+    async def create(self, item: UserDefinition) -> UserDefinition:
+        async with self.session_factory() as session:
+            entity = self._to_orm(item)
+            session.add(entity)
+            entity = await self._commit_and_refresh(session, entity)
+            return self._to_domain(entity)
+
+    async def save(self, item: UserDefinition) -> UserDefinition:
+        async with self.session_factory() as session:
+            existing = await session.get(UserORM, item.id)
+            if existing is None:
+                entity = self._to_orm(item)
+                session.add(entity)
+            else:
+                source = self._to_orm(item)
+                entity = existing
+                for field in (
+                        "email",
+                        "display_name",
+                        "avatar_url",
+                        "status",
+                        "roles_json",
+                        "provider",
+                        "provider_subject",
+                        "provider_account_id",
+                        "metadata_json",
+                ):
+                    setattr(entity, field, getattr(source, field))
+            entity = await self._commit_and_refresh(session, entity)
+            return self._to_domain(entity)
+
+    async def list(self, *, include_deleted: bool = False) -> list[UserDefinition]:
+        async with self.session_factory() as session:
+            result = await session.execute(select(UserORM).order_by(UserORM.email.asc()))
+            return [self._to_domain(item) for item in result.scalars().all()]
+
+    async def get(self, item_id: str, *, include_deleted: bool = False) -> UserDefinition | None:
+        async with self.session_factory() as session:
+            item = await session.get(UserORM, item_id)
+            return None if item is None else self._to_domain(item)
+
+    async def find_by_email(self, email: str) -> UserDefinition | None:
+        async with self.session_factory() as session:
+            result = await session.execute(select(UserORM).where(UserORM.email == email.lower()))
+            item = result.scalars().first()
+            return None if item is None else self._to_domain(item)
+
+    async def find_by_external_identity(self, provider: str, provider_subject: str) -> UserDefinition | None:
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(UserORM).where(
+                    UserORM.provider == provider,
+                    UserORM.provider_subject == provider_subject,
+                )
+            )
+            item = result.scalars().first()
+            return None if item is None else self._to_domain(item)
+
+    async def search_by_email(self, email: str) -> list[UserDefinition]:
+        pattern = f"%{email.lower()}%"
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(UserORM).where(UserORM.email.ilike(pattern)).order_by(UserORM.email.asc())
+            )
+            return [self._to_domain(item) for item in result.scalars().all()]
+
+    async def upsert_from_identity(self, item: UserDefinition) -> UserDefinition:
+        existing = None
+        if item.provider and item.provider_subject:
+            existing = await self.find_by_external_identity(item.provider, item.provider_subject)
+        if existing is None:
+            existing = await self.find_by_email(item.email)
+        if existing is None:
+            return await self.create(item)
+        merged = existing.model_dump(mode="json")
+        incoming = item.model_dump(mode="json", exclude_none=True)
+        if "roles" not in item.model_fields_set:
+            incoming.pop("roles", None)
+        if "metadata" in item.model_fields_set:
+            incoming["metadata"] = {**existing.metadata, **item.metadata}
+        merged.update(incoming)
+        merged["id"] = existing.id
+        return await self.save(UserDefinition.model_validate(merged))
+
+    async def update(self, item_id: str, patch: dict[str, Any]) -> UserDefinition | None:
+        current = await self.get(item_id, include_deleted=True)
+        if current is None:
+            return None
+        merged = current.model_dump(mode="json")
+        merged.update(patch)
+        return await self.save(UserDefinition.model_validate(merged))
+
+    async def soft_delete(self, item_id: str) -> bool:
+        item = await self.get(item_id)
+        if item is None:
+            return False
+        await self.update(item_id, {"status": "disabled"})
+        return True
+
+
+class SQLOneCLIIdentityMappingRepository(SQLDomainRepositoryBase):
+    def _to_domain(self, orm: OneCLIIdentityMappingORM) -> OneCLIIdentityMapping:
+        return OneCLIIdentityMapping.model_validate(
+            {
+                "id": orm.id,
+                "owner_user_id": orm.owner_user_id,
+                "name": orm.name,
+                "onecli_agent_id": orm.onecli_agent_id,
+                "agent_token_secret_ref": orm.agent_token_secret_ref,
+                "status": orm.status,
+                "workflow_id": orm.workflow_id,
+                "metadata": orm.metadata_json or {},
+            }
+        )
+
+    def _to_orm(self, item: OneCLIIdentityMapping) -> OneCLIIdentityMappingORM:
+        return OneCLIIdentityMappingORM(
+            id=item.id,
+            owner_user_id=item.owner_user_id,
+            name=item.name,
+            onecli_agent_id=item.onecli_agent_id,
+            agent_token_secret_ref=item.agent_token_secret_ref,
+            status=item.status.value if hasattr(item.status, "value") else str(item.status),
+            workflow_id=item.workflow_id,
+            metadata_json=item.metadata,
+        )
+
+    async def create(self, item: OneCLIIdentityMapping) -> OneCLIIdentityMapping:
+        async with self.session_factory() as session:
+            entity = self._to_orm(item)
+            session.add(entity)
+            entity = await self._commit_and_refresh(session, entity)
+            return self._to_domain(entity)
+
+    async def save(self, item: OneCLIIdentityMapping) -> OneCLIIdentityMapping:
+        async with self.session_factory() as session:
+            existing = await session.get(OneCLIIdentityMappingORM, item.id)
+            if existing is None:
+                entity = self._to_orm(item)
+                session.add(entity)
+            else:
+                source = self._to_orm(item)
+                entity = existing
+                for field in (
+                        "owner_user_id",
+                        "name",
+                        "onecli_agent_id",
+                        "agent_token_secret_ref",
+                        "status",
+                        "workflow_id",
+                        "metadata_json",
+                ):
+                    setattr(entity, field, getattr(source, field))
+            entity = await self._commit_and_refresh(session, entity)
+            return self._to_domain(entity)
+
+    async def list(self, *, include_deleted: bool = False) -> list[OneCLIIdentityMapping]:
+        async with self.session_factory() as session:
+            stmt = select(OneCLIIdentityMappingORM).order_by(OneCLIIdentityMappingORM.name.asc())
+            if not include_deleted:
+                stmt = stmt.where(OneCLIIdentityMappingORM.status == "active")
+            result = await session.execute(stmt)
+            return [self._to_domain(item) for item in result.scalars().all()]
+
+    async def list_by_owner(self, owner_user_id: str, *, include_disabled: bool = False) -> list[OneCLIIdentityMapping]:
+        async with self.session_factory() as session:
+            stmt = (
+                select(OneCLIIdentityMappingORM)
+                .where(OneCLIIdentityMappingORM.owner_user_id == owner_user_id)
+                .order_by(OneCLIIdentityMappingORM.name.asc())
+            )
+            if not include_disabled:
+                stmt = stmt.where(OneCLIIdentityMappingORM.status == "active")
+            result = await session.execute(stmt)
+            return [self._to_domain(item) for item in result.scalars().all()]
+
+    async def get(self, item_id: str, *, include_deleted: bool = False) -> OneCLIIdentityMapping | None:
+        async with self.session_factory() as session:
+            item = await session.get(OneCLIIdentityMappingORM, item_id)
+            if item is None:
+                return None
+            if not include_deleted and item.status != "active":
+                return None
+            return self._to_domain(item)
+
+    async def update(self, item_id: str, patch: dict[str, Any]) -> OneCLIIdentityMapping | None:
+        current = await self.get(item_id, include_deleted=True)
+        if current is None:
+            return None
+        merged = current.model_dump(mode="json")
+        merged.update(patch)
+        return await self.save(OneCLIIdentityMapping.model_validate(merged))
+
+    async def soft_delete(self, item_id: str) -> bool:
+        updated = await self.update(item_id, {"status": "disabled"})
+        return updated is not None
+
+
 class SQLRuntimeRevisionRepository(SQLDomainRepositoryBase):
     def _to_domain(self, orm: RuntimeRevisionORM) -> RuntimeRevision:
         return RuntimeRevision.model_validate(
@@ -1677,7 +2372,163 @@ class SQLMCPServerRepository(SQLDomainRepositoryBase):
             return True
 
 
+def _workflow_projection_agents(workflow: WorkflowDefinition) -> list[dict[str, Any]]:
+    agents: list[dict[str, Any]] = []
+    for agent in workflow.agent_definitions:
+        if not agent.id:
+            continue
+        agents.append(
+            {
+                "id": agent.id,
+                "name": agent.name,
+                "display_name": agent.display_name,
+                "description": agent.description,
+                "role": agent.role,
+                "model_profile_id": agent.model_profile_id,
+                "tool_ids": list(agent.tool_ids),
+                "handoff_agent_ids": list(agent.handoff_agent_ids),
+                "memory_enabled": agent.memory.enabled,
+                "memory_scope": agent.memory.scope,
+                "memory_strategy": agent.memory.strategy,
+                "memory_backend_ref": agent.memory.backend_ref,
+            }
+        )
+    return agents
+
+
+def _workflow_projection_tasks(workflow: WorkflowDefinition) -> list[dict[str, Any]]:
+    tasks: list[dict[str, Any]] = []
+    for task in workflow.task_definitions:
+        if not task.id:
+            continue
+        tasks.append(
+            {
+                "id": task.id,
+                "name": task.name,
+                "description": task.description,
+                "agent_id": task.agent_id,
+                "tool_ids": list(task.tool_ids),
+                "depends_on_task_ids": list(task.depends_on_task_ids),
+                "human_approval_required": task.human_approval_required,
+                "has_input_schema": bool(task.input_schema),
+                "has_output_schema": bool(task.output_schema),
+            }
+        )
+    return tasks
+
+
+def _workflow_projection_tools(workflow: WorkflowDefinition) -> list[dict[str, Any]]:
+    tools: list[dict[str, Any]] = []
+    for tool in workflow.tool_definitions:
+        if not tool.id:
+            continue
+        tools.append(
+            {
+                "id": tool.id,
+                "name": tool.name,
+                "display_name": tool.display_name,
+                "description": tool.description,
+                "tool_type": tool.tool_type.value if hasattr(tool.tool_type, "value") else str(tool.tool_type),
+                "tags": list(tool.tags),
+                "requires_approval": tool.security.requires_approval,
+                "sandbox_required": tool.security.sandbox_required,
+                "allow_shell": tool.security.allow_shell,
+                "allow_browser": tool.security.allow_browser,
+                "allow_filesystem": tool.security.allow_filesystem,
+                "allow_network": tool.security.allow_network,
+                "read_only": tool.security.read_only,
+                "read_only_sql": tool.security.read_only_sql,
+                "dangerous": tool.security.dangerous,
+                "has_input_schema": bool(tool.input_schema),
+                "has_output_schema": bool(tool.output_schema),
+            }
+        )
+    return tools
+
+
+def _workflow_projection_nodes(workflow: WorkflowDefinition) -> list[dict[str, Any]]:
+    nodes: list[dict[str, Any]] = []
+    for node in workflow.nodes:
+        if not node.id:
+            continue
+        nodes.append(
+            {
+                "id": node.id,
+                "name": node.name,
+                "node_type": node.node_type.value if hasattr(node.node_type, "value") else str(node.node_type),
+                "agent_id": node.agent_id,
+                "task_id": node.task_id,
+                "tool_id": node.tool_id,
+            }
+        )
+    return nodes
+
+
+def _workflow_projection_edges(workflow: WorkflowDefinition) -> list[dict[str, Any]]:
+    edges: list[dict[str, Any]] = []
+    for edge in workflow.edges:
+        if not edge.id:
+            continue
+        edges.append(
+            {
+                "id": edge.id,
+                "source_node_id": edge.source_node_id,
+                "target_node_id": edge.target_node_id,
+                "edge_type": edge.edge_type.value if hasattr(edge.edge_type, "value") else str(edge.edge_type),
+                "has_condition": bool(edge.condition),
+            }
+        )
+    return edges
+
+
 class SQLWorkflowRepository(SQLDomainRepositoryBase):
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, graph_projection_event_repo=None):
+        super().__init__(session_factory)
+        self.graph_projection_event_repo = graph_projection_event_repo
+
+    async def _append_projection_event(
+            self,
+            *,
+            event_type: str,
+            workflow: WorkflowDefinition,
+            payload: dict[str, Any] | None = None,
+    ) -> None:
+        if not get_settings().graph_projection_enabled:
+            return
+        if self.graph_projection_event_repo is None:
+            return
+        user_id = workflow.metadata.get("updated_by") or workflow.metadata.get("created_by")
+        try:
+            await self.graph_projection_event_repo.append(
+                GraphProjectionEvent(
+                    event_type=event_type,
+                    aggregate_type="workflow",
+                    aggregate_id=workflow.id,
+                    user_id=user_id if isinstance(user_id, str) else None,
+                    payload={
+                        "workflow_id": workflow.id,
+                        "name": workflow.name,
+                        "description": workflow.description,
+                        "entrypoint": workflow.entrypoint,
+                        "revision": workflow.versioning.revision,
+                        "is_published": workflow.versioning.is_published,
+                        "version": workflow.versioning.version,
+                        "labels": workflow.versioning.labels,
+                        "default_runtime_adapter_id": workflow.default_runtime_adapter_id,
+                        "allowed_runtime_adapter_ids": workflow.allowed_runtime_adapter_ids,
+                        "agents": _workflow_projection_agents(workflow),
+                        "tasks": _workflow_projection_tasks(workflow),
+                        "tools": _workflow_projection_tools(workflow),
+                        "nodes": _workflow_projection_nodes(workflow),
+                        "edges": _workflow_projection_edges(workflow),
+                        **(payload or {}),
+                    },
+                    source="workflow_repository",
+                )
+            )
+        except Exception:
+            logger.exception("Failed to append workflow graph projection event")
+
     async def _load_domain(self, session: AsyncSession, workflow_id: str) -> WorkflowDefinition | None:
         workflow = await session.get(WorkflowORM, workflow_id)
         if workflow is None or not workflow.enabled:
@@ -1718,11 +2569,13 @@ class SQLWorkflowRepository(SQLDomainRepositoryBase):
             session.add(workflow)
             session.add(version)
             await session.commit()
+            await self._append_projection_event(event_type="workflow.created", workflow=item)
             return item
 
     async def save(self, item: WorkflowDefinition) -> WorkflowDefinition:
         async with self.session_factory() as session:
             workflow = await session.get(WorkflowORM, item.id)
+            created = workflow is None
             if workflow is None:
                 workflow = WorkflowORM(
                     id=item.id,
@@ -1754,6 +2607,10 @@ class SQLWorkflowRepository(SQLDomainRepositoryBase):
                 version.definition_json = item.model_dump(mode="json")
                 version.published_at = utc_now() if item.versioning.is_published else None
             await session.commit()
+            await self._append_projection_event(
+                event_type="workflow.created" if created else "workflow.updated",
+                workflow=item,
+            )
             return item
 
     async def list(self, *, include_deleted: bool = False) -> list[WorkflowDefinition]:
@@ -1791,8 +2648,15 @@ class SQLWorkflowRepository(SQLDomainRepositoryBase):
             workflow = await session.get(WorkflowORM, item_id)
             if workflow is None:
                 return False
+            domain_workflow = await self._load_domain(session, item_id)
             workflow.enabled = False
             await session.commit()
+            if domain_workflow is not None:
+                await self._append_projection_event(
+                    event_type="workflow.deleted",
+                    workflow=domain_workflow,
+                    payload={"deleted": True},
+                )
             return True
 
     async def get_workflow(self, workflow_id: str) -> WorkflowDefinition | None:

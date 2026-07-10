@@ -8,25 +8,20 @@ writes and backfills continue to use the model-profile path.
 
 ## Setup
 
-Run the full built-in agent setup:
-
-```bash
-make setup-agents
-```
-
-To update only the Embedding agent:
+Run:
 
 ```bash
 .venv/bin/python scripts/setup.py embedding-agent
 ```
-
-`python scripts/setup.py` provisions this agent together with the main, Coder, and Evaluation agents.
 
 The script creates or updates:
 
 - an Ollama provider, default id `ollama`
 - an embedding model profile, default id `embedding-nemotron-nano`
 - an `Embedding` agent pointing at that profile
+
+The `Embedding` agent is graph-disabled by default and receives no graph tools. Enable graph access only for explicit
+lineage debugging, not routine vectorization.
 
 Default model:
 
@@ -50,6 +45,7 @@ MEMORY_EMBEDDING_MODEL_PROFILE_ID=embedding-nemotron-nano
 MEMORY_EMBEDDING_WRITE_ERRORS_STRICT=false
 ```
 
+After activating the profile, use `POST /memories/embeddings/backfill` to populate vectors for existing memory records.
 New memory writes embed automatically when the profile resolves successfully.
 
 ## Prompt

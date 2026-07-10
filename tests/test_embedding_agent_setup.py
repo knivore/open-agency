@@ -9,6 +9,7 @@ from scripts.setup import (
     DEFAULT_MODEL_PROFILE_ID,
     DEFAULT_PROVIDER_ID,
     setup_embedding_agent,
+    sync_embedding_agent_tool_access,
 )
 
 
@@ -33,6 +34,9 @@ class EmbeddingAgentSetupTests(unittest.TestCase):
         self.assertEqual(result.agent.id, "embedding")
         self.assertEqual(result.agent.model_profile_id, DEFAULT_MODEL_PROFILE_ID)
         self.assertEqual(result.agent.framework_hints.metadata["agent_kind"], "embedding")
+        self.assertFalse(result.agent.graph_context.enabled)
+        self.assertFalse(result.agent.graph_context.auto_retrieval_enabled)
+        self.assertNotIn("agency.graph.context", result.agent.tool_ids)
 
     def test_setup_embedding_agent_is_idempotent(self) -> None:
         first = self._run(setup_embedding_agent(context=self.context, base_url="http://localhost:11434"))
@@ -47,6 +51,17 @@ class EmbeddingAgentSetupTests(unittest.TestCase):
         self.assertEqual([provider.id for provider in providers], [DEFAULT_PROVIDER_ID])
         self.assertEqual([profile.id for profile in profiles], [DEFAULT_MODEL_PROFILE_ID])
         self.assertEqual([agent.id for agent in agents], ["embedding"])
+
+    def test_sync_embedding_agent_tool_access_clears_managed_tool_set(self) -> None:
+        result = self._run(setup_embedding_agent(context=self.context, base_url="http://localhost:11434"))
+        dirty = result.agent.model_copy(update={"tool_ids": ["agency.workflow.list"]})
+        self._run(self.context.agent_repo.save(dirty))
+
+        synced = self._run(sync_embedding_agent_tool_access(context=self.context))
+
+        self.assertIsNotNone(synced)
+        assert synced is not None
+        self.assertEqual(synced.tool_ids, [])
 
 
 if __name__ == "__main__":

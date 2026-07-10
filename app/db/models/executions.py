@@ -1,3 +1,5 @@
+"""ORM mappings for execution state, events, artifacts, approvals, and tool calls."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -38,10 +40,12 @@ class ExecutionORM(TimestampMixin, Base):
         Index("ix_executions_container_id", "container_id"),
         Index("ix_executions_container_status", "container_status"),
         Index("ix_executions_replacement_of_execution_id", "replacement_of_execution_id"),
+        Index("ix_executions_goal_id", "goal_id"),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     workflow_id: Mapped[str] = mapped_column(ForeignKey("workflows.id"), nullable=False)
+    goal_id: Mapped[str | None] = mapped_column(ForeignKey("goals.id"), nullable=True)
     workflow_version_id: Mapped[str | None] = mapped_column(ForeignKey("workflow_versions.id"), nullable=True)
     status: Mapped[str] = mapped_column(String(64), nullable=False)
     runtime_adapter: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -52,6 +56,7 @@ class ExecutionORM(TimestampMixin, Base):
     input_json: Mapped[dict] = mapped_column(JSON_VARIANT, default=dict)
     output_json: Mapped[dict | None] = mapped_column(JSON_VARIANT, nullable=True)
     error_json: Mapped[dict | None] = mapped_column(JSON_VARIANT, nullable=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON_VARIANT, default=dict)
     created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     worker_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     started_at: Mapped[object | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -68,6 +73,7 @@ class ExecutionORM(TimestampMixin, Base):
     restart_reason: Mapped[str | None] = mapped_column(String, nullable=True)
 
     workflow = relationship("WorkflowORM", back_populates="executions")
+    goal = relationship("GoalORM", back_populates="executions")
     workflow_version = relationship("WorkflowVersionORM", back_populates="executions")
     runtime_revision = relationship("RuntimeRevisionORM", back_populates="executions")
     replacement_of_execution = relationship("ExecutionORM", remote_side="ExecutionORM.id")
@@ -130,7 +136,8 @@ class ApprovalRequestORM(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     execution_id: Mapped[str] = mapped_column(ForeignKey("executions.id", ondelete="CASCADE"), nullable=False)
     event_id: Mapped[str | None] = mapped_column(ForeignKey("execution_events.id"), nullable=True)
-    tool_id: Mapped[str | None] = mapped_column(ForeignKey("tools.id"), nullable=True)
+    # Runtime approvals may reference workflow-embedded tools that are not global catalog rows.
+    tool_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(64), nullable=False)
     request_payload_json: Mapped[dict] = mapped_column(JSON_VARIANT, default=dict)
     response_payload_json: Mapped[dict | None] = mapped_column(JSON_VARIANT, nullable=True)
@@ -140,7 +147,6 @@ class ApprovalRequestORM(Base):
 
     execution = relationship("ExecutionORM", back_populates="approval_requests")
     event = relationship("ExecutionEventORM", back_populates="approval_requests")
-    tool = relationship("ToolORM")
 
 
 class ToolInvocationORM(Base):
@@ -148,7 +154,8 @@ class ToolInvocationORM(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     execution_id: Mapped[str] = mapped_column(ForeignKey("executions.id", ondelete="CASCADE"), nullable=False)
-    tool_id: Mapped[str] = mapped_column(ForeignKey("tools.id"), nullable=False)
+    # Invocation history keeps the tool id even when the executed tool only exists inside a workflow version.
+    tool_id: Mapped[str] = mapped_column(String(64), nullable=False)
     event_id: Mapped[str | None] = mapped_column(ForeignKey("execution_events.id"), nullable=True)
     status: Mapped[str] = mapped_column(String(64), nullable=False)
     input_json: Mapped[dict] = mapped_column(JSON_VARIANT, default=dict)
@@ -160,4 +167,3 @@ class ToolInvocationORM(Base):
 
     execution = relationship("ExecutionORM", back_populates="tool_invocations")
     event = relationship("ExecutionEventORM", back_populates="tool_invocations")
-    tool = relationship("ToolORM")

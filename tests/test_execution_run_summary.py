@@ -17,7 +17,7 @@ from app.domain import (
 )
 from app.llm.base import ModelResponse
 from app.llm.registry import LLMEnvironmentConfig
-from app.services import ExecutionRunSummaryService
+from app.services.execution_run_summary import ExecutionRunSummaryService
 
 
 class _RunSummaryFakeModelClient:
@@ -112,14 +112,14 @@ class ExecutionRunSummaryTests(unittest.IsolatedAsyncioTestCase):
             result = await self.context.runtime_registry.start_execution(execution.id)
             summaries = await self.context.memory_repo.query(
                 workflow_id=self.workflow.id,
-                memory_kinds=["run_summary"],
+                memory_types=["run_summary"],
                 statuses=["active"],
                 limit=10,
             )
 
         self.assertEqual(result.status.value, "completed")
         self.assertEqual(len(summaries), 1)
-        self.assertEqual(summaries[0].memory_kind.value, "run_summary")
+        self.assertEqual(summaries[0].memory_type.value, "run_summary")
         self.assertEqual(summaries[0].source_execution_id, execution.id)
         self.assertEqual(summaries[0].metadata["execution_status"], "completed")
 
@@ -133,7 +133,7 @@ class ExecutionRunSummaryTests(unittest.IsolatedAsyncioTestCase):
         await self.context.runtime_registry.start_execution(execution.id)
         summaries = await self.context.memory_repo.query(
             workflow_id=self.workflow.id,
-            memory_kinds=["run_summary"],
+            memory_types=["run_summary"],
             limit=10,
         )
         self.assertEqual(summaries, [])

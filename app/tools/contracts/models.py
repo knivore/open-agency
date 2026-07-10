@@ -1,8 +1,7 @@
 from __future__ import annotations
 
+from pydantic import AliasChoices, Field
 from typing import Any, Literal
-
-from pydantic import Field
 
 from app.domain import DomainModel
 
@@ -13,6 +12,11 @@ class ToolContract(DomainModel):
     name: str
     version: str
     description: str | None = None
+    risk_labels: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("riskLabels", "risk_labels"),
+        serialization_alias="riskLabels",
+    )
     inputs: dict[str, Any]
     outputs: dict[str, Any]
 

@@ -10,6 +10,30 @@ DEFAULT_SECRET_PATTERNS = [
     r"(?i)(api[_-]?key|token|password|secret)",
 ]
 
+SECRET_KEY_NAMES = {
+    "api_key",
+    "apikey",
+    "authorization",
+    "auth_token",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "token",
+    "password",
+    "secret",
+}
+
+
+def key_looks_secret(key: str) -> bool:
+    normalized = key.strip().lower().replace("-", "_")
+    if normalized in SECRET_KEY_NAMES:
+        return True
+    if normalized.endswith(("_api_key", "_apikey", "_auth_token", "_access_token", "_refresh_token")):
+        return True
+    if normalized.endswith(("_password", "_secret")):
+        return True
+    return False
+
 
 class Redactor:
     def __init__(self, *, enabled: bool = True, extra_patterns: list[str] | None = None):
@@ -40,8 +64,7 @@ class Redactor:
             fields: list[str] = []
             for key, item in value.items():
                 nested_path = f"{path}.{key}" if path else str(key)
-                if any(secret in str(key).lower() for secret in
-                       ("api_key", "apikey", "token", "password", "secret", "authorization")):
+                if key_looks_secret(str(key)):
                     result[key] = "[REDACTED]"
                     fields.append(nested_path)
                 else:

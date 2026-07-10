@@ -3,14 +3,12 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from enum import Enum
+from pydantic import Field, field_validator
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
-from pydantic import Field, field_validator
-
 from app.core.time import utc_now
 from app.domain.credentials import DomainModel
-
 
 AGENCY_RUNTIME_EVENT_SCHEMA_VERSION = "agency.runtime-event.v1"
 

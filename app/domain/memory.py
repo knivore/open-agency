@@ -1,3 +1,5 @@
+"""Domain contracts for durable memory records and memory scoping."""
+
 from __future__ import annotations
 
 from datetime import date
@@ -22,10 +24,11 @@ class MemoryScope(str, Enum):
     GLOBAL = "global"
 
 
-class MemoryKind(str, Enum):
+class MemoryType(str, Enum):
     FACT = "fact"
     PREFERENCE = "preference"
     DAILY_SUMMARY = "daily_summary"
+    CONTEXT_PACK = "context_pack"
     DECISION = "decision"
     TASK_COMMITMENT = "task_commitment"
     ARCHIVE = "archive"
@@ -51,7 +54,7 @@ class MemoryRecord(DomainModel):
     workflow_id: str | None = None
     agent_id: str | None = None
     source: str | None = None
-    memory_kind: MemoryKind | None = None
+    memory_type: MemoryType | None = None
     status: MemoryStatus = MemoryStatus.ACTIVE
     importance: int = 50
     summary_date: date | None = None
@@ -84,7 +87,7 @@ class MemoryRecord(DomainModel):
             raise ValueError("Conversation-scoped memory requires conversation_id.")
         if self.scope == MemoryScope.WORKFLOW and not self.workflow_id:
             raise ValueError("Workflow-scoped memory requires workflow_id.")
-        if self.memory_kind == MemoryKind.DAILY_SUMMARY:
+        if self.memory_type == MemoryType.DAILY_SUMMARY:
             if self.summary_date is None:
                 raise ValueError("Daily-summary memory requires summary_date.")
             if not self.source_conversation_id:

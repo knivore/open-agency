@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import urlparse
 
+from app.core.onecli_http import ONECLI_BLOCKED_HEADER_NAMES, ONECLI_BLOCKED_QUERY_PARAM_NAMES
 from app.tools.contracts.models import PolicyRuleResult, PolicyVerdict
 
 MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
@@ -61,6 +62,42 @@ def evaluate_http_request_policy(
         rules.append(PolicyRuleResult(id="http-verify-ssl", outcome="warn", reason="TLS verification is disabled"))
     else:
         rules.append(PolicyRuleResult(id="http-verify-ssl", outcome="ok"))
+
+    if str(payload.get("credential_mode") or "none").lower() == "onecli":
+        headers = payload.get("headers") if isinstance(payload.get("headers"), dict) else {}
+        blocked_headers = sorted(
+            name
+            for name in (str(key).strip().lower() for key in headers)
+            if name in ONECLI_BLOCKED_HEADER_NAMES
+        )
+        if blocked_headers:
+            rules.append(
+                PolicyRuleResult(
+                    id="http-onecli-no-direct-auth-headers",
+                    outcome="deny",
+                    reason="OneCLI mode rejects direct credential-bearing headers: " + ", ".join(blocked_headers),
+                )
+            )
+        else:
+            rules.append(PolicyRuleResult(id="http-onecli-no-direct-auth-headers", outcome="ok"))
+
+        query_params = payload.get("query_params") if isinstance(payload.get("query_params"), dict) else {}
+        blocked_query_params = sorted(
+            name
+            for name in (str(key).strip().lower() for key in query_params)
+            if name in ONECLI_BLOCKED_QUERY_PARAM_NAMES
+        )
+        if blocked_query_params:
+            rules.append(
+                PolicyRuleResult(
+                    id="http-onecli-no-direct-auth-query",
+                    outcome="deny",
+                    reason="OneCLI mode rejects direct credential-bearing query parameters: "
+                           + ", ".join(blocked_query_params),
+                )
+            )
+        else:
+            rules.append(PolicyRuleResult(id="http-onecli-no-direct-auth-query", outcome="ok"))
 
     score = sum(100 if rule.outcome == "deny" else 25 if rule.outcome == "warn" else 0 for rule in rules)
     return PolicyVerdict(score=score, rules=rules)

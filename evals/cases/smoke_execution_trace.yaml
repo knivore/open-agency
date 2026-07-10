@@ -85,7 +85,7 @@ assertions:
   - type: tool_called
     tool_id: agency.workflow.get
   - type: max_total_tokens
-    value: 500
+    value: "500"
   - type: artifact_contains
     name: summary.txt
     value: "Smoke evaluation completed"

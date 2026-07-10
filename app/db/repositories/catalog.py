@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from typing import Any, Dict, Generic, List, Optional, Type, TypeVar
 
 from app.core.time import utc_now
 from app.db.mongo import get_mongodb_db_name, mongo_db_connect
-from app.domain import ModelProfileDefinition, RuntimeAdapterDefinition, RuntimeAdapterType, WorkflowDefinition
+from app.domain import (
+    ModelProfileDefinition,
+    RuntimeAdapterDefinition,
+    RuntimeAdapterType,
+    RuntimeRevision,
+    RuntimeRevisionStatus,
+    WorkflowDefinition,
+)
 
 T = TypeVar("T")
 
@@ -40,7 +46,11 @@ class InMemoryCatalogRepository(BaseCatalogRepository[T]):
         self._items: Dict[str, Dict[str, Any]] = {}
 
     def _serialize(self, item: T) -> Dict[str, Any]:
-        return item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item)
+        payload = item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item)
+        # Preserve internal mirror fields that are intentionally excluded from normal API dumps.
+        if hasattr(item, "runtime_secret_encrypted") and "runtime_secret_encrypted" not in payload:
+            payload["runtime_secret_encrypted"] = getattr(item, "runtime_secret_encrypted")
+        return payload
 
     def _deserialize(self, payload: Dict[str, Any]) -> T:
         clean = {key: value for key, value in payload.items() if not key.startswith("_")}
@@ -94,6 +104,59 @@ class InMemoryCatalogRepository(BaseCatalogRepository[T]):
         existing["_deleted_at"] = utc_now().isoformat()
         existing["_updated_at"] = utc_now().isoformat()
         return True
+
+
+class InMemoryRuntimeRevisionRepository(InMemoryCatalogRepository[RuntimeRevision]):
+    """In-memory runtime revision store matching the SQL repository contract used by tests."""
+
+    def __init__(self):
+        super().__init__(RuntimeRevision)
+
+    async def list(self, *, include_deleted: bool = False) -> List[RuntimeRevision]:
+        items = await super().list(include_deleted=True)
+        if not include_deleted:
+            items = [item for item in items if item.build_status != RuntimeRevisionStatus.INVALIDATED]
+        return sorted(items, key=lambda item: item.created_at, reverse=True)
+
+    async def get(self, item_id: str, *, include_deleted: bool = False) -> Optional[RuntimeRevision]:
+        item = await super().get(item_id, include_deleted=True)
+        if item is None:
+            return None
+        if not include_deleted and item.build_status == RuntimeRevisionStatus.INVALIDATED:
+            return None
+        return item
+
+    async def get_by_fingerprint(self, fingerprint: str) -> RuntimeRevision | None:
+        for item in await super().list(include_deleted=True):
+            if item.fingerprint == fingerprint:
+                return item
+        return None
+
+    async def get_latest_ready(self) -> RuntimeRevision | None:
+        ready = [
+            item
+            for item in await super().list(include_deleted=True)
+            if item.build_status == RuntimeRevisionStatus.READY
+        ]
+        return max(ready, key=lambda item: item.created_at, default=None)
+
+    async def invalidate_revision(
+            self,
+            item_id: str,
+            *,
+            reason: str | None = None,
+    ) -> RuntimeRevision | None:
+        current = await self.get(item_id, include_deleted=True)
+        if current is None:
+            return None
+        return await self.update(
+            item_id,
+            {
+                "build_status": RuntimeRevisionStatus.INVALIDATED.value,
+                "invalidated_at": utc_now().isoformat(),
+                "invalidation_reason": reason,
+            },
+        )
 
 
 class MongoCatalogRepository(BaseCatalogRepository[T]):
@@ -358,7 +421,7 @@ BUILTIN_RUNTIME_ADAPTERS = [
         name="CrewAI Runtime",
         adapter_type=RuntimeAdapterType.CREWAI,
         description="CrewAI compatibility adapter.",
-        capabilities=["crewai-compatibility", "multi-agent", "legacy-crews"],
+        capabilities=["crewai-compatibility", "multi-agent"],
     ),
 ]
 

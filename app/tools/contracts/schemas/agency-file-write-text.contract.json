@@ -21,11 +21,19 @@
       },
       "mode": {
         "type": "string",
-        "enum": ["write", "append"],
+        "enum": [
+          "write",
+          "append"
+        ],
         "description": "write replaces the file; append adds to the end."
       }
     },
-    "required": ["base_folder", "filename", "content", "mode"],
+    "required": [
+      "base_folder",
+      "filename",
+      "content",
+      "mode"
+    ],
     "additionalProperties": false
   },
   "outputs": {
@@ -33,17 +41,29 @@
     "properties": {
       "verdict": {
         "type": "string",
-        "enum": ["ok", "warn", "deny"]
+        "enum": [
+          "ok",
+          "warn",
+          "deny"
+        ]
       },
       "policyVerdict": {
-        "type": ["object", "null"]
+        "type": [
+          "object",
+          "null"
+        ]
       },
       "result": {
-        "type": ["object", "null"],
+        "type": [
+          "object",
+          "null"
+        ],
         "properties": {
           "status": {
             "type": "string",
-            "enum": ["success"]
+            "enum": [
+              "success"
+            ]
           },
           "message": {
             "type": "string"
@@ -55,7 +75,10 @@
         "additionalProperties": false
       },
       "patch": {
-        "type": ["string", "null"]
+        "type": [
+          "string",
+          "null"
+        ]
       },
       "filesChanged": {
         "type": "array",
@@ -76,13 +99,23 @@
         "type": "string"
       },
       "actor": {
-        "type": ["string", "null"]
+        "type": [
+          "string",
+          "null"
+        ]
       },
       "signature": {
-        "type": ["string", "null"]
+        "type": [
+          "string",
+          "null"
+        ]
       }
     },
-    "required": ["verdict", "dryRun", "timestamp"],
+    "required": [
+      "verdict",
+      "dryRun",
+      "timestamp"
+    ],
     "additionalProperties": false
   }
 }

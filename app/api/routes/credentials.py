@@ -1,7 +1,8 @@
+"""Credential storage routes with owner isolation and raw-secret rejection."""
+
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import ValidationError
 from typing import Any, Optional
@@ -9,8 +10,8 @@ from typing import Any, Optional
 from app.api.context import ApiContext, get_default_api_context
 from app.api.identity import resolve_current_user
 from app.domain import ConnectorCredentialValidationPayload
-from app.integrations import get_connector_definition
-from app.services import CredentialService
+from app.integrations.connectors import get_connector_definition
+from app.services.credentials import CredentialService
 from ._crud import serializable_validation_errors
 
 RAW_SECRET_PAYLOAD_KEYS = {"secret", "raw_secret", "value", "token", "password", "api_key"}
@@ -56,6 +57,28 @@ def create_credentials_router(context: Optional[ApiContext] = None) -> APIRouter
     service = CredentialService(context)
     router = APIRouter(prefix="/credentials", tags=["Credentials"])
 
+    @router.post("/connectors/resolve", summary="Resolve Connector Credential")
+    async def resolve_connector_credential(payload: dict[str, Any], request: Request):
+        current_user = await resolve_current_user(request, context, required_scopes=["integrations:read"])
+        provider = payload.get("provider")
+        if not isinstance(provider, str) or not provider.strip():
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="provider is required")
+        filters = payload.get("filters")
+        if filters is not None and not isinstance(filters, dict):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="filters must be an object")
+        credential_status = payload.get("status")
+        if credential_status is not None and not isinstance(credential_status, str):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="status must be a string")
+        result = await service.resolve_connector_credential_for_owner(
+            owner_user_id=current_user.id,
+            provider_key=provider,
+            filters=filters,
+            status=credential_status if isinstance(credential_status, str) else "active",
+        )
+        if result.get("status") == "error":
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=result.get("error"))
+        return result
+
     @router.get("/connectors/{provider_key}/schema", summary="Get Connector Credential Schema")
     async def get_connector_schema(provider_key: str):
         canonical, capability = service.resolve_connector_capability(provider_key)
@@ -91,13 +114,13 @@ def create_credentials_router(context: Optional[ApiContext] = None) -> APIRouter
             if created is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                                     detail=f"Connector '{provider_key}' not found")
-        except ValueError as exc:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         except ValidationError as exc:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=serializable_validation_errors(exc),
             ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return created.model_dump(mode="json")
 
     @router.post("", summary="Create Credential")
@@ -110,6 +133,8 @@ def create_credentials_router(context: Optional[ApiContext] = None) -> APIRouter
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=serializable_validation_errors(exc),
             ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return created.model_dump(mode="json")
 
     @router.get("", summary="List Credentials")
@@ -140,6 +165,8 @@ def create_credentials_router(context: Optional[ApiContext] = None) -> APIRouter
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=serializable_validation_errors(exc),
             ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         if item is None:
             raise _hide_missing_or_cross_owner()
         return item.model_dump(mode="json")
@@ -153,13 +180,13 @@ def create_credentials_router(context: Optional[ApiContext] = None) -> APIRouter
                 owner_user_id=current_user.id,
                 patch=patch,
             )
-        except ValueError as exc:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         except ValidationError as exc:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=serializable_validation_errors(exc),
             ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         if item is None:
             provider_key = patch.get("provider")
             if provider_key is not None and service.resolve_connector_capability(str(provider_key))[0] is None:
@@ -186,13 +213,13 @@ def create_credentials_router(context: Optional[ApiContext] = None) -> APIRouter
                 owner_user_id=current_user.id,
                 payload=payload,
             )
-        except ValueError as exc:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         except ValidationError as exc:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=serializable_validation_errors(exc),
             ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         if item is None:
             raise _hide_missing_or_cross_owner()
         return item.model_dump(mode="json")

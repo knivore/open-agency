@@ -12,8 +12,8 @@ from app.domain import ConversationMessage, MCPExposureSettings, ModelProfileDef
     ToolDefinition, ToolImplementationReference, ToolType
 from app.llm.base import ModelResponse, ModelToolCall
 from app.llm.registry import LLMEnvironmentConfig
-from app.services.conversations import ConversationService
-from app.services.main_agent_setup import MainAgentSetupConfig, MainAgentSetupService
+from app.services.conversations.core import ConversationService
+from app.services.main_agent_setup.service import MainAgentSetupConfig, MainAgentSetupService
 
 
 class _FakeModelClient:
@@ -158,6 +158,66 @@ class ConversationStreamingServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event_name, "message.created")
         self.assertEqual(payload["message"]["id"], "message-live-1")
 
+    async def test_service_stream_emits_activity_events_for_async_turn(self) -> None:
+        _FakeModelClient.responses = [ModelResponse(content="activity stream reply", provider="fake", model="fake-model")]
+        stream = self.service.stream_conversation_events(self.conversation_id, _ConnectedRequest(),
+                                                         idle_timeout_seconds=1.0)
+
+        async def produce_message() -> None:
+            await asyncio.sleep(0.05)
+            await self.service.post_message(
+                self.conversation_id,
+                {
+                    "response_mode": "async",
+                    "message": {
+                        "id": "message-activity-1",
+                        "role": "user",
+                        "message_type": "user_text",
+                        "plain_text": "show activity",
+                        "content": {"text": "show activity"},
+                    },
+                },
+            )
+
+        producer = asyncio.create_task(produce_message())
+        seen_events: list[str] = []
+        activity_payloads: list[dict] = []
+        final_message_payload = None
+        for _ in range(24):
+            chunk = await anext(stream)
+            event_name, payload = _parse_sse_payload(chunk)
+            seen_events.append(event_name or "")
+            if event_name in {
+                "turn.started",
+                "context.loading",
+                "context.loaded",
+                "memory.searching",
+                "memory.found",
+                "planner.started",
+                "planner.completed",
+                "assistant.summary",
+                "assistant.finalizing",
+                "assistant.draft_delta",
+                "turn.completed",
+            }:
+                activity_payloads.append(payload)
+            if event_name == "message.created" and payload["message"]["role"] == "assistant":
+                final_message_payload = payload
+            if event_name == "turn.completed":
+                break
+        await producer
+        await stream.aclose()
+
+        self.assertIn("turn.started", seen_events)
+        self.assertIn("assistant.draft_delta", seen_events)
+        self.assertIn("turn.completed", seen_events)
+        self.assertIsNotNone(final_message_payload)
+        turn_ids = {payload["turn_id"] for payload in activity_payloads}
+        self.assertEqual(turn_ids, {"turn:message-activity-1"})
+        self.assertEqual(final_message_payload["message"]["metadata"]["turn_id"], "turn:message-activity-1")
+        draft_payload = next(payload for payload in activity_payloads if payload["event_type"] == "assistant.draft_delta")
+        self.assertEqual(draft_payload["text_delta"], "activity stream reply")
+
     async def test_service_stream_emits_live_approval_event(self) -> None:
         stream = self.service.stream_conversation_events(self.conversation_id, _ConnectedRequest(),
                                                          idle_timeout_seconds=1.0)
@@ -188,7 +248,7 @@ class ConversationStreamingServiceTests(unittest.IsolatedAsyncioTestCase):
         producer = asyncio.create_task(produce_approval())
         seen_events: list[str] = []
         approval_payload = None
-        for _ in range(4):
+        for _ in range(16):
             chunk = await anext(stream)
             event_name, payload = _parse_sse_payload(chunk)
             seen_events.append(event_name or "")
@@ -254,7 +314,7 @@ class ConversationStreamingServiceTests(unittest.IsolatedAsyncioTestCase):
 
         producer = asyncio.create_task(produce_message())
         approval_payload = None
-        for _ in range(6):
+        for _ in range(20):
             chunk = await anext(stream)
             event_name, payload = _parse_sse_payload(chunk)
             if event_name == "approval.requested":

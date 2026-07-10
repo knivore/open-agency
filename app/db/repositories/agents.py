@@ -1,3 +1,5 @@
+"""Repository adapters for agent definitions across SQL, Mongo, and memory stores."""
+
 from app.db.models import AgentORM
 from app.domain import AgentDefinition
 

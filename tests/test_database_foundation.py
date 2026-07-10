@@ -45,6 +45,44 @@ class DatabaseFoundationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(settings.database_pool_size, 9)
         self.assertEqual(settings.database_max_overflow, 4)
 
+    def test_config_loads_physical_policy_limits(self) -> None:
+        with patch.dict(
+                os.environ,
+                {
+                    "AGENCY_PHYSICAL_POLICY_REQUIRE_CONFIRMATION_FOR_RISKY_COMMANDS": "false",
+                    "AGENCY_PHYSICAL_POLICY_MIN_CLIMATE_TEMPERATURE_CELSIUS": "16",
+                    "AGENCY_PHYSICAL_POLICY_MAX_CLIMATE_TEMPERATURE_CELSIUS": "26",
+                    "AGENCY_PHYSICAL_POLICY_RESTRICTED_ROOMS": "nursery,garage",
+                    "AGENCY_PHYSICAL_POLICY_BLOCKED_USERS": "agent:blocked",
+                    "AGENCY_PHYSICAL_POLICY_PRESENCE_REQUIRED_ROOMS": "entry",
+                    "AGENCY_PHYSICAL_POLICY_QUIET_HOURS": "22:00-07:00",
+                },
+                clear=False,
+        ):
+            reset_settings_cache()
+            settings = get_settings()
+
+        self.assertFalse(settings.agency_physical_policy_require_confirmation_for_risky_commands)
+        self.assertEqual(settings.agency_physical_policy_min_climate_temperature_celsius, 16)
+        self.assertEqual(settings.agency_physical_policy_max_climate_temperature_celsius, 26)
+        self.assertEqual(settings.agency_physical_policy_restricted_rooms, "nursery,garage")
+        self.assertEqual(settings.agency_physical_policy_blocked_users, "agent:blocked")
+        self.assertEqual(settings.agency_physical_policy_presence_required_rooms, "entry")
+        self.assertEqual(settings.agency_physical_policy_quiet_hours, "22:00-07:00")
+
+    def test_config_rejects_invalid_physical_policy_temperature_range(self) -> None:
+        with patch.dict(
+                os.environ,
+                {
+                    "AGENCY_PHYSICAL_POLICY_MIN_CLIMATE_TEMPERATURE_CELSIUS": "30",
+                    "AGENCY_PHYSICAL_POLICY_MAX_CLIMATE_TEMPERATURE_CELSIUS": "20",
+                },
+                clear=False,
+        ):
+            reset_settings_cache()
+            with self.assertRaises(RuntimeError):
+                get_settings().ensure_runtime_requirements()
+
     async def test_db_session_can_connect_with_sqlite_fallback(self) -> None:
         with patch.dict(
                 os.environ,
@@ -88,9 +126,13 @@ class DatabaseFoundationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(module.target_metadata, Base.metadata)
         self.assertIn("agents", module.target_metadata.tables)
+        self.assertIn("api_tokens", module.target_metadata.tables)
         self.assertIn("conversations", module.target_metadata.tables)
         self.assertIn("conversation_approval_requests", module.target_metadata.tables)
         self.assertIn("main_agent_profiles", module.target_metadata.tables)
+        self.assertIn("users", module.target_metadata.tables)
+        self.assertIn("onecli_identity_mappings", module.target_metadata.tables)
+        self.assertIn("public_endpoints", module.target_metadata.tables)
         self.assertIn("executions", module.target_metadata.tables)
         self.assertIn("schedule_fire_claims", module.target_metadata.tables)
 
@@ -100,6 +142,20 @@ class DatabaseFoundationTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "APP_ENV": "production",
                     "DATABASE_URL": "",
+                },
+                clear=True,
+        ):
+            reset_settings_cache()
+            with self.assertRaises(RuntimeError):
+                get_settings().ensure_runtime_requirements()
+
+    def test_production_mode_requires_internal_api_key(self) -> None:
+        with patch.dict(
+                os.environ,
+                {
+                    "APP_ENV": "production",
+                    "DATABASE_URL": "sqlite+aiosqlite:///:memory:",
+                    "AGENCY_INTERNAL_API_KEY": "",
                 },
                 clear=True,
         ):
@@ -121,6 +177,45 @@ class DatabaseFoundationTests(unittest.IsolatedAsyncioTestCase):
             reset_settings_cache()
             with self.assertRaises(RuntimeError):
                 get_settings().ensure_runtime_requirements()
+
+    def test_isolated_workers_require_container_visible_postgres_url(self) -> None:
+        with patch.dict(
+                os.environ,
+                {
+                    "APP_ENV": "test",
+                    "DATABASE_URL": "postgresql://postgres:postgres@localhost:5432/agency",
+                    "EXECUTION_ISOLATION_ENABLED": "true",
+                    "INTEGRATIONS_RUNTIME_ENABLED": "true",
+                    "EXECUTION_RUNTIME_DATABASE_URL": "",
+                    "EXECUTION_CONTAINER_NETWORK": "agency_default",
+                },
+                clear=False,
+        ):
+            reset_settings_cache()
+            with self.assertRaisesRegex(RuntimeError, "EXECUTION_RUNTIME_DATABASE_URL"):
+                get_settings().ensure_runtime_requirements()
+
+    def test_isolated_workers_accept_container_visible_postgres_url(self) -> None:
+        with patch.dict(
+                os.environ,
+                {
+                    "APP_ENV": "test",
+                    "DATABASE_URL": "postgresql://postgres:postgres@localhost:5432/agency",
+                    "EXECUTION_ISOLATION_ENABLED": "true",
+                    "INTEGRATIONS_RUNTIME_ENABLED": "true",
+                    "EXECUTION_RUNTIME_DATABASE_URL": "postgresql://postgres:postgres@postgres:5432/agency",
+                    "EXECUTION_CONTAINER_NETWORK": "agency_default",
+                },
+                clear=False,
+        ):
+            reset_settings_cache()
+            settings = get_settings()
+            settings.ensure_runtime_requirements()
+
+        self.assertEqual(
+            settings.container_database_url,
+            "postgresql://postgres:postgres@postgres:5432/agency",
+        )
 
     def test_shadow_mode_requires_integrations_runtime_flag(self) -> None:
         with patch.dict(
@@ -171,6 +266,139 @@ class DatabaseFoundationTests(unittest.IsolatedAsyncioTestCase):
             reset_settings_cache()
             with self.assertRaises(RuntimeError):
                 get_settings().ensure_runtime_requirements()
+
+    def test_onecli_enforcement_requires_onecli_enabled(self) -> None:
+        with patch.dict(
+                os.environ,
+                {
+                    "APP_ENV": "test",
+                    "ONECLI_ENABLED": "false",
+                    "ONECLI_FORCE_FOR_HTTP_TOOLS": "true",
+                },
+                clear=False,
+        ):
+            reset_settings_cache()
+            with self.assertRaisesRegex(RuntimeError, "ONECLI_ENABLED"):
+                get_settings().ensure_runtime_requirements()
+
+    def test_production_onecli_https_gateway_requires_ca_bundle(self) -> None:
+        with patch.dict(
+                os.environ,
+                {
+                    "APP_ENV": "production",
+                    "DATABASE_URL": "sqlite+aiosqlite:///:memory:",
+                    "AGENCY_INTERNAL_API_KEY": "test-internal-key",
+                    "ONECLI_ENABLED": "true",
+                    "ONECLI_GATEWAY_URL": "https://onecli-gateway.local",
+                    "ONECLI_GATEWAY_CA_BUNDLE_PATH": "",
+                },
+                clear=False,
+        ):
+            reset_settings_cache()
+            with self.assertRaisesRegex(RuntimeError, "ONECLI_GATEWAY_CA_BUNDLE_PATH"):
+                get_settings().ensure_runtime_requirements()
+
+    def test_onecli_worker_enforcement_requires_execution_isolation(self) -> None:
+        with patch.dict(
+                os.environ,
+                {
+                    "APP_ENV": "test",
+                    "ONECLI_ENABLED": "true",
+                    "ONECLI_FORCE_FOR_ISOLATED_WORKERS": "true",
+                    "EXECUTION_ISOLATION_ENABLED": "false",
+                },
+                clear=False,
+        ):
+            reset_settings_cache()
+            with self.assertRaisesRegex(RuntimeError, "EXECUTION_ISOLATION_ENABLED"):
+                get_settings().ensure_runtime_requirements()
+
+    def test_onecli_worker_internal_egress_requires_worker_enforcement(self) -> None:
+        with patch.dict(
+                os.environ,
+                {
+                    "APP_ENV": "test",
+                    "ONECLI_ENABLED": "true",
+                    "ONECLI_FORCE_FOR_ISOLATED_WORKERS": "false",
+                    "ONECLI_WORKER_EGRESS_MODE": "docker_internal_network",
+                },
+                clear=False,
+        ):
+            reset_settings_cache()
+            with self.assertRaisesRegex(RuntimeError, "ONECLI_FORCE_FOR_ISOLATED_WORKERS"):
+                get_settings().ensure_runtime_requirements()
+
+    def test_onecli_multi_user_mode_rejects_global_agent_token_fallback(self) -> None:
+        with patch.dict(
+                os.environ,
+                {
+                    "APP_ENV": "test",
+                    "ONECLI_ENABLED": "true",
+                    "ONECLI_MULTI_USER_MODE": "true",
+                    "ONECLI_ALLOW_GLOBAL_AGENT_TOKEN_FALLBACK": "true",
+                },
+                clear=False,
+        ):
+            reset_settings_cache()
+            with self.assertRaisesRegex(RuntimeError, "ONECLI_ALLOW_GLOBAL_AGENT_TOKEN_FALLBACK"):
+                get_settings().ensure_runtime_requirements()
+
+    def test_production_onecli_worker_enforcement_requires_internal_egress(self) -> None:
+        with patch.dict(
+                os.environ,
+                {
+                    "APP_ENV": "production",
+                    "DATABASE_URL": "sqlite+aiosqlite:///:memory:",
+                    "AGENCY_INTERNAL_API_KEY": "test-internal-key",
+                    "INTEGRATIONS_RUNTIME_ENABLED": "true",
+                    "EXECUTION_ISOLATION_ENABLED": "true",
+                    "ONECLI_ENABLED": "true",
+                    "ONECLI_FORCE_FOR_ISOLATED_WORKERS": "true",
+                    "ONECLI_WORKER_EGRESS_MODE": "proxy_env_only",
+                    "OPENAI_API_KEY": "",
+                    "ANTHROPIC_API_KEY": "",
+                    "GOOGLE_API_KEY": "",
+                    "AZURE_API_KEY": "",
+                    "AZURE_OPENAI_API_KEY": "",
+                    "LOCAL_OPENAI_API_KEY": "",
+                },
+                clear=False,
+        ):
+            reset_settings_cache()
+            with self.assertRaisesRegex(RuntimeError, "ONECLI_WORKER_EGRESS_MODE"):
+                get_settings().ensure_runtime_requirements()
+
+    def test_production_onecli_enforcement_rejects_direct_external_credentials(self) -> None:
+        with patch.dict(
+                os.environ,
+                {
+                    "APP_ENV": "production",
+                    "DATABASE_URL": "sqlite+aiosqlite:///:memory:",
+                    "AGENCY_INTERNAL_API_KEY": "test-internal-key",
+                    "ONECLI_ENABLED": "true",
+                    "ONECLI_FORCE_FOR_HTTP_TOOLS": "true",
+                    "ONECLI_GATEWAY_URL": "http://onecli:10255",
+                    "OPENAI_API_KEY": "sk-test",
+                },
+                clear=False,
+        ):
+            reset_settings_cache()
+            with self.assertRaisesRegex(RuntimeError, "OPENAI_API_KEY"):
+                get_settings().ensure_runtime_requirements()
+
+    def test_onecli_diagnostics_redact_secret_reference_value(self) -> None:
+        with patch.dict(
+                os.environ,
+                {
+                    "ONECLI_ENABLED": "true",
+                    "ONECLI_AGENT_TOKEN_SECRET_REF": "env://ONECLI_AGENT_TOKEN",
+                },
+                clear=False,
+        ):
+            reset_settings_cache()
+            diagnostics = get_settings().sanitized_onecli_diagnostics
+            self.assertTrue(diagnostics["agent_token_secret_ref_configured"])
+            self.assertNotIn("env://ONECLI_AGENT_TOKEN", diagnostics.values())
 
     def test_valid_hardened_runtime_configuration_passes(self) -> None:
         with patch.dict(

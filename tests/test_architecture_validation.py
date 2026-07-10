@@ -9,6 +9,7 @@ from tests.architecture.checks import (
     find_direct_crewai_import_violations,
     find_legacy_import_violations,
     find_legacy_tool_import_violations,
+    find_optional_module_top_level_import_violations,
 )
 
 
@@ -47,6 +48,9 @@ class ArchitectureValidationTests(unittest.TestCase):
 
     def test_no_legacy_tool_imports_from_app_owned_modules(self) -> None:
         self.assertEqual(find_legacy_tool_import_violations(), [])
+
+    def test_no_top_level_optional_module_imports_from_core_code(self) -> None:
+        self.assertEqual(find_optional_module_top_level_import_violations(), [])
 
 
 if __name__ == "__main__":

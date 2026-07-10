@@ -1,13 +1,17 @@
+"""Tool executor that delegates Agency MCP tools to the configured MCP registry."""
+
 from __future__ import annotations
 
 from app.domain import ToolDefinition, ToolType
-from app.protocols.mcp import MCPRegistryError
 from app.protocols.mcp.computer_use_adapter import adapt_computer_use_arguments, normalize_computer_use_response
+from app.protocols.mcp.registry import MCPRegistryError
 from app.runtime.native.errors import ToolExecutionError
 from .base import ToolExecutionContext
 
 
 class McpToolExecutor:
+    """Validate MCP registry availability and normalize remote tool responses."""
+
     tool_type = ToolType.MCP_TOOL
     async_execution = True
 

@@ -41,16 +41,16 @@ configuration.
 
 ## Local Postgres Setup
 
-For normal local development, use the root startup shortcut:
-
-```bash
-make start
-```
-
-If you only need the backing services for a manual backend run, start Postgres and Redis directly:
+Start the local database:
 
 ```bash
 docker compose up -d postgres redis
+```
+
+Start the full local stack, including Langfuse observability services:
+
+```bash
+docker compose up --build
 ```
 
 The grouped container assets for the local stack now live under:
@@ -75,18 +75,16 @@ Verify connectivity:
 curl http://localhost:8000/health/db
 ```
 
-## Git-Based Local Snapshots
+## Local Snapshots
 
-For a small private development database, you can export the Docker Compose Postgres database into a snapshot file that
-can be committed to git and imported on another machine:
+For a small private development database, you can export the Docker Compose Postgres database into a local snapshot and
+import it later on the same machine or after moving it through a trusted private channel:
 
 ```bash
 python scripts/db_snapshot.py export --database agency
-git add database_exports/agency.dump database_exports/agency.json
-git commit -m "Update local agency database snapshot"
 ```
 
-On a Windows laptop after pulling the repository and starting Postgres:
+On a Windows laptop after placing that snapshot under `database_exports/` and starting Postgres:
 
 ```powershell
 docker compose up -d postgres
@@ -98,8 +96,8 @@ need local Postgres client tools installed. Use `--database langfuse` to snapsho
 `--database all` for both configured Postgres databases. Use `--timestamped` if you also want an archive copy such as
 `agency-20260514T120000Z.dump`.
 
-These snapshots can contain credentials, tokens, memory records, conversations, and other sensitive local data.
-Commit them only to a private repository.
+These snapshots can contain credentials, API tokens, memory records, conversations, and other sensitive local data. Do
+not commit raw snapshots; use sanitized fixtures or migrations for anything that must live in the repository.
 
 ## Tables
 
@@ -111,6 +109,7 @@ Current platform tables:
 - `tools`
 - `workflows`
 - `workflow_versions`
+- `goals`
 - `runtime_revisions`
 - `executions`
 - `execution_events`
@@ -135,7 +134,9 @@ Key relational links:
 - `model_profiles.provider_id -> model_providers.id`
 - `agents.model_profile_id -> model_profiles.id`
 - `workflow_versions.workflow_id -> workflows.id`
+- `goals.parent_goal_id -> goals.id`
 - `executions.workflow_id -> workflows.id`
+- `executions.goal_id -> goals.id`
 - `executions.workflow_version_id -> workflow_versions.id`
 - `executions.runtime_revision_id -> runtime_revisions.id`
 - `execution_events.execution_id -> executions.id`
@@ -151,6 +152,7 @@ Key relational links:
 
 Important integrity rules include:
 
+- indexed goal status, owner, parent, and updated-at lookups for supervisor scans
 - indexed execution status, workflow, and created-at lookups
 - indexed schedule enablement and next-fire timestamps
 - indexed tool and workflow enablement
@@ -160,9 +162,11 @@ Important integrity rules include:
 
 Persistent memory is stored in `memory_records`.
 
-The table serves runtime-owned memory use cases:
+The table now serves:
 
+- manual durable memory CRUD
 - main-agent retrieved memory context
+- `context_pack` compact conversation/workflow state for handoff and reuse
 - `daily_summary` durable archives for conversations
 - `run_summary` durable archives for non-main-agent executions
 
@@ -174,7 +178,7 @@ Important memory columns include:
 - `conversation_id`
 - `workflow_id`
 - `agent_id`
-- `memory_kind`
+- `memory_type`
 - `status`
 - `importance`
 - `summary_date`
@@ -186,13 +190,15 @@ Important memory columns include:
 
 Important memory indexes include:
 
-- `ix_memory_records_kind_status`
+- `ix_memory_records_type_status`
 - `ix_memory_records_source_conversation_summary_date`
-- `ix_memory_records_summary_date_kind`
-- `ix_memory_records_agent_kind`
-- `ix_memory_records_workflow_kind`
-- `ix_memory_records_workspace_kind`
-- `ix_memory_records_user_kind`
+- `ix_memory_records_summary_date_type`
+- `ix_memory_records_agent_type`
+- `ix_memory_records_workflow_type`
+- `ix_memory_records_workspace_type`
+- `ix_memory_records_user_type`
+
+See [memory.md](./memory.md) for the application-level memory contract and retrieval behavior.
 
 ## Repository Pattern
 
@@ -211,6 +217,10 @@ Representative repositories:
 - `SQLRuntimeAdapterRepository`
 - `SQLMCPServerRepository`
 - `SQLA2AAgentRepository`
+
+`SQLExecutionStore` owns the SQL mapping for execution rows, ordered execution events, artifacts, approvals, and runtime
+metadata. Runtime-governance read snapshots are stored in `executions.metadata_json` and updated by
+`save_execution()` on both insert and update paths; immutable audit history remains in `execution_events`.
 
 The repository pattern keeps:
 

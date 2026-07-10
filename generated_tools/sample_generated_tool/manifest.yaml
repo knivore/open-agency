@@ -1,0 +1,11 @@
+id: sample-generated-tool
+name: Sample Generated Tool
+version: 0.1.0
+enabled: true
+module_root: generated_tools.sample_generated_tool
+tool_modules:
+  - generated_tools.sample_generated_tool.tools
+requirements_file: requirements.txt
+metadata:
+  owner: coder-agent
+  visibility: shared

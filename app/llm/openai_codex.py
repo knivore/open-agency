@@ -13,11 +13,12 @@ import time
 from openai import OpenAI
 from typing import Any, Dict, Iterator, List, Optional
 
+from app.core.config import get_settings
 from app.domain import ModelProfileDefinition
 from app.llm.base import ModelMessage, ModelResponse, ModelToolCall
+from app.llm.openai_helpers import sanitize_openai_message_name
 from app.llm.registry import LLMEnvironmentConfig
 from app.utils.oauth_pkce import OPENAI_CODEX_REDIRECT_URI, OAuthPKCEHandler
-
 
 _refresh_locks: dict[str, asyncio.Lock] = {}
 _refresh_locks_guard = threading.Lock()
@@ -45,11 +46,11 @@ class OpenAICodexModelClient:
         self.auth_mode = self.config.get("auth_mode", "chatgpt")
         self.oauth_profile_id = self.config.get("oauth_profile_id")
         self.skip_provider_hydration = bool(self.config.get("skip_provider_hydration"))
-        
+
         # If auth_mode is 'api', we use standard API key from config or env
         self.api_key = self.config.get("api_key") or self.config.get("apiKey") or env_config.openai_api_key
         self.provider_id = self.config.get("provider_id") or self.config.get("providerId") or profile.provider_id
-        
+
         # If auth_mode is 'chatgpt' (default), we use OAuth tokens
         self.access_token = self.config.get("access_token")
         self.refresh_token = self.config.get("refresh_token")
@@ -64,19 +65,34 @@ class OpenAICodexModelClient:
     def _codex_cli_timeout_seconds(self, timeout_seconds: int | None = None) -> int:
         if timeout_seconds is not None:
             return timeout_seconds
+        settings_timeout = get_settings().codex_cli_timeout_seconds or 1800
+        env_timeout = os.getenv("CODEX_CLI_TIMEOUT_SECONDS") or None
+        llm_timeout = os.getenv("LLM_REQUEST_TIMEOUT_SECONDS") or None
         raw_timeout = (
-            self.config.get("codex_cli_timeout_seconds")
-            or self.config.get("codexCliTimeoutSeconds")
-            or self.config.get("request_timeout_seconds")
-            or self.config.get("timeout_seconds")
-            or os.getenv("CODEX_CLI_TIMEOUT_SECONDS")
-            or os.getenv("LLM_REQUEST_TIMEOUT_SECONDS")
-            or 120
+                env_timeout
+                or self.config.get("codex_cli_timeout_seconds")
+                or self.config.get("codexCliTimeoutSeconds")
+                or self.config.get("request_timeout_seconds")
+                or self.config.get("timeout_seconds")
+                or llm_timeout
+                or settings_timeout
         )
         try:
             timeout = int(float(raw_timeout))
         except (TypeError, ValueError) as exc:
             raise RuntimeError("Codex CLI timeout must be a number of seconds") from exc
+        llm_timeout_value = None
+        if llm_timeout is not None:
+            try:
+                llm_timeout_value = int(float(llm_timeout))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("LLM request timeout must be a number of seconds") from exc
+        # Keep an explicit env override authoritative, but otherwise never allow the
+        # Codex CLI fallback to exceed a stricter per-request LLM timeout.
+        if env_timeout is None and llm_timeout_value is not None:
+            timeout = min(timeout, llm_timeout_value)
+        elif env_timeout is None:
+            timeout = max(timeout, int(float(settings_timeout)))
         if timeout <= 0:
             raise RuntimeError("Codex CLI timeout must be greater than zero")
         return timeout
@@ -109,12 +125,12 @@ class OpenAICodexModelClient:
 
         self.auth_mode = oauth_config.get("auth_mode", provider_config.get("auth_mode", self.auth_mode))
         self.api_key = (
-            oauth_config.get("api_key")
-            or oauth_config.get("apiKey")
-            or provider_config.get("api_key")
-            or provider_config.get("apiKey")
-            or self.api_key
-            or self.env_config.openai_api_key
+                oauth_config.get("api_key")
+                or oauth_config.get("apiKey")
+                or provider_config.get("api_key")
+                or provider_config.get("apiKey")
+                or self.api_key
+                or self.env_config.openai_api_key
         )
         self.access_token = oauth_config.get("access_token", self.access_token)
         self.refresh_token = oauth_config.get("refresh_token", self.refresh_token)
@@ -141,6 +157,9 @@ class OpenAICodexModelClient:
                     "OpenAI Codex API key not configured. Public API model calls require an OpenAI API key with model-request permissions."
                 )
             self.client.api_key = self.api_key
+            return
+
+        if self.auth_mode == "chatgpt" and not self.access_token:
             return
 
         if not self.access_token:
@@ -184,26 +203,201 @@ class OpenAICodexModelClient:
                             redirect_uri=handler.redirect_uri,
                         )
             else:
-                raise RuntimeError("OpenAI Codex token expired. Please re-authorize via 'POST /model-providers/{id}/authorize'")
+                raise RuntimeError(
+                    "OpenAI Codex token expired. Please re-authorize via 'POST /model-providers/{id}/authorize'")
 
     def _messages_to_prompt(self, messages: List[ModelMessage]) -> str:
         rendered: list[str] = []
         for message in messages:
             role = message.role.upper()
             rendered.append(f"{role}:\n{message.content}")
+            if message.tool_calls:
+                # The CLI is stateless between native-runtime iterations, so preserve
+                # the assistant tool request that each following TOOL message answers.
+                rendered.append(
+                    "ASSISTANT TOOL CALLS:\n"
+                    + json.dumps(
+                        [
+                            {
+                                "id": tool_call.id,
+                                "name": tool_call.name,
+                                "arguments": tool_call.arguments,
+                            }
+                            for tool_call in message.tool_calls
+                        ],
+                        ensure_ascii=True,
+                    )
+                )
+            if message.tool_call_id:
+                rendered.append(f"TOOL CALL ID: {message.tool_call_id}")
         return "\n\n".join(rendered).strip()
+
+    def _cli_tool_contract(
+            self,
+            messages: List[ModelMessage],
+            tools: List[Dict[str, Any]],
+    ) -> tuple[List[ModelMessage], Dict[str, Any], set[str]]:
+        tool_definitions: list[dict[str, Any]] = []
+        allowed_tool_names: set[str] = set()
+        for item in tools:
+            function = item.get("function") if isinstance(item, dict) else None
+            if not isinstance(function, dict):
+                continue
+            name = str(function.get("name") or "").strip()
+            if not name:
+                continue
+            allowed_tool_names.add(name)
+            tool_definitions.append(
+                {
+                    "name": name,
+                    "description": function.get("description") or "",
+                    "parameters": function.get("parameters") or {"type": "object"},
+                }
+            )
+
+        if not allowed_tool_names:
+            return messages, {}, set()
+
+        # Codex CLI cannot receive API-style function definitions. A strict final
+        # envelope lets it select a tool while Agency retains policy and execution.
+        response_schema: Dict[str, Any] = {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["tool_call", "final"]},
+                "tool_name": {"type": "string", "enum": ["", *sorted(allowed_tool_names)]},
+                "arguments_json": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["action", "tool_name", "arguments_json", "content"],
+            "additionalProperties": False,
+        }
+        contract = {
+            "available_agency_tools": tool_definitions,
+            "response_contract": {
+                "tool_call": {
+                    "action": "tool_call",
+                    "tool_name": "one exact available tool name",
+                    "arguments_json": "a JSON object encoded as a string",
+                    "content": "",
+                },
+                "final": {
+                    "action": "final",
+                    "tool_name": "",
+                    "arguments_json": "{}",
+                    "content": "the final answer",
+                },
+            },
+        }
+        return [
+            *messages,
+            ModelMessage(
+                role="system",
+                content=(
+                    "You are the reasoning model inside Agency's native workflow runtime. "
+                    "Do not execute tools, inspect installed connectors, search for MCP resources, "
+                    "or use Codex built-in tools. Agency owns all tool execution and policy checks. "
+                    "Return exactly one response-contract envelope. Select tool_call when an "
+                    "available Agency tool is needed; after TOOL results are present, either select "
+                    "another available tool or return final. Never claim a listed tool is unavailable.\n"
+                    + json.dumps(contract, ensure_ascii=True)
+                ),
+            ),
+        ], response_schema, allowed_tool_names
+
+    def _parse_cli_tool_response(
+            self,
+            response: ModelResponse,
+            *,
+            allowed_tool_names: set[str],
+    ) -> ModelResponse:
+        payload = self._parse_structured_cli_content(response.content, schema_name="agency_native_tool_turn")
+        if not isinstance(payload, dict):
+            raise RuntimeError("Codex CLI Agency tool response must be a JSON object.")
+
+        action = payload.get("action")
+        if action == "final":
+            response.content = str(payload.get("content") or "")
+            return response
+        if action != "tool_call":
+            raise RuntimeError("Codex CLI Agency tool response has an invalid action.")
+
+        tool_name = str(payload.get("tool_name") or "").strip()
+        if tool_name not in allowed_tool_names:
+            raise RuntimeError(f"Codex CLI requested unavailable Agency tool '{tool_name}'.")
+        raw_arguments = payload.get("arguments_json") or "{}"
+        try:
+            arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Codex CLI returned invalid arguments for Agency tool '{tool_name}'.") from exc
+        if not isinstance(arguments, dict):
+            raise RuntimeError(f"Codex CLI arguments for Agency tool '{tool_name}' must be a JSON object.")
+
+        response.content = None
+        response.tool_calls = [
+            ModelToolCall(id=None, name=tool_name, arguments=arguments, raw=payload)
+        ]
+        return response
+
+    def _structured_cli_messages(
+            self,
+            messages: List[ModelMessage],
+            *,
+            schema_name: str,
+            schema: Dict[str, Any],
+    ) -> List[ModelMessage]:
+        # ChatGPT OAuth mode uses Codex CLI rather than the public API, so structured
+        # output is enforced by prompt contract and parsed locally after the CLI returns.
+        schema_contract = json.dumps({"schema_name": schema_name, "schema": schema}, ensure_ascii=True)
+        return [
+            *messages,
+            ModelMessage(
+                role="system",
+                content=(
+                    "Return only JSON that validates against this JSON schema. "
+                    "Do not include markdown fences, commentary, or extra keys.\n"
+                    f"{schema_contract}"
+                ),
+            ),
+        ]
+
+    def _parse_structured_cli_content(self, content: Any, *, schema_name: str) -> Any:
+        if not isinstance(content, str):
+            return content
+        text = content.strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            start_candidates = [index for index in (text.find("{"), text.find("[")) if index >= 0]
+            if not start_candidates:
+                raise RuntimeError(f"Codex CLI structured response '{schema_name}' was not valid JSON.")
+            start = min(start_candidates)
+            end = max(text.rfind("}"), text.rfind("]"))
+            if end <= start:
+                raise RuntimeError(f"Codex CLI structured response '{schema_name}' was not valid JSON.")
+            try:
+                return json.loads(text[start:end + 1])
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Codex CLI structured response '{schema_name}' was not valid JSON.") from exc
 
     def _generate_text_with_codex_cli(
             self,
             messages: List[ModelMessage],
             *,
             timeout_seconds: int | None = None,
+            output_schema: Dict[str, Any] | None = None,
     ) -> ModelResponse:
         codex_binary = (
-            self.config.get("codex_binary")
-            or self.config.get("codexBinary")
-            or os.getenv("CODEX_CLI_BINARY")
-            or "codex"
+                self.config.get("codex_binary")
+                or self.config.get("codexBinary")
+                or os.getenv("CODEX_CLI_BINARY")
+                or "codex"
         )
         executable = shutil.which(codex_binary)
         if executable is None:
@@ -217,18 +411,27 @@ class OpenAICodexModelClient:
         prompt = self._messages_to_prompt(messages)
         started_at = time.perf_counter()
         sandbox_mode = (
-            self.config.get("codex_cli_sandbox")
-            or self.config.get("codexCliSandbox")
-            or os.getenv("CODEX_CLI_SANDBOX")
-            or "read-only"
+                self.config.get("codex_cli_sandbox")
+                or self.config.get("codexCliSandbox")
+                or os.getenv("CODEX_CLI_SANDBOX")
+                or "read-only"
         )
 
         with tempfile.NamedTemporaryFile("w+", encoding="utf-8", suffix=".txt", delete=False) as output_file:
             output_path = output_file.name
 
+        schema_path: str | None = None
+        if output_schema:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as schema_file:
+                json.dump(output_schema, schema_file, ensure_ascii=True)
+                schema_path = schema_file.name
+
         command = [
             executable,
             "exec",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
             "--sandbox",
             str(sandbox_mode),
             "--skip-git-repo-check",
@@ -236,8 +439,10 @@ class OpenAICodexModelClient:
             self.profile.model,
             "--output-last-message",
             output_path,
-            prompt,
         ]
+        if schema_path:
+            command.extend(["--output-schema", schema_path])
+        command.append("-")
         cwd = self.config.get("codex_cwd") or os.getenv("CODEX_CLI_CWD") or os.getcwd()
         try:
             completed = subprocess.run(
@@ -245,6 +450,7 @@ class OpenAICodexModelClient:
                 cwd=cwd,
                 text=True,
                 capture_output=True,
+                input=prompt,
                 timeout=timeout,
                 check=False,
             )
@@ -273,6 +479,11 @@ class OpenAICodexModelClient:
                 os.unlink(output_path)
             except OSError:
                 pass
+            if schema_path:
+                try:
+                    os.unlink(schema_path)
+                except OSError:
+                    pass
 
     def _to_openai_messages(self, messages: List[ModelMessage]) -> List[Dict[str, Any]]:
         payload = []
@@ -281,8 +492,22 @@ class OpenAICodexModelClient:
                 "role": message.role,
                 "content": message.content,
             }
+            if message.tool_calls:
+                item["tool_calls"] = [
+                    {
+                        "id": tool_call.id,
+                        "type": "function",
+                        "function": {
+                            "name": sanitize_openai_message_name(tool_call.name) or tool_call.name,
+                            "arguments": json.dumps(tool_call.arguments or {}),
+                        },
+                    }
+                    for tool_call in message.tool_calls
+                ]
             if message.name:
-                item["name"] = message.name
+                sanitized_name = sanitize_openai_message_name(message.name)
+                if sanitized_name:
+                    item["name"] = sanitized_name
             if message.tool_call_id:
                 item["tool_call_id"] = message.tool_call_id
             payload.append(item)
@@ -354,6 +579,15 @@ class OpenAICodexModelClient:
     ) -> ModelResponse:
         asyncio.run(self._ensure_authorized())
         if self.auth_mode == "chatgpt":
+            tools = kwargs.get("tools")
+            if isinstance(tools, list) and tools:
+                contract_messages, response_schema, allowed_tool_names = self._cli_tool_contract(messages, tools)
+                if allowed_tool_names:
+                    response = self._generate_text_with_codex_cli(
+                        contract_messages,
+                        output_schema=response_schema,
+                    )
+                    return self._parse_cli_tool_response(response, allowed_tool_names=allowed_tool_names)
             return self._generate_text_with_codex_cli(messages)
 
         started_at = time.perf_counter()
@@ -378,6 +612,16 @@ class OpenAICodexModelClient:
     ) -> ModelResponse:
         await self._ensure_authorized()
         if self.auth_mode == "chatgpt":
+            tools = kwargs.get("tools")
+            if isinstance(tools, list) and tools:
+                contract_messages, response_schema, allowed_tool_names = self._cli_tool_contract(messages, tools)
+                if allowed_tool_names:
+                    response = await asyncio.to_thread(
+                        self._generate_text_with_codex_cli,
+                        contract_messages,
+                        output_schema=response_schema,
+                    )
+                    return self._parse_cli_tool_response(response, allowed_tool_names=allowed_tool_names)
             return await asyncio.to_thread(self._generate_text_with_codex_cli, messages)
 
         started_at = time.perf_counter()
@@ -403,6 +647,13 @@ class OpenAICodexModelClient:
             **kwargs: Any,
     ) -> ModelResponse:
         asyncio.run(self._ensure_authorized())
+        schema_name = kwargs.pop("schema_name", "structured_output")
+        if self.auth_mode == "chatgpt":
+            response = self._generate_text_with_codex_cli(
+                self._structured_cli_messages(messages, schema_name=schema_name, schema=schema)
+            )
+            response.content = self._parse_structured_cli_content(response.content, schema_name=schema_name)
+            return response
 
         started_at = time.perf_counter()
         response = self.client.chat.completions.create(
@@ -414,7 +665,7 @@ class OpenAICodexModelClient:
                 response_format={
                     "type": "json_schema",
                     "json_schema": {
-                        "name": kwargs.pop("schema_name", "structured_output"),
+                        "name": schema_name,
                         "schema": schema,
                     },
                 },
@@ -439,6 +690,14 @@ class OpenAICodexModelClient:
             **kwargs: Any,
     ) -> ModelResponse:
         await self._ensure_authorized()
+        schema_name = kwargs.pop("schema_name", "structured_output")
+        if self.auth_mode == "chatgpt":
+            response = await asyncio.to_thread(
+                self._generate_text_with_codex_cli,
+                self._structured_cli_messages(messages, schema_name=schema_name, schema=schema),
+            )
+            response.content = self._parse_structured_cli_content(response.content, schema_name=schema_name)
+            return response
 
         started_at = time.perf_counter()
         response = await asyncio.to_thread(
@@ -451,7 +710,7 @@ class OpenAICodexModelClient:
                 response_format={
                     "type": "json_schema",
                     "json_schema": {
-                        "name": kwargs.pop("schema_name", "structured_output"),
+                        "name": schema_name,
                         "schema": schema,
                     },
                 },
@@ -553,10 +812,10 @@ class OpenAICodexModelClient:
 
     def _chatgpt_health_payload(self) -> Dict[str, Any]:
         codex_binary = (
-            self.config.get("codex_binary")
-            or self.config.get("codexBinary")
-            or os.getenv("CODEX_CLI_BINARY")
-            or "codex"
+                self.config.get("codex_binary")
+                or self.config.get("codexBinary")
+                or os.getenv("CODEX_CLI_BINARY")
+                or "codex"
         )
         executable = shutil.which(codex_binary)
         return {

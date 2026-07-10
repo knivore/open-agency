@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from app.domain import ToolDefinition, ToolType
 from app.runtime.native.errors import ToolExecutionError
-from app.tools.policies import blocked_command_reason
+from app.tools.policies.command import blocked_command_reason
 from .base import ToolExecutionContext
 
 
@@ -42,10 +42,9 @@ class ShellCommandToolExecutor:
         cwd = arguments.get("cwd") or tool.implementation.config.get("cwd")
         started_at = time.perf_counter()
         try:
-            completed = subprocess.run(  # noqa: S602,S603
-                str(command),
-                shell=True,
-                executable=executable,
+            completed = subprocess.run(  # noqa: S603
+                self._build_shell_invocation(executable, shell_label, str(command)),
+                shell=False,
                 capture_output=True,
                 cwd=str(cwd) if cwd else None,
                 timeout=timeout,
@@ -158,6 +157,16 @@ class ShellCommandToolExecutor:
             f"Unknown shell mode '{mode}'. Use one of: auto, bash, sh, zsh, powershell, pwsh, cmd."
         )
 
+    def _build_shell_invocation(self, executable: str | None, shell_label: str, command: str) -> list[str]:
+        normalized = shell_label.lower()
+        if normalized in {"bash", "sh", "zsh"}:
+            return [executable or normalized, "-lc", command]
+        if normalized in {"pwsh", "powershell"}:
+            return [executable or normalized, "-NoLogo", "-NonInteractive", "-Command", command]
+        if normalized == "cmd":
+            return [executable or os.environ.get("COMSPEC", "cmd"), "/d", "/s", "/c", command]
+        raise ToolExecutionError(f"Shell mode '{shell_label}' is not supported")
+
     def _enforce_command_policy(self, command: str) -> None:
         reason = blocked_command_reason(command)
         if reason:
@@ -180,13 +189,13 @@ class ShellCommandToolExecutor:
         return timeout
 
     def _format_presentation(
-        self,
-        *,
-        stdout: str,
-        stderr: str,
-        returncode: int,
-        duration_ms: int,
-        context: ToolExecutionContext,
+            self,
+            *,
+            stdout: str,
+            stderr: str,
+            returncode: int,
+            duration_ms: int,
+            context: ToolExecutionContext,
     ) -> dict[str, object]:
         output_parts = [stdout.rstrip("\n")] if stdout else []
         if stderr:

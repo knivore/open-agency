@@ -47,6 +47,11 @@ class InMemoryUserRepository(InMemoryCatalogRepository[UserDefinition]):
         if existing is None:
             return await self.create(item)
         merged: dict[str, Any] = existing.model_dump(mode="json")
-        merged.update(item.model_dump(mode="json", exclude_none=True))
+        incoming = item.model_dump(mode="json", exclude_none=True)
+        if "roles" not in item.model_fields_set:
+            incoming.pop("roles", None)
+        if "metadata" in item.model_fields_set:
+            incoming["metadata"] = {**existing.metadata, **item.metadata}
+        merged.update(incoming)
         merged["id"] = existing.id
         return await self.save(UserDefinition.model_validate(merged))

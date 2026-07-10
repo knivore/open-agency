@@ -1,8 +1,14 @@
+"""Reconciler for execution records and Docker worker state.
+
+The reconciler compares persisted execution status with container lifecycle
+state, repairs stale active runs, records runtime operations, and emits terminal
+events when workers exit without completing the normal control-plane path.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
 
 from app.core.config import get_settings
 from app.core.time import ensure_utc, utc_now

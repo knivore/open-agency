@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from app.core.config import get_settings
@@ -54,7 +54,7 @@ class ExecutionRunSummaryService:
             "scope": scope,
             "content": content,
             "summary": summary,
-            "memory_kind": "run_summary",
+            "memory_type": "run_summary",
             "status": "active",
             "importance": int(config.get("importance", 55) or 55),
             "workflow_id": workflow.id,
@@ -128,7 +128,8 @@ class ExecutionRunSummaryService:
             workflow: WorkflowDefinition,
     ) -> tuple[str, str, dict[str, Any]]:
         status_text = execution.status.value
-        result_text = self._stable_text(execution.output_payload) if execution.output_payload else (execution.error or "")
+        result_text = self._stable_text(execution.output_payload) if execution.output_payload else (
+                    execution.error or "")
         summary = self._truncate(
             f"{workflow.name} {status_text}: {result_text}" if result_text else f"{workflow.name} {status_text}.",
             180,
@@ -175,7 +176,7 @@ class ExecutionRunSummaryService:
             scope_payload: dict[str, Any],
     ) -> bool:
         query_kwargs: dict[str, Any] = {
-            "memory_kinds": ["run_summary"],
+            "memory_types": ["run_summary"],
             "statuses": ["active"],
             "limit": 20,
         }

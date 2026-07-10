@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import httpx
 import json
-from pathlib import Path
 import time
-from urllib.parse import urlparse, urlunparse
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
+from urllib.parse import urlparse, urlunparse
 
 from app.core.config import get_settings
 from app.domain import ModelProfileDefinition
@@ -26,9 +26,9 @@ class OllamaModelClient:
     def _normalize_base_url(self, base_url: str) -> str:
         parsed = urlparse(base_url)
         if (
-            Path("/.dockerenv").exists()
-            and parsed.hostname in {"localhost", "127.0.0.1"}
-            and (parsed.port or 11434) == 11434
+                Path("/.dockerenv").exists()
+                and parsed.hostname in {"localhost", "127.0.0.1"}
+                and (parsed.port or 11434) == 11434
         ):
             netloc = "host.docker.internal"
             if parsed.port:

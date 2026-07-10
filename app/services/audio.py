@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import os
-from urllib.parse import urlparse, urlunparse
-from typing import Any
-
 import httpx
+import os
+from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 
 class OpenAIAudioConfigurationError(RuntimeError):

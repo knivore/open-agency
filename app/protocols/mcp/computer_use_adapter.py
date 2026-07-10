@@ -1,3 +1,5 @@
+"""Argument and response adapters for Computer Use tools exposed through MCP."""
+
 from __future__ import annotations
 
 import json

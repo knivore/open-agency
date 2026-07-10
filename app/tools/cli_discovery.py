@@ -4,37 +4,15 @@ from difflib import get_close_matches
 from typing import Any
 
 from app.domain import ToolDefinition
-from app.services.agent_tools import (
-    command_system_tool_definitions,
-    execution_system_tool_definitions,
-    memory_system_tool_definitions,
-    tool_management_system_tool_definitions,
-    workflow_system_tool_definitions,
-)
-from app.tools.definitions import get_tool_catalog_definitions
+from app.tools.builtins import builtin_tool_definitions
 from app.tools.names import make_tool_call_name, tool_call_name, tool_display_name
-
 
 GENERIC_TAGS = {"agent_assignable", "catalog", "crewai", "system"}
 
 
 def list_builtin_tool_definitions() -> list[ToolDefinition]:
-    tools = [
-        *get_tool_catalog_definitions(),
-        *workflow_system_tool_definitions(can_trigger_workflows=True),
-        *tool_management_system_tool_definitions(can_manage_tools=True),
-        *memory_system_tool_definitions(can_manage_memory=True),
-        *execution_system_tool_definitions(can_inspect_executions=True),
-        *command_system_tool_definitions(can_run_commands=True),
-    ]
-    seen: set[str] = set()
-    unique_tools: list[ToolDefinition] = []
-    for tool in tools:
-        if tool.id in seen:
-            continue
-        seen.add(tool.id)
-        unique_tools.append(tool)
-    return sorted(unique_tools, key=lambda tool: tool.id)
+    # Keep CLI discovery as a thin read facade over the shared builtin registry entrypoint.
+    return builtin_tool_definitions()
 
 
 def command_alias_for_tool(tool: ToolDefinition) -> str:

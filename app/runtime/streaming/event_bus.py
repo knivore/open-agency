@@ -1,10 +1,11 @@
+"""In-process fan-out bus for runtime stream events."""
+
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
 
 from .runtime_event_models import RuntimeStreamEvent
-
 
 DEFAULT_RUNTIME_EVENT_QUEUE_SIZE = 256
 
@@ -19,6 +20,8 @@ class RuntimeEventPublishResult:
 
 @dataclass(slots=True)
 class RuntimeEventBus:
+    """Publish runtime events to active SSE/WebSocket subscribers."""
+
     max_queue_size: int = DEFAULT_RUNTIME_EVENT_QUEUE_SIZE
     _subscribers: set[asyncio.Queue[RuntimeStreamEvent]] = field(default_factory=set)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)

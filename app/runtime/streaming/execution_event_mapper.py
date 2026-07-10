@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from app.domain import ExecutionEvent, ExecutionEventType
-
 from .runtime_event_models import (
     RuntimeEventActor,
     RuntimeEventLevel,
@@ -76,6 +75,48 @@ def _log_message_for(event: ExecutionEvent) -> str:
         return f"Model request created for iteration {event.payload.get('iteration', '?')}"
     if event_type == ExecutionEventType.LLM_RESPONSE_CREATED:
         return f"Model response received for iteration {event.payload.get('iteration', '?')}"
+    if event_type == ExecutionEventType.MODEL_FALLBACK_USED:
+        return (
+            f"Model fallback used: {event.payload.get('primary_provider')}:"
+            f"{event.payload.get('primary_model')} -> {event.payload.get('fallback_provider')}:"
+            f"{event.payload.get('fallback_model')}"
+        )
+    if event_type == ExecutionEventType.MODEL_FALLBACK_FAILED:
+        return f"Model fallback failed: {event.payload.get('error') or 'all fallback attempts failed'}"
+    if event_type == ExecutionEventType.TOKEN_USAGE_RECORDED:
+        usage = event.payload.get("usage") if isinstance(event.payload.get("usage"), dict) else {}
+        total_tokens = usage.get("total_tokens") or event.metrics.get("total_tokens") or 0
+        return f"Token usage recorded: {total_tokens} total tokens"
+    if event_type == ExecutionEventType.TOKEN_BUDGET_WARNING:
+        return "Token budget warning"
+    if event_type == ExecutionEventType.TOKEN_BUDGET_EXCEEDED:
+        return "Token budget exceeded"
+    if event_type == ExecutionEventType.CONTEXT_HEALTH_RECORDED:
+        return f"Context health: {event.payload.get('status') or event.metrics.get('context_status') or 'unknown'}"
+    if event_type == ExecutionEventType.CONTEXT_COMPACTION_STARTED:
+        return "Context compaction started"
+    if event_type == ExecutionEventType.CONTEXT_COMPACTION_COMPLETED:
+        record = event.payload.get("record") if isinstance(event.payload.get("record"), dict) else {}
+        if record.get("compacted"):
+            return f"Context compaction completed: {record.get('estimated_tokens_saved') or 0} estimated tokens saved"
+        return f"Context compaction skipped: {record.get('reason') or 'not needed'}"
+    if event_type == ExecutionEventType.CONTEXT_COMPACTION_FAILED:
+        return f"Context compaction failed: {event.payload.get('error') or 'unknown error'}"
+    if event_type == ExecutionEventType.SUBAGENT_PROGRESS_UPDATED:
+        if event.payload.get("blocker"):
+            return f"Sub-agent blocked: {event.payload.get('blocker')}"
+        if event.payload.get("clarification_needed"):
+            return f"Sub-agent needs clarification: {event.payload.get('clarification_needed')}"
+        status = event.payload.get("status") or event.payload.get("subagent_status") or "running"
+        return f"Sub-agent progress: {status}"
+    if event_type == ExecutionEventType.SUBAGENT_STEP_COMPLETED:
+        return "Sub-agent step completed"
+    if event_type == ExecutionEventType.SUBAGENT_STEP_FAILED:
+        return f"Sub-agent step failed: {event.payload.get('error') or event.payload.get('blocker') or 'unknown error'}"
+    if event_type == ExecutionEventType.SUBAGENT_NEEDS_INPUT:
+        return f"Sub-agent needs input: {event.payload.get('clarification_needed') or event.payload.get('question') or 'input required'}"
+    if event_type == ExecutionEventType.SUBAGENT_NEEDS_APPROVAL:
+        return f"Sub-agent needs approval: {event.payload.get('approval_type') or event.payload.get('reason') or 'approval required'}"
     if event_type == ExecutionEventType.TOOL_CALL_STARTED:
         return f"Tool started: {event.payload.get('tool_name') or event.payload.get('tool_id') or 'tool'}"
     if event_type == ExecutionEventType.TOOL_CALL_COMPLETED:
@@ -96,6 +137,10 @@ def _log_message_for(event: ExecutionEvent) -> str:
         return "Monitor proposed a workflow improvement"
     if event_type == ExecutionEventType.MONITOR_IMPROVEMENT_COMPARED:
         return f"Monitor compared improvement outcome: {event.payload.get('outcome') or 'unknown'}"
+    if event_type == ExecutionEventType.SUPERVISOR_STEERING_REQUESTED:
+        return f"Supervisor steering requested: {event.payload.get('recommended_action') or 'review'}"
+    if event_type == ExecutionEventType.SUPERVISOR_STEERING_APPLIED:
+        return f"Supervisor steering applied: {event.payload.get('applied_action') or event.payload.get('recommended_action') or 'steering'}"
     return event_type.value
 
 
@@ -137,6 +182,115 @@ def map_execution_event_to_runtime_events(event: ExecutionEvent) -> list[Runtime
                 message="Model response received",
                 progress=0.55,
                 metadata=_metadata_for(event, phase="model_response", iteration=event.payload.get("iteration")),
+            )
+        )
+
+    if event.event_type == ExecutionEventType.CONTEXT_HEALTH_RECORDED:
+        level = (
+            RuntimeEventLevel.WARNING
+            if event.payload.get("status") in {"warning", "critical", "overflow"}
+            else RuntimeEventLevel.INFO
+        )
+        runtime_events.append(
+            _runtime_event(
+                event,
+                RuntimeEventType.TASK_PROGRESS,
+                level=level,
+                message=_log_message_for(event),
+                progress=0.35,
+                metadata=_metadata_for(
+                    event,
+                    phase="context_health",
+                    contextStatus=event.payload.get("status"),
+                    contextUsageRatio=event.payload.get("usage_ratio"),
+                ),
+            )
+        )
+
+    if event.event_type in {
+        ExecutionEventType.SUBAGENT_PROGRESS_UPDATED,
+        ExecutionEventType.SUBAGENT_STEP_COMPLETED,
+        ExecutionEventType.SUBAGENT_STEP_FAILED,
+        ExecutionEventType.SUBAGENT_NEEDS_INPUT,
+        ExecutionEventType.SUBAGENT_NEEDS_APPROVAL,
+    }:
+        progress_percent = event.payload.get("progress_percent") or event.payload.get("percent")
+        progress = None
+        if isinstance(progress_percent, int | float):
+            progress = max(min(float(progress_percent) / 100, 1), 0)
+        level = RuntimeEventLevel.ERROR if event.event_type == ExecutionEventType.SUBAGENT_STEP_FAILED else (
+            RuntimeEventLevel.WARNING
+            if event.event_type in {ExecutionEventType.SUBAGENT_NEEDS_INPUT, ExecutionEventType.SUBAGENT_NEEDS_APPROVAL}
+               or event.payload.get("blocker")
+               or event.payload.get("clarification_needed")
+            else RuntimeEventLevel.SUCCESS
+            if event.event_type == ExecutionEventType.SUBAGENT_STEP_COMPLETED
+            else RuntimeEventLevel.INFO
+        )
+        runtime_events.append(
+            _runtime_event(
+                event,
+                RuntimeEventType.TASK_PROGRESS,
+                level=level,
+                message=_log_message_for(event),
+                progress=progress,
+                metadata=_metadata_for(
+                    event,
+                    phase="subagent_status",
+                    subagentStatus=event.payload.get("status") or event.payload.get("subagent_status"),
+                    confidence=event.payload.get("confidence"),
+                ),
+            )
+        )
+
+    if event.event_type in {ExecutionEventType.TOKEN_BUDGET_WARNING, ExecutionEventType.TOKEN_BUDGET_EXCEEDED}:
+        runtime_events.append(
+            _runtime_event(
+                event,
+                RuntimeEventType.TASK_PROGRESS,
+                level=RuntimeEventLevel.WARNING,
+                message=_log_message_for(event),
+                progress=0.6,
+                metadata=_metadata_for(event, phase="token_budget"),
+            )
+        )
+
+    if event.event_type == ExecutionEventType.SUPERVISOR_STEERING_REQUESTED:
+        runtime_events.append(
+            _runtime_event(
+                event,
+                RuntimeEventType.TASK_PROGRESS,
+                level=RuntimeEventLevel.WARNING,
+                message=_log_message_for(event),
+                progress=0.65,
+                metadata=_metadata_for(
+                    event,
+                    phase="supervisor_steering",
+                    recommendedAction=event.payload.get("recommended_action"),
+                    findingCategory=event.payload.get("category"),
+                    steeringStatus=event.payload.get("status"),
+                ),
+            )
+        )
+
+    if event.event_type in {
+        ExecutionEventType.CONTEXT_COMPACTION_STARTED,
+        ExecutionEventType.CONTEXT_COMPACTION_COMPLETED,
+        ExecutionEventType.CONTEXT_COMPACTION_FAILED,
+    }:
+        level = (
+            RuntimeEventLevel.ERROR
+            if event.event_type == ExecutionEventType.CONTEXT_COMPACTION_FAILED
+            else RuntimeEventLevel.INFO
+        )
+        runtime_events.append(
+            _runtime_event(
+                event,
+                RuntimeEventType.TASK_PROGRESS,
+                level=level,
+                message=_log_message_for(event),
+                progress=0.4,
+                metadata=_metadata_for(event, phase="context_compaction"),
             )
         )
 
@@ -211,6 +365,20 @@ def map_execution_event_to_runtime_events(event: ExecutionEvent) -> list[Runtime
     if event.event_type in {
         ExecutionEventType.LLM_REQUEST_CREATED,
         ExecutionEventType.LLM_RESPONSE_CREATED,
+        ExecutionEventType.MODEL_FALLBACK_USED,
+        ExecutionEventType.MODEL_FALLBACK_FAILED,
+        ExecutionEventType.TOKEN_USAGE_RECORDED,
+        ExecutionEventType.TOKEN_BUDGET_WARNING,
+        ExecutionEventType.TOKEN_BUDGET_EXCEEDED,
+        ExecutionEventType.CONTEXT_HEALTH_RECORDED,
+        ExecutionEventType.CONTEXT_COMPACTION_STARTED,
+        ExecutionEventType.CONTEXT_COMPACTION_COMPLETED,
+        ExecutionEventType.CONTEXT_COMPACTION_FAILED,
+        ExecutionEventType.SUBAGENT_PROGRESS_UPDATED,
+        ExecutionEventType.SUBAGENT_STEP_COMPLETED,
+        ExecutionEventType.SUBAGENT_STEP_FAILED,
+        ExecutionEventType.SUBAGENT_NEEDS_INPUT,
+        ExecutionEventType.SUBAGENT_NEEDS_APPROVAL,
         ExecutionEventType.TOOL_CALL_STARTED,
         ExecutionEventType.TOOL_CALL_COMPLETED,
         ExecutionEventType.TOOL_CALL_FAILED,
@@ -218,10 +386,23 @@ def map_execution_event_to_runtime_events(event: ExecutionEvent) -> list[Runtime
         ExecutionEventType.EXECUTION_REPAIRED,
         ExecutionEventType.MONITOR_FINDING_CREATED,
         ExecutionEventType.MONITOR_IMPROVEMENT_PROPOSED,
+        ExecutionEventType.SUPERVISOR_STEERING_REQUESTED,
+        ExecutionEventType.SUPERVISOR_STEERING_APPLIED,
     }:
         level = RuntimeEventLevel.ERROR if event.event_type in {
+            ExecutionEventType.CONTEXT_COMPACTION_FAILED,
+            ExecutionEventType.MODEL_FALLBACK_FAILED,
+            ExecutionEventType.SUBAGENT_STEP_FAILED,
             ExecutionEventType.TOOL_CALL_FAILED,
             ExecutionEventType.EXECUTION_FAILED,
+        } else RuntimeEventLevel.WARNING if event.event_type in {
+            ExecutionEventType.TOKEN_BUDGET_WARNING,
+            ExecutionEventType.TOKEN_BUDGET_EXCEEDED,
+            ExecutionEventType.CONTEXT_COMPACTION_STARTED,
+            ExecutionEventType.MODEL_FALLBACK_USED,
+            ExecutionEventType.SUBAGENT_NEEDS_INPUT,
+            ExecutionEventType.SUBAGENT_NEEDS_APPROVAL,
+            ExecutionEventType.SUPERVISOR_STEERING_REQUESTED,
         } else RuntimeEventLevel.INFO
         runtime_events.append(
             _runtime_event(

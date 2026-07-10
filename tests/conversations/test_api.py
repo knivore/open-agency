@@ -9,7 +9,8 @@ from app.domain import ConversationMessage, ConversationMessageType, Conversatio
     ModelProfileDefinition, SecuritySettings, ToolDefinition, ToolImplementationReference, ToolType
 from app.llm.base import ModelResponse, ModelToolCall
 from app.llm.registry import LLMEnvironmentConfig
-from app.services.main_agent_setup import MainAgentSetupConfig, MainAgentSetupService
+from app.services.conversations.audit import ConversationAuditService
+from app.services.main_agent_setup.service import MainAgentSetupConfig, MainAgentSetupService
 
 
 class _FakeModelClient:
@@ -106,7 +107,9 @@ class ConversationsApiTests(unittest.TestCase):
 
         list_response = self.client.get("/conversations")
         self.assertEqual(list_response.status_code, 200)
-        self.assertEqual(len(list_response.json()["items"]), 1)
+        listed = list_response.json()["items"]
+        self.assertIn("conversation-1", {item["id"] for item in listed})
+        self.assertIn("main-agent-profile-monitor", {item["id"] for item in listed})
 
         get_response = self.client.get("/conversations/conversation-1")
         self.assertEqual(get_response.status_code, 200)
@@ -148,6 +151,107 @@ class ConversationsApiTests(unittest.TestCase):
         workflow = self._run(self.context.workflow_repo.get(profile.default_workflow_id))
         assert workflow is not None
         self.assertEqual(workflow.agent_definitions[0].model_profile_id, "profile-ollama")
+
+    def test_context_usage_reports_resolved_model_window_and_alert_status(self) -> None:
+        self._run(
+            self.context.model_profile_repo.save(
+                ModelProfileDefinition(
+                    id="profile-small-context",
+                    name="Small Context",
+                    provider="fake",
+                    model="small-context-model",
+                    context_window=100,
+                    max_tokens=20,
+                )
+            )
+        )
+        patch_response = self.client.patch(
+            "/conversations/main-agent-profile",
+            json={"default_model_profile_id": "profile-small-context"},
+        )
+        self.assertEqual(patch_response.status_code, 200)
+
+        create_response = self.client.post(
+            "/conversations",
+            json={
+                "id": "conversation-context-usage",
+                "created_by_user_id": "user-1",
+                "channel_type": "api",
+            },
+        )
+        self.assertEqual(create_response.status_code, 200)
+        self._run(
+            self.context.conversation_message_repo.create(
+                ConversationMessage(
+                    id="context-usage-message-1",
+                    conversation_id="conversation-context-usage",
+                    role=ConversationRole.USER,
+                    message_type=ConversationMessageType.USER_TEXT,
+                    plain_text="Please retain this context. " * 20,
+                    content={"text": "Please retain this context. " * 20},
+                )
+            )
+        )
+
+        usage_response = self.client.get("/conversations/conversation-context-usage/context-usage")
+        self.assertEqual(usage_response.status_code, 200)
+        payload = usage_response.json()
+        self.assertEqual(payload["model_profile"]["id"], "profile-small-context")
+        self.assertEqual(payload["context_window"], 100)
+        self.assertGreater(payload["estimated_context_tokens"], 0)
+        self.assertEqual(payload["status"], "overflow")
+        self.assertTrue(payload["compact_recommended"])
+
+    def test_direct_reply_records_governance_events_and_usage_snapshot(self) -> None:
+        _FakeModelClient.responses = [
+            ModelResponse(
+                content="Governed reply",
+                usage={"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
+                provider="fake",
+                model="fake-model",
+                latency_ms=3,
+            )
+        ]
+        create_response = self.client.post(
+            "/conversations",
+            json={
+                "id": "conversation-governance",
+                "created_by_user_id": "user-1",
+                "channel_type": "api",
+            },
+        )
+        self.assertEqual(create_response.status_code, 200)
+
+        append_response = self.client.post(
+            "/conversations/conversation-governance/messages",
+            json={
+                "id": "message-governance",
+                "role": "user",
+                "message_type": "user_text",
+                "plain_text": "Track governance",
+                "content": {"text": "Track governance"},
+            },
+        )
+        self.assertEqual(append_response.status_code, 200)
+        self.assertEqual(append_response.json()["assistant_message"]["plain_text"], "Governed reply")
+
+        audit_execution_id = ConversationAuditService(self.context).audit_execution_id("conversation-governance")
+        events = self._run(self.context.execution_store.list_events(audit_execution_id))
+        event_types = [event.event_type.value for event in events]
+
+        self.assertIn("context.health.recorded", event_types)
+        self.assertIn("llm.request.created", event_types)
+        self.assertIn("llm.response.created", event_types)
+        self.assertIn("token.usage.recorded", event_types)
+        token_events = [event for event in events if event.event_type.value == "token.usage.recorded"]
+        self.assertEqual(token_events[-1].metrics["total_tokens"], 18)
+        self.assertEqual(token_events[-1].payload["call_kind"], "direct_reply")
+
+        audit_execution = self._run(self.context.execution_store.get_execution(audit_execution_id))
+        assert audit_execution is not None
+        governance = audit_execution.metadata["runtime_governance"]
+        self.assertEqual(governance["token_usage"]["total"]["total_tokens"], 18)
+        self.assertGreater(governance["context_health"]["last"]["estimated_total_context_tokens"], 0)
 
     def test_main_agent_chat_uses_agent_equipped_model_profile(self) -> None:
         self._run(

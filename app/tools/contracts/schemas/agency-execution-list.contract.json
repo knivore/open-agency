@@ -1,0 +1,121 @@
+{
+  "@context": "https://agency.local/tool-contracts/v1",
+  "@type": "ToolContract",
+  "name": "agency.execution.list",
+  "version": "1.0",
+  "description": "Read recent Agency executions through the contract layer.",
+  "inputs": {
+    "type": "object",
+    "properties": {
+      "workflow_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Optional workflow id filter."
+      },
+      "agent_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Optional agent id filter."
+      },
+      "status": {
+        "type": [
+          "array",
+          "null"
+        ],
+        "items": {
+          "type": "string"
+        },
+        "description": "Optional execution status filters."
+      },
+      "active_only": {
+        "type": [
+          "boolean",
+          "null"
+        ],
+        "description": "Whether to return only active executions."
+      },
+      "limit": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "minimum": 1,
+        "maximum": 200,
+        "description": "Maximum number of executions to return."
+      }
+    },
+    "additionalProperties": false
+  },
+  "outputs": {
+    "type": "object",
+    "properties": {
+      "verdict": {
+        "type": "string",
+        "enum": [
+          "ok",
+          "warn",
+          "deny"
+        ]
+      },
+      "policyVerdict": {
+        "type": [
+          "object",
+          "null"
+        ]
+      },
+      "result": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "additionalProperties": true
+      },
+      "patch": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "filesChanged": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      },
+      "errors": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "dryRun": {
+        "type": "boolean"
+      },
+      "timestamp": {
+        "type": "string"
+      },
+      "actor": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "signature": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "verdict",
+      "dryRun",
+      "timestamp"
+    ],
+    "additionalProperties": false
+  }
+}

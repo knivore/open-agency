@@ -1,13 +1,15 @@
+"""Domain contracts for tool definitions, implementations, and security policy."""
+
 from __future__ import annotations
 
+import re
 from enum import Enum
 from pydantic import AliasChoices, Field, model_validator
-import re
 from typing import Any, Dict, List, Literal, Optional
 from uuid import uuid4
 
 from .agents import FrameworkHints
-from .credentials import CredentialReference, DomainModel
+from .credentials import ConnectorBindingDefinition, CredentialReference, DomainModel
 
 
 class ToolType(str, Enum):
@@ -54,6 +56,7 @@ class SecuritySettings(DomainModel):
         validation_alias=AliasChoices("credential_references", "secret_references"),
         serialization_alias="credential_references",
     )
+    connector_bindings: List[ConnectorBindingDefinition] = Field(default_factory=list)
     redaction_enabled: bool = False
     redaction_rules: List[str] = Field(default_factory=list)
 
@@ -191,7 +194,8 @@ _TOOL_DISPLAY_ACRONYMS = {
     "xml",
     "yaml",
 }
-_TOOL_DISPLAY_LOWERCASE_WORDS = {"a", "an", "and", "as", "by", "for", "from", "in", "of", "on", "or", "the", "to", "with"}
+_TOOL_DISPLAY_LOWERCASE_WORDS = {"a", "an", "and", "as", "by", "for", "from", "in", "of", "on", "or", "the", "to",
+                                 "with"}
 
 
 def _default_tool_display_name(value: str) -> str:

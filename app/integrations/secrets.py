@@ -12,6 +12,14 @@ class SecretResolutionResult:
     error: str | None = None
 
 
+def is_onecli_secret_ref(secret_ref: str | None) -> bool:
+    return isinstance(secret_ref, str) and secret_ref.strip().lower().startswith("onecli://")
+
+
+def onecli_secret_identifier(secret_ref: str) -> str:
+    return secret_ref.strip()[len("onecli://"):]
+
+
 def resolve_secret_ref(secret_ref: str) -> SecretResolutionResult:
     if secret_ref.startswith("env://"):
         env_var = secret_ref[len("env://"):].strip()

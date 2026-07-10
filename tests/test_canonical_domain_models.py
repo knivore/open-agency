@@ -10,7 +10,7 @@ from app.domain import (
     ExecutionArtifact,
     ExecutionEvent,
     ExecutionEventType,
-    MemoryKind,
+    MemoryType,
     MemoryRecord,
     MemoryStatus,
     ModelProfileDefinition,
@@ -24,9 +24,11 @@ from app.domain import (
     WorkflowNodeDefinition,
 )
 from app.domain.models import (
+    ConnectorBindingDefinition,
     CredentialReference,
     EdgeType,
     FrameworkHints,
+    GraphContextSettings,
     MCPExposureSettings,
     MemorySettings,
     ModelProviderType,
@@ -64,6 +66,19 @@ class CanonicalDomainModelTests(unittest.TestCase):
             supports_tools=True,
             supports_structured_output=True,
             supports_streaming=True,
+            fallback_strategy="manual",
+            fallback_policy={
+                "retry_on": ["rate_limit", "timeout"],
+                "same_provider_only": True,
+                "require_capability_match": True,
+            },
+            fallback_models=[
+                {
+                    "provider": provider.id,
+                    "model": "gpt-4o-mini-compatible-backup",
+                    "context_window": 64000,
+                }
+            ],
         )
 
         provider_round_trip = ModelProviderDefinition.model_validate(provider.model_dump(mode="json"))
@@ -74,6 +89,10 @@ class CanonicalDomainModelTests(unittest.TestCase):
         self.assertEqual(profile_round_trip.provider_id, provider.id)
         self.assertEqual(profile_round_trip.model_name, "gpt-4o-mini-compatible")
         self.assertTrue(profile_round_trip.supports_structured_output)
+        self.assertEqual(profile_round_trip.fallback_strategy, "manual")
+        self.assertEqual(profile_round_trip.fallback_policy.retry_on, ["rate_limit", "timeout"])
+        self.assertTrue(profile_round_trip.fallback_policy.same_provider_only)
+        self.assertEqual(profile_round_trip.fallback_models[0].model, "gpt-4o-mini-compatible-backup")
 
     def test_agent_tool_task_workflow_round_trip(self):
         tool = ToolDefinition(
@@ -96,6 +115,14 @@ class CanonicalDomainModelTests(unittest.TestCase):
                 module_allowlist=["tools.browser"],
                 function_allowlist=["create_tool"],
                 credential_references=[CredentialReference(ref="secret/browser-token", source="vault")],
+                connector_bindings=[
+                    ConnectorBindingDefinition(
+                        provider="github",
+                        credential_id="credential-github-api",
+                        purpose="release_automation",
+                        target_scope={"owner": "acme", "repo": "api"},
+                    )
+                ],
             ),
             mcp_exposure=MCPExposureSettings(expose_as_mcp_tool=True, tags=["browser"]),
         )
@@ -110,6 +137,13 @@ class CanonicalDomainModelTests(unittest.TestCase):
             tool_ids=[tool.id],
             handoff_agent_ids=["agent-reviewer"],
             memory=MemorySettings(enabled=True, strategy="buffer", scope="execution"),
+            graph_context=GraphContextSettings(
+                enabled=True,
+                auto_retrieval_enabled=False,
+                default_intent="resume",
+                default_budget="brief",
+                max_records=25,
+            ),
             framework_hints=FrameworkHints(preferred_adapter="crewai", adapter_config={"verbose": True}),
         )
         task = TaskDefinition(
@@ -159,10 +193,17 @@ class CanonicalDomainModelTests(unittest.TestCase):
         self.assertEqual(round_trip.default_runtime_adapter, "crewai")
         self.assertEqual(round_trip.allowed_runtime_adapters, ["native", "crewai"])
         self.assertEqual(round_trip.agent_definitions[0].tool_ids, [tool.id])
+        self.assertTrue(round_trip.agent_definitions[0].graph_context.enabled)
+        self.assertEqual(round_trip.agent_definitions[0].graph_context.default_intent, "resume")
+        self.assertEqual(round_trip.agent_definitions[0].graph_context.default_budget, "brief")
         self.assertEqual(round_trip.agent_definitions[0].instructions, "Use tools carefully and cite sources.")
         self.assertEqual(round_trip.agent_definitions[0].system_prompt, "Use tools carefully and cite sources.")
         self.assertNotIn("objective", serialized_agent)
         self.assertEqual(round_trip.edges[0].edge_type, EdgeType.APPROVAL)
+        self.assertEqual(
+            round_trip.tool_definitions[0].security.connector_bindings[0].target_scope["repo"],
+            "api",
+        )
 
     def test_memory_record_legacy_and_summary_validation(self):
         legacy = MemoryRecord(
@@ -171,7 +212,7 @@ class CanonicalDomainModelTests(unittest.TestCase):
             content="User prefers concise summaries.",
         )
         legacy_round_trip = MemoryRecord.model_validate(legacy.model_dump(mode="json"))
-        self.assertIsNone(legacy_round_trip.memory_kind)
+        self.assertIsNone(legacy_round_trip.memory_type)
         self.assertEqual(legacy_round_trip.status, MemoryStatus.ACTIVE)
         self.assertEqual(legacy_round_trip.importance, 50)
 
@@ -179,7 +220,7 @@ class CanonicalDomainModelTests(unittest.TestCase):
             scope="conversation",
             conversation_id="conversation-1",
             source_conversation_id="conversation-1",
-            memory_kind=MemoryKind.DAILY_SUMMARY,
+            memory_type=MemoryType.DAILY_SUMMARY,
             summary_date=date(2026, 5, 7),
             archived_window_start=datetime(2026, 5, 7, 0, 0, tzinfo=timezone.utc),
             archived_window_end=datetime(2026, 5, 7, 23, 59, tzinfo=timezone.utc),
@@ -187,14 +228,14 @@ class CanonicalDomainModelTests(unittest.TestCase):
             summary="Locked the DB-first memory approach.",
         )
         summary_round_trip = MemoryRecord.model_validate(summary.model_dump(mode="json"))
-        self.assertEqual(summary_round_trip.memory_kind, MemoryKind.DAILY_SUMMARY)
+        self.assertEqual(summary_round_trip.memory_type, MemoryType.DAILY_SUMMARY)
         self.assertEqual(summary_round_trip.summary_date, date(2026, 5, 7))
 
         with self.assertRaises(ValueError):
             MemoryRecord(
                 scope="conversation",
                 conversation_id="conversation-1",
-                memory_kind=MemoryKind.DAILY_SUMMARY,
+                memory_type=MemoryType.DAILY_SUMMARY,
                 content="Missing required summary fields.",
             )
 

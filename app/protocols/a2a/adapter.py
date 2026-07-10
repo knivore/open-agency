@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import httpx
 import json
 from typing import Any
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 
 from app.domain import ExecutionArtifact, ExecutionEvent, ExecutionEventType, ToolDefinition
 from app.runtime.native.errors import ToolExecutionError
@@ -49,6 +49,8 @@ class A2AAdapter:
 
         target = tool.implementation.target
         parsed = urlparse(target)
+        if parsed.scheme not in {"http", "https"}:
+            raise ToolExecutionError(f"A2A remote URL scheme '{parsed.scheme or '<missing>'}' is not allowed")
         if parsed.hostname and tool.security.allowlisted_domains and parsed.hostname not in tool.security.allowlisted_domains:
             raise ToolExecutionError(f"A2A remote host '{parsed.hostname}' is not allowlisted for tool '{tool.id}'")
         message = {
@@ -61,14 +63,14 @@ class A2AAdapter:
             "trigger": {"created_by": "a2a_remote_agent"},
             "message": message,
         }
-        request = Request(
-            url=target.rstrip("/") + "/tasks",
-            method="POST",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        )
-        with urlopen(request, timeout=tool.implementation.config.get("timeout", 30)) as response:  # noqa: S310
-            body = json.loads(response.read().decode("utf-8"))
+        async with httpx.AsyncClient(timeout=tool.implementation.config.get("timeout", 30)) as client:
+            response = await client.post(
+                target.rstrip("/") + "/tasks",
+                content=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            response.raise_for_status()
+            body = response.json()
             return body if isinstance(body, dict) else {"result": body}
 
     async def get_task(self, execution_id: str) -> dict[str, Any] | None:

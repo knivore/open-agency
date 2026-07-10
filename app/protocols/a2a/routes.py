@@ -1,3 +1,11 @@
+"""FastAPI routes for the Agent2Agent compatibility boundary.
+
+A2A is intentionally an adapter over Agency's canonical execution store. The
+routes below expose an agent card, create tasks by creating normal executions,
+append A2A messages as execution events, and read artifacts from the same store
+used by native Agency runs.
+"""
+
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -5,7 +13,7 @@ from typing import Optional
 
 from app.api.context import ApiContext, get_default_api_context
 from app.runtime.native.errors import WorkflowNotFoundError
-from app.services import ExecutionService
+from app.services.executions import ExecutionService
 from .adapter import A2AAdapter
 from .agent_card import agent_definition_to_card
 from .artifacts import execution_artifact_to_a2a_artifact

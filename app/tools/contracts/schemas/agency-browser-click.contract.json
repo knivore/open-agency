@@ -7,36 +7,107 @@
   "inputs": {
     "type": "object",
     "properties": {
-      "instruction": { "type": "string", "minLength": 1, "description": "Description of the element to click." },
-      "sequence_number": { "type": ["integer", "null"], "description": "Optional sequence number of the target element." }
+      "instruction": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Description of the element to click."
+      },
+      "sequence_number": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "description": "Optional sequence number of the target element."
+      }
     },
-    "required": ["instruction"],
+    "required": [
+      "instruction"
+    ],
     "additionalProperties": false
   },
   "outputs": {
     "type": "object",
     "properties": {
-      "verdict": { "type": "string", "enum": ["ok", "warn", "deny"] },
-      "policyVerdict": { "type": ["object", "null"] },
+      "verdict": {
+        "type": "string",
+        "enum": [
+          "ok",
+          "warn",
+          "deny"
+        ]
+      },
+      "policyVerdict": {
+        "type": [
+          "object",
+          "null"
+        ]
+      },
       "result": {
-        "type": ["object", "null"],
+        "type": [
+          "object",
+          "null"
+        ],
         "properties": {
-          "status": { "type": "string", "enum": ["ok", "error"] },
-          "tool": { "type": "string", "const": "agency.browser.click" },
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "error"
+            ]
+          },
+          "tool": {
+            "type": "string",
+            "const": "agency.browser.click"
+          },
           "output": {},
-          "error": { "type": "string" }
+          "error": {
+            "type": "string"
+          }
         },
         "additionalProperties": true
       },
-      "patch": { "type": ["string", "null"] },
-      "filesChanged": { "type": "array", "items": { "type": "object" } },
-      "errors": { "type": "array", "items": { "type": "string" } },
-      "dryRun": { "type": "boolean" },
-      "timestamp": { "type": "string" },
-      "actor": { "type": ["string", "null"] },
-      "signature": { "type": ["string", "null"] }
+      "patch": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "filesChanged": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      },
+      "errors": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "dryRun": {
+        "type": "boolean"
+      },
+      "timestamp": {
+        "type": "string"
+      },
+      "actor": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "signature": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
     },
-    "required": ["verdict", "dryRun", "timestamp"],
+    "required": [
+      "verdict",
+      "dryRun",
+      "timestamp"
+    ],
     "additionalProperties": false
   }
 }

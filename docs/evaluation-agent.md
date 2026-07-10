@@ -13,22 +13,20 @@ Evaluation agent owns semantic scoring and concise failure analysis.
 Run:
 
 ```bash
-make setup-agents
+make setup-evaluation-agent
 ```
 
-To update only the Evaluation agent:
+Equivalent command:
 
 ```bash
-make setup-evaluation-agent
 ./.venv/bin/python scripts/setup.py evaluation-agent
 ```
-
-`python scripts/setup.py` provisions this agent together with the main, Coder, and Embedding agents.
 
 The setup script:
 
 - creates or updates an agent named `Evaluation`
 - assigns only read-only inspection tools
+- assigns read-only `agency.graph.context` when `AGENCY_GRAPH_CONTEXT_TOOLS_ENABLED=true`
 - disables durable memory by default to avoid judge contamination
 - chooses a model profile that is not used by the active main agent, `Coder`, or `Embedding`
 - prefers profiles tagged for evaluation through profile parameters or framework metadata
@@ -60,6 +58,7 @@ agency.execution.events
 agency.execution.artifacts
 agency.workflow.get
 agency.workflow.list
+agency.graph.context  # when AGENCY_GRAPH_CONTEXT_TOOLS_ENABLED=true
 ```
 
 These tools are read-only. Do not assign command, workflow-run, memory-write, browser-mutation, or proposal tools to the

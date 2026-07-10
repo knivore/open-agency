@@ -8,7 +8,10 @@ from app.api.context import create_test_api_context
 from app.domain import Execution, ExecutionEvent, ExecutionEventType, ExecutionStatus, \
     WorkflowDefinition, WorkflowNodeDefinition
 from app.observability.service import ObservabilityService
-from app.services import AgentService, ExecutionService, ScheduleService, WorkflowService
+from app.services.agents import AgentService
+from app.services.executions import ExecutionService
+from app.services.schedules import ScheduleService
+from app.services.workflows import WorkflowService
 
 
 class ServiceLayerTests(unittest.IsolatedAsyncioTestCase):

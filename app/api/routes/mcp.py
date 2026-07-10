@@ -1,3 +1,5 @@
+"""MCP server catalog routes and discovery trigger."""
+
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -5,7 +7,7 @@ from typing import Any, Optional
 
 from app.api.context import ApiContext, get_default_api_context
 from app.domain import MCPServerDefinition
-from app.services import ModelCatalogService
+from app.services.models import ModelCatalogService
 from ._crud import build_crud_router
 
 

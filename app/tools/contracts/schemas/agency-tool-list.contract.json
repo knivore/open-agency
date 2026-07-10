@@ -14,10 +14,17 @@
     "properties": {
       "verdict": {
         "type": "string",
-        "enum": ["ok", "warn", "deny"]
+        "enum": [
+          "ok",
+          "warn",
+          "deny"
+        ]
       },
       "policyVerdict": {
-        "type": ["object", "null"]
+        "type": [
+          "object",
+          "null"
+        ]
       },
       "result": {
         "type": "object",
@@ -32,11 +39,17 @@
             "type": "integer"
           }
         },
-        "required": ["items", "count"],
+        "required": [
+          "items",
+          "count"
+        ],
         "additionalProperties": false
       },
       "patch": {
-        "type": ["string", "null"]
+        "type": [
+          "string",
+          "null"
+        ]
       },
       "filesChanged": {
         "type": "array",
@@ -57,13 +70,24 @@
         "type": "string"
       },
       "actor": {
-        "type": ["string", "null"]
+        "type": [
+          "string",
+          "null"
+        ]
       },
       "signature": {
-        "type": ["string", "null"]
+        "type": [
+          "string",
+          "null"
+        ]
       }
     },
-    "required": ["verdict", "result", "dryRun", "timestamp"],
+    "required": [
+      "verdict",
+      "result",
+      "dryRun",
+      "timestamp"
+    ],
     "additionalProperties": false
   }
 }

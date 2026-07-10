@@ -30,11 +30,13 @@ class EventBus:
 
     def publish(self, event: ExecutionEvent) -> ExecutionEvent:
         payload, fields = self.redactor.redact_value(event.payload)
+        metrics, metric_fields = self.redactor.redact_value(event.metrics)
         metadata, meta_fields = self.redactor.redact_value(event.metadata)
-        if fields or meta_fields:
+        if fields or metric_fields or meta_fields:
             event.payload = payload
+            event.metrics = metrics
             event.metadata = metadata
-            event.redacted_fields = sorted(set([*event.redacted_fields, *fields, *meta_fields]))
+            event.redacted_fields = sorted(set([*event.redacted_fields, *fields, *metric_fields, *meta_fields]))
         for exporter in self.exporters:
             exporter.export_event(event)
         return event

@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: docker/backend/Dockerfile
-    container_name: agency-backend
+    container_name: open-agency-backend
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
@@ -16,6 +16,9 @@ services:
       REDIS_PORT: "6379"
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       OBSERVABILITY_EXPORTERS: ${OBSERVABILITY_EXPORTERS:-jsonl}
+      OBSERVABILITY_REDACT_SECRETS: ${OBSERVABILITY_REDACT_SECRETS:-true}
+      OBSERVABILITY_JSONL_PATH: ${OBSERVABILITY_JSONL_PATH:-logs/observability.jsonl}
+      LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL:-http://langfuse-web:3001}
       LANGFUSE_HOST: ${LANGFUSE_HOST:-http://langfuse-web:3001}
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
@@ -23,34 +26,71 @@ services:
       BACKEND_RELOAD: ${BACKEND_RELOAD:-true}
       WORKFLOW_SCHEDULER_ENABLED: ${WORKFLOW_SCHEDULER_ENABLED:-false}
       WORKFLOW_SCHEDULER_INTERVAL_SECONDS: ${WORKFLOW_SCHEDULER_INTERVAL_SECONDS:-30}
+      MAIN_AGENT_WORKFLOW_MONITOR_ENABLED: ${MAIN_AGENT_WORKFLOW_MONITOR_ENABLED:-true}
+      MAIN_AGENT_WORKFLOW_MONITOR_DEFAULT_ENABLED: ${MAIN_AGENT_WORKFLOW_MONITOR_DEFAULT_ENABLED:-true}
+      MAIN_AGENT_WORKFLOW_MONITOR_INTERVAL_SECONDS: ${MAIN_AGENT_WORKFLOW_MONITOR_INTERVAL_SECONDS:-60}
+      MAIN_AGENT_WORKFLOW_MONITOR_STALE_AFTER_SECONDS: ${MAIN_AGENT_WORKFLOW_MONITOR_STALE_AFTER_SECONDS:-300}
+      MAIN_AGENT_WORKFLOW_MONITOR_TERMINAL_LOOKBACK_SECONDS: ${MAIN_AGENT_WORKFLOW_MONITOR_TERMINAL_LOOKBACK_SECONDS:-86400}
+      MAIN_AGENT_WORKFLOW_MONITOR_FINDING_RETENTION_DAYS: ${MAIN_AGENT_WORKFLOW_MONITOR_FINDING_RETENTION_DAYS:-60}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       LLM_REQUEST_TIMEOUT_SECONDS: ${LLM_REQUEST_TIMEOUT_SECONDS:-180}
-      CODEX_CLI_TIMEOUT_SECONDS: ${CODEX_CLI_TIMEOUT_SECONDS:-600}
+      PERSONA_FACTORY_LLM_TIMEOUT_SECONDS: ${PERSONA_FACTORY_LLM_TIMEOUT_SECONDS:-120}
+      AGENCY_PUBLIC_WEBHOOK_BASE_URL: ${AGENCY_PUBLIC_WEBHOOK_BASE_URL:-}
+      AGENT_ACTIVITY_IDLE_TIMEOUT_SECONDS: ${AGENT_ACTIVITY_IDLE_TIMEOUT_SECONDS:-600}
+      AGENT_RUN_TIMEOUT_SECONDS: ${AGENT_RUN_TIMEOUT_SECONDS:-7200}
+      CODEX_CLI_TIMEOUT_SECONDS: ${CODEX_CLI_TIMEOUT_SECONDS:-1800}
       CODEX_HOME: /codex
-      CODEX_HOME_VOLUME: ${CODEX_HOME_VOLUME:-agency_codex_home}
-      CODEX_CLI_CWD: /workspace/agency
+      CODEX_HOME_VOLUME: ${CODEX_HOME_VOLUME:-open_agency_codex_home}
+      CODEX_CLI_CWD: /workspace/open-agency
+      # Local trusted-dev default only. Do not reuse danger-full-access for shared or production deployments.
       CODEX_CLI_SANDBOX: ${CODEX_CLI_SANDBOX:-danger-full-access}
-      EXECUTION_RUNTIME_BASE_IMAGE: ${EXECUTION_RUNTIME_BASE_IMAGE:-agency-backend:latest}
-      EXECUTION_CONTAINER_NETWORK: ${EXECUTION_CONTAINER_NETWORK:-agency_default}
+      EXECUTION_RUNTIME_BASE_IMAGE: ${EXECUTION_RUNTIME_BASE_IMAGE:-open-agency-backend:latest}
+      EXECUTION_CONTAINER_NETWORK: ${EXECUTION_CONTAINER_NETWORK:-open-agency_default}
       EXECUTION_CONTAINER_WORKDIR: ${EXECUTION_CONTAINER_WORKDIR:-/app}
       TZ: ${AGENCY_TIMEZONE:-Asia/Singapore}
       MEMORY_DAILY_SUMMARY_TIMEZONE: ${MEMORY_DAILY_SUMMARY_TIMEZONE:-Asia/Singapore}
-      AGENCY_BACKEND_WORKSPACE: /workspace/agency
+      AGENCY_GRAPH_CONTEXT_TOOLS_ENABLED: ${AGENCY_GRAPH_CONTEXT_TOOLS_ENABLED:-true}
+      GRAPH_CONTEXT_AUTO_RETRIEVAL_ENABLED: ${GRAPH_CONTEXT_AUTO_RETRIEVAL_ENABLED:-false}
+      GRAPH_CONTEXT_SUBAGENT_STEERING_ENABLED: ${GRAPH_CONTEXT_SUBAGENT_STEERING_ENABLED:-false}
+      GRAPH_CONTEXT_CODING_AGENT_RESUME_ENABLED: ${GRAPH_CONTEXT_CODING_AGENT_RESUME_ENABLED:-false}
+      GRAPH_CONTEXT_LOOP_GUARD_ENABLED: ${GRAPH_CONTEXT_LOOP_GUARD_ENABLED:-true}
+      AGENCY_BACKEND_WORKSPACE: /workspace/open-agency
       AGENCY_BACKEND_HOST_WORKSPACE: ${AGENCY_BACKEND_HOST_WORKSPACE:-${PWD}}
-      AGENCY_FRONTEND_WORKSPACE: /workspace/agency-fe
-      AGENCY_FRONTEND_HOST_WORKSPACE: ${AGENCY_FRONTEND_HOST_WORKSPACE:-${PWD}/../agency-fe}
+      AGENCY_TUNNEL_PREFERENCE_PATH: /workspace/open-agency/.agency/tunnel-preference.json
+      AGENCY_FRONTEND_WORKSPACE: /workspace/open-agency-fe
+      AGENCY_FRONTEND_HOST_WORKSPACE: ${AGENCY_FRONTEND_HOST_WORKSPACE:-${PWD}/../open-agency-fe}
+      ONECLI_ENABLED: ${ONECLI_ENABLED:-false}
+      ONECLI_API_URL: ${AGENCY_BACKEND_ONECLI_API_URL:-http://onecli:10254}
+      ONECLI_GATEWAY_URL: ${AGENCY_BACKEND_ONECLI_GATEWAY_URL:-http://onecli:10255}
+      ONECLI_GATEWAY_CA_BUNDLE_PATH: ${AGENCY_BACKEND_ONECLI_GATEWAY_CA_BUNDLE_PATH:-}
+      SSL_CERT_FILE: ${AGENCY_BACKEND_ONECLI_GATEWAY_CA_BUNDLE_PATH:-}
+      REQUESTS_CA_BUNDLE: ${AGENCY_BACKEND_ONECLI_GATEWAY_CA_BUNDLE_PATH:-}
+      ONECLI_AGENT_TOKEN_SECRET_REF: ${ONECLI_AGENT_TOKEN_SECRET_REF:-}
+      ONECLI_AGENT_TOKEN: ${ONECLI_AGENT_TOKEN:-}
+      ONECLI_ALLOW_GLOBAL_AGENT_TOKEN_FALLBACK: ${ONECLI_ALLOW_GLOBAL_AGENT_TOKEN_FALLBACK:-false}
+      ONECLI_WORKER_EGRESS_MODE: ${ONECLI_WORKER_EGRESS_MODE:-proxy_env_only}
+      ONECLI_WORKER_EGRESS_NETWORK: ${ONECLI_WORKER_EGRESS_NETWORK:-open_agency_onecli_worker_egress}
+      GRAPH_PROJECTION_ENABLED: ${GRAPH_PROJECTION_ENABLED:-true}
+      NEO4J_ENABLED: ${NEO4J_ENABLED:-true}
+      NEO4J_URI: ${NEO4J_BACKEND_URI:-bolt://neo4j:7687}
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-agency-neo4j-password}
+      NEO4J_DATABASE: ${NEO4J_DATABASE:-}
     ports:
-      - "8000:8000"
+      - "${AGENCY_BACKEND_BIND_HOST:-127.0.0.1}:8000:8000"
     volumes:
-      - .:/workspace/agency
-      - ${AGENCY_FE_DIR:-../agency-fe}:/workspace/agency-fe
-      - ./app:/app/app
-      - ./alembic:/app/alembic
-      - ./scripts:/app/scripts
-      - ./alembic.ini:/app/alembic.ini
-      - ./docs:/app/docs
-      - codex_home:/codex
-      - /var/run/docker.sock:/var/run/docker.sock
+      # Local trusted-dev workspace mounts. Keep production runtimes isolated from host source trees.
+      - .:/workspace/open-agency:rw
+      - ${AGENCY_FE_DIR:-../open-agency-fe}:/workspace/open-agency-fe:rw
+      - ./app:/app/app:rw
+      - ./alembic:/app/alembic:rw
+      - ./scripts:/app/scripts:rw
+      - ./app.py:/app/app.py:rw
+      - ./alembic.ini:/app/alembic.ini:rw
+      - ./docs:/app/docs:rw
+      # Local trusted-dev runtime control. Docker socket access is host-level authority.
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+      - ${CODEX_HOME_SOURCE:-codex_home}:/codex:rw
     depends_on:
       postgres:
         condition: service_healthy
@@ -61,18 +101,21 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
+    networks:
+      - default
+      - onecli_worker_egress
 
   postgres:
     build:
       context: .
       dockerfile: docker/postgres/Dockerfile
-    container_name: agency-postgres
+    container_name: open-agency-postgres
     environment:
       POSTGRES_DB: agency
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     ports:
-      - "${POSTGRES_HOST_PORT:-5432}:5432"
+      - "${POSTGRES_BIND_HOST:-127.0.0.1}:${POSTGRES_HOST_PORT:-5433}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -80,14 +123,17 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - default
+      - onecli_worker_egress
 
   redis:
     build:
       context: .
       dockerfile: docker/redis/Dockerfile
-    container_name: agency-redis
+    container_name: open-agency-redis
     ports:
-      - "${REDIS_HOST_PORT:-6380}:6379"
+      - "${REDIS_BIND_HOST:-127.0.0.1}:${REDIS_HOST_PORT:-6380}:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -95,10 +141,117 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - default
+      - onecli_worker_egress
+
+  neo4j:
+    image: ${NEO4J_IMAGE:-neo4j:5-community}
+    container_name: open-agency-neo4j
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-agency-neo4j-password}
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP_INITIAL_SIZE:-512m}
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP_MAX_SIZE:-1G}
+    ports:
+      - "${NEO4J_HTTP_BIND_HOST:-127.0.0.1}:${NEO4J_HTTP_PORT:-7474}:7474"
+      - "${NEO4J_BOLT_BIND_HOST:-127.0.0.1}:${NEO4J_BOLT_PORT:-7687}:7687"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: [ "CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - default
+
+  graph-projector:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    container_name: open-agency-graph-projector
+    command: >
+      python -m app.cli graph-projection project-neo4j-loop
+      --ensure-schema
+      --limit ${GRAPH_PROJECTOR_BATCH_SIZE:-100}
+      --interval-seconds ${GRAPH_PROJECTOR_INTERVAL_SECONDS:-5}
+      --json
+    environment:
+      APP_ENV: development
+      REQUIRE_DATABASE: "true"
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/agency
+      DATABASE_HOST: postgres
+      DATABASE_PORT: "5432"
+      GRAPH_PROJECTION_ENABLED: ${GRAPH_PROJECTION_ENABLED:-true}
+      NEO4J_ENABLED: ${NEO4J_ENABLED:-true}
+      NEO4J_URI: ${NEO4J_BACKEND_URI:-bolt://neo4j:7687}
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-agency-neo4j-password}
+      NEO4J_DATABASE: ${NEO4J_DATABASE:-}
+      OTEL_SDK_DISABLED: "true"
+      TZ: ${AGENCY_TIMEZONE:-Asia/Singapore}
+    volumes:
+      - ./app:/app/app:rw
+      - ./alembic:/app/alembic:rw
+      - ./alembic.ini:/app/alembic.ini:rw
+    depends_on:
+      backend:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    networks:
+      - default
+
+  onecli-postgres:
+    image: ${ONECLI_POSTGRES_IMAGE:-docker.io/postgres:17}
+    container_name: open-agency-onecli-postgres
+    restart: unless-stopped
+    profiles:
+      - onecli
+    environment:
+      POSTGRES_USER: ${ONECLI_POSTGRES_USER:-onecli}
+      POSTGRES_PASSWORD: ${ONECLI_POSTGRES_PASSWORD:-onecli}
+      POSTGRES_DB: ${ONECLI_POSTGRES_DB:-onecli}
+    volumes:
+      - onecli_postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${ONECLI_POSTGRES_USER:-onecli} -d ${ONECLI_POSTGRES_DB:-onecli}" ]
+      interval: 5s
+      timeout: 3s
+      start_period: 15s
+      retries: 10
+    networks:
+      - default
+      - onecli_worker_egress
+
+  onecli:
+    image: ${ONECLI_IMAGE:-ghcr.io/onecli/onecli:${ONECLI_VERSION:-latest}}
+    container_name: open-agency-onecli
+    restart: unless-stopped
+    profiles:
+      - onecli
+    depends_on:
+      onecli-postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${ONECLI_POSTGRES_USER:-onecli}:${ONECLI_POSTGRES_PASSWORD:-onecli}@onecli-postgres:5432/${ONECLI_POSTGRES_DB:-onecli}
+      NEXTAUTH_SECRET: ${ONECLI_NEXTAUTH_SECRET:-}
+      SECRET_ENCRYPTION_KEY: ${ONECLI_SECRET_ENCRYPTION_KEY:-}
+      NEXT_PUBLIC_APP_URL: ${ONECLI_APP_URL:-http://127.0.0.1:10254}
+      APP_URL: ${ONECLI_APP_URL:-http://127.0.0.1:10254}
+    ports:
+      - "${ONECLI_BIND_HOST:-127.0.0.1}:${ONECLI_APP_PORT:-10254}:10254"
+      - "${ONECLI_BIND_HOST:-127.0.0.1}:${ONECLI_GATEWAY_PORT:-10255}:10255"
+    volumes:
+      - onecli_app_data:/app/data
+    networks:
+      - default
+      - onecli_worker_egress
 
   langfuse-web:
     image: docker.io/langfuse/langfuse:3
-    container_name: agency-langfuse-web
+    container_name: open-agency-langfuse-web
     restart: unless-stopped
     depends_on:
       langfuse-worker:
@@ -151,11 +304,11 @@ services:
       LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-}
       LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-}
     ports:
-      - "3001:3001"
+      - "${LANGFUSE_BIND_HOST:-127.0.0.1}:3001:3001"
 
   langfuse-worker:
     image: docker.io/langfuse/langfuse-worker:3
-    container_name: agency-langfuse-worker
+    container_name: open-agency-langfuse-worker
     restart: unless-stopped
     depends_on:
       langfuse-postgres:
@@ -171,7 +324,7 @@ services:
 
   langfuse-clickhouse:
     image: docker.io/clickhouse/clickhouse-server:25.4
-    container_name: agency-langfuse-clickhouse
+    container_name: open-agency-langfuse-clickhouse
     restart: unless-stopped
     user: "101:101"
     environment:
@@ -190,7 +343,7 @@ services:
 
   langfuse-minio:
     image: cgr.dev/chainguard/minio:latest
-    container_name: agency-langfuse-minio
+    container_name: open-agency-langfuse-minio
     restart: unless-stopped
     entrypoint: sh
     command:
@@ -200,8 +353,8 @@ services:
       MINIO_ROOT_USER: ${LANGFUSE_S3_ACCESS_KEY_ID:-minio}
       MINIO_ROOT_PASSWORD: ${LANGFUSE_S3_SECRET_ACCESS_KEY:-change-me-langfuse-minio-password}
     ports:
-      - "9090:9000"
-      - "9091:9001"
+      - "${LANGFUSE_MINIO_BIND_HOST:-127.0.0.1}:9090:9000"
+      - "${LANGFUSE_MINIO_BIND_HOST:-127.0.0.1}:9091:9001"
     volumes:
       - langfuse_minio_data:/data
     healthcheck:
@@ -213,7 +366,7 @@ services:
 
   langfuse-redis:
     image: docker.io/redis:7
-    container_name: agency-langfuse-redis
+    container_name: open-agency-langfuse-redis
     restart: unless-stopped
     command:
       - redis-server
@@ -231,7 +384,7 @@ services:
 
   langfuse-postgres:
     image: docker.io/postgres:17
-    container_name: agency-langfuse-postgres
+    container_name: open-agency-langfuse-postgres
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${LANGFUSE_POSTGRES_USER:-postgres}
@@ -251,8 +404,18 @@ volumes:
   codex_home:
   postgres_data:
   redis_data:
+  neo4j_data:
+  neo4j_logs:
+  onecli_postgres_data:
+  onecli_app_data:
   langfuse_postgres_data:
   langfuse_clickhouse_data:
   langfuse_clickhouse_logs:
   langfuse_minio_data:
   langfuse_redis_data:
+
+networks:
+  default:
+  onecli_worker_egress:
+    name: ${ONECLI_WORKER_EGRESS_NETWORK:-open_agency_onecli_worker_egress}
+    internal: true

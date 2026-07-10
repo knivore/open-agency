@@ -5,13 +5,8 @@ import json
 import unittest
 
 from app.api.streaming.runtime_sse import runtime_event_sse_stream
-from app.runtime.streaming import (
-    DEFAULT_RUNTIME_EVENT_QUEUE_SIZE,
-    RuntimeEventBus,
-    RuntimeEventLevel,
-    RuntimeEventType,
-    RuntimeStreamEvent,
-)
+from app.runtime.streaming.event_bus import DEFAULT_RUNTIME_EVENT_QUEUE_SIZE, RuntimeEventBus
+from app.runtime.streaming.runtime_event_models import RuntimeEventLevel, RuntimeEventType, RuntimeStreamEvent
 from app.runtime.streaming.stream_safety import (
     RuntimeStreamRateLimiter,
     safe_runtime_event_payload,

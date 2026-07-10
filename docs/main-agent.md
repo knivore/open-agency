@@ -1,7 +1,10 @@
 # Main Agent
 
-This document covers the backend-native `main agent` lifecycle: first-run setup, runtime resolution, and the canonical
+This document covers the backend-native `main agent` lifecycle: local onboarding, runtime resolution, and the canonical
 conversation surface, including the LLM-first conversation architecture and model-auth recovery contract.
+
+It intentionally describes backend runtime behavior, not frontend component setup. Frontend rendering, popup assistant UI
+wiring, page-context collection, and conversation stream presentation belong in `open-agency-fe/docs/main-agent.md`.
 
 ## Overview
 
@@ -10,9 +13,9 @@ The backend now expects a database-backed `main agent` configuration.
 Implemented behavior:
 
 - the backend no longer hardcodes the live main agent
-- first-run setup supports interactive and non-interactive bootstrap
+- local onboarding supports browser, terminal, interactive operator, and non-interactive bootstrap paths
 - the active main agent is resolved from the database at runtime
-- `agency-fe` identifies the active main agent from backend state and edits the underlying agent through canonical
+- `open-agency-fe` identifies the active main agent from backend state and edits the underlying agent through canonical
   backend APIs
 - plain user chat is planned by the configured main-agent LLM before natural-language workflow/tool decisions are made
 - model auth failures are surfaced as assistant messages with `metadata.model_auth` instead of generic conversation 500s
@@ -25,7 +28,20 @@ The first usable main agent consists of:
 - at least one usable model profile
 
 Default main-agent tools include workflow orchestration, tool management, durable memory, visible Computer Use MCP
-tools, and `agency.command.run` for approval-gated CLI workflows.
+tools, `agency.command.run` for approval-gated CLI workflows, and `agency.graph.context` when
+`AGENCY_GRAPH_CONTEXT_TOOLS_ENABLED=true`.
+
+When `AGENCY_GRAPH_CONTEXT_TOOLS_ENABLED=true` and `agency.graph.context` is assigned, the main agent can use Agency
+Graph as read-only operational context. Use it when steering or debugging workflows, preparing a handoff, auditing
+workflow state, or investigating root cause. Durable/vector memory remains the right tool for semantic user or project
+recall; Agency Graph context is for relationships, lineage, prior attempts, failures, decisions, constraints, and next
+actions. Prefer `budget=balanced` and keep raw graph output disabled unless the user or operator needs inspectable graph
+DTOs.
+
+For workflow-aware calls, pass an explicit `anchor_type` plus `anchor_id` when known. If runtime metadata is already
+available, `scope.runtime_context.execution_id`, `workflow_id`, `task_id`, or `agent_id` can anchor the request without
+duplicating the ids as top-level anchor fields. If graph context returns `graph_disabled`, `graph_unavailable`, or
+`no_data`, fall back to durable memory, execution event inspection, or ask the user for a clearer anchor.
 
 ## Host Backend Mode
 
@@ -50,9 +66,26 @@ inside Docker, Ollama should normally use `http://host.docker.internal:11434`.
 
 ## First-Run Setup
 
-### Interactive setup
+### Preferred local setup
 
-Run first-run setup explicitly:
+For normal first run, prefer these paths:
+
+```bash
+./agency start
+```
+
+- with `open-agency-fe`: follow `/setup`
+- without `open-agency-fe`: run `python scripts/setup.py local-onboarding` or `make setup-local-onboarding`
+
+Both paths now support a quick-setup option for the recommended supporting agent bundle:
+
+- `Coder`
+- `Embedding`
+- `Evaluation`
+
+### Operator setup
+
+Run the older operator-style main-agent setup explicitly when you need a recovery or headless path:
 
 ```bash
 make setup-main-agent
@@ -64,20 +97,15 @@ Equivalent command:
 ./.venv/bin/python scripts/setup.py main-agent
 ```
 
-To provision all built-in agents in one pass, including the main agent, `Coder`, `Embedding`, and `Evaluation`, run:
-
-```bash
-make setup-agents
-```
-
-This flow will:
+This operator flow will:
 
 1. detect whether any model profiles already exist
 2. if none exist, prompt for a provider family and create a provider/model profile first
 3. prompt for the first main-agent configuration
-4. create the agent, main-agent profile, and default main workflow
+4. ask whether the operator wants direct CLI chat or should prepare Discord/Telegram bot access
+5. create the agent, main-agent profile, and default main workflow
 
-Supported provider onboarding paths in the current interactive setup flow:
+Supported provider onboarding paths in the current operator setup flow:
 
 - OpenAI (`ChatGPT` / `Codex`) via API
 - Anthropic (`Claude`) via API
@@ -85,6 +113,98 @@ Supported provider onboarding paths in the current interactive setup flow:
 - xAI / Grok via API-compatible endpoint
 - Ollama / local models
 - custom OpenAI-compatible endpoints
+
+After setup, the direct terminal chat path is available with:
+
+```bash
+make chat-main-agent
+```
+
+To print the setup checklist for a Discord, Telegram, or WhatsApp chat channel, run:
+
+```bash
+make setup-chat-channel CHANNEL=discord
+make setup-chat-channel CHANNEL=telegram
+make setup-chat-channel CHANNEL=whatsapp
+```
+
+Discord-specific operator flow:
+
+1. Create the Discord app and bot in the Discord Developer Portal.
+2. Copy the Bot Token, Application ID, Public Key, and initial Guild ID.
+3. Store the bot token as the credential secret and store `application_id`, `bot_user_id`, `default_guild_id`, and
+   `webhook_public_key` as credential metadata.
+4. Set the Discord interactions endpoint URL in Discord to the public backend URL ending in
+   `/integrations/conversations/adapters/discord/webhook`.
+5. If your backend is only running on `localhost`, expose the backend with a public tunnel and use that tunnel URL for
+   the interactions endpoint.
+   - Use Cloudflare Tunnel when your laptop/network already runs through Cloudflare Zero Trust.
+   - Use ngrok when you want a simple local tunnel and outbound TLS interception is not in the way.
+   - If you later move Agency to a real public host, disable local tunneling and use the deployed backend URL instead.
+   - Launcher examples:
+
+```bash
+AGENCY_PUBLIC_TUNNEL_PROVIDER=cloudflare ./agency start
+AGENCY_PUBLIC_TUNNEL_PROVIDER=ngrok ./agency start
+```
+
+6. Create a trusted channel identity mapping for your Discord user id if you want protected mutations to resolve as your
+   internal Agency user.
+7. Run:
+
+```bash
+./.venv/bin/python -m app.cli smoke-test-discord --owner-user-id YOUR_USER_ID --discord-user-id YOUR_DISCORD_USER_ID
+```
+
+8. If you want ordinary Discord channel chat, not only interactions and approval callbacks, Agency starts a background
+   Discord listener automatically from active Discord integrations.
+
+   - If the credential is stored in OneCLI, Agency uses REST polling through the OneCLI proxy for server/channel chat.
+     No Discord bot token env var is required for that mode, and the listener resumes automatically on backend restart.
+   - If you are using a direct or `env://` Discord credential outside OneCLI, you can still force the older
+     websocket-style listener with these optional local overrides:
+
+```bash
+DISCORD_GATEWAY_LISTENER_ENABLED=true
+DISCORD_GATEWAY_BOT_TOKEN=PASTE_THE_RAW_BOT_TOKEN
+# Optional when more than one Discord credential exists:
+DISCORD_GATEWAY_CREDENTIAL_ID=YOUR_DISCORD_CREDENTIAL_ID
+DISCORD_GATEWAY_MENTION_ONLY=true
+DISCORD_GATEWAY_RECONNECT_DELAY_SECONDS=5
+```
+
+9. Restart the backend if you changed any optional override variables.
+10. Send a real Discord message and confirm the backend creates or reuses a conversation and replies in Discord.
+
+Telegram-specific operator flow:
+
+1. Create the Telegram bot in @BotFather and copy the Bot API token.
+2. Run Telegram `getMe` with that token and copy the numeric `result.id` as `bot_user_id`.
+3. Store the bot token as the credential secret and store `bot_user_id` plus `bot_username` as credential metadata.
+4. Set the Telegram webhook URL to the public backend URL ending in
+   `/integrations/conversations/adapters/telegram/webhook?credential_id=<installation_id>`.
+5. If your backend is only running on `localhost`, expose the backend with a public tunnel and use that tunnel URL for
+   the Telegram webhook endpoint.
+6. When the launcher exports or records `AGENCY_PUBLIC_WEBHOOK_BASE_URL`, Telegram completion auto-registers the
+   webhook and sends replies back through the same installation record.
+7. On backend restart, Agency re-registers active Telegram webhooks against the current recorded public URL so a new
+   Cloudflare quick-tunnel URL does not strand the bot on the old callback endpoint.
+8. Send a real Telegram message and confirm the backend creates or reuses a conversation and replies in Telegram.
+
+Important:
+
+- `webhook_public_key` must be the Discord application Public Key hex string.
+- It is not the Discord endpoint URL and not a Discord webhook URL.
+- Discord interactions endpoint changes still have to be applied in the Discord Developer Portal. Agency can compute and
+  display the current endpoint, but Discord does not let this backend update that portal setting on your behalf.
+- Ordinary Discord channel messages still require the background listener path, not just the interactions webhook.
+- With the published OneCLI image, Discord DM chat is not supported. Use server/channel chat plus interactions, or use
+  the direct bot-token fallback if you need true Discord Gateway behavior locally.
+- Direct-capable Discord credentials do not need `DISCORD_GATEWAY_BOT_TOKEN` for server/channel chat or DMs. The env
+  var remains as a direct-credential fallback only.
+- Telegram metadata must use the numeric `bot_user_id` from `getMe`. Do not use the bot display name or username in
+  that field.
+- If the smoke test reports connector health failure, fix credential/OneCLI connectivity before testing live chat.
 
 ### Non-interactive bootstrap
 
@@ -98,7 +218,7 @@ MAIN_AGENT_BOOTSTRAP_PROFILE_NAME="Ollama Main" \
 MAIN_AGENT_BOOTSTRAP_AGENT_NAME="Agency Assistant" \
 MAIN_AGENT_BOOTSTRAP_AGENT_DESCRIPTION="Default assistant for this deployment." \
 MAIN_AGENT_BOOTSTRAP_AGENT_INSTRUCTIONS="Be concise and helpful." \
-./.venv/bin/python scripts/setup.py --non-interactive
+./.venv/bin/python scripts/setup.py main-agent --non-interactive
 ```
 
 If a model profile already exists, you can also bootstrap from it directly with
@@ -108,9 +228,23 @@ Minimum env bootstrap inputs on a fresh backend are:
 
 - `MAIN_AGENT_BOOTSTRAP_ENABLED=true`
 - either `MAIN_AGENT_BOOTSTRAP_EXISTING_MODEL_PROFILE_ID` or a provider/model pair such as:
-    - `MAIN_AGENT_BOOTSTRAP_PROVIDER_FAMILY`
-    - `MAIN_AGENT_BOOTSTRAP_MODEL_NAME`
+  - `MAIN_AGENT_BOOTSTRAP_PROVIDER_FAMILY`
+  - `MAIN_AGENT_BOOTSTRAP_MODEL_NAME`
 - `MAIN_AGENT_BOOTSTRAP_AGENT_INSTRUCTIONS` only if you want to override the built-in default instructions
+
+Optional bootstrap fields can refine the created provider, model profile, agent, and workflow:
+
+- `MAIN_AGENT_BOOTSTRAP_PROVIDER_NAME`
+- `MAIN_AGENT_BOOTSTRAP_BASE_URL`
+- `MAIN_AGENT_BOOTSTRAP_API_KEY`
+- `MAIN_AGENT_BOOTSTRAP_TEMPERATURE`
+- `MAIN_AGENT_BOOTSTRAP_MAX_TOKENS`
+- `MAIN_AGENT_BOOTSTRAP_WORKFLOW_NAME`
+- `MAIN_AGENT_BOOTSTRAP_WORKFLOW_DESCRIPTION`
+- `MAIN_AGENT_BOOTSTRAP_CAN_TRIGGER_WORKFLOWS`
+- `MAIN_AGENT_BOOTSTRAP_CAN_CREATE_WORKFLOWS`
+- `MAIN_AGENT_BOOTSTRAP_CAN_UPDATE_WORKFLOWS`
+- `MAIN_AGENT_BOOTSTRAP_REQUIRE_APPROVAL_FOR_MUTATIONS`
 
 ### Check setup status
 
@@ -123,8 +257,44 @@ make check-main-agent
 Equivalent command:
 
 ```bash
-./.venv/bin/python -m app.cli check-main-agent
+./.venv/bin/python scripts/setup.py check-main-agent
 ```
+
+### Operational shortcuts
+
+Useful local commands:
+
+```bash
+make setup-local-onboarding
+make sync-recommended-agents
+make setup-main-agent
+make setup-coder-agent
+make setup-embedding-agent
+make setup-evaluation-agent
+make sync-main-agent-prompt
+make check-main-agent
+make setup-chat-channel CHANNEL=discord
+make setup-chat-channel CHANNEL=telegram
+make setup-chat-channel CHANNEL=whatsapp
+make chat-main-agent
+make eval
+```
+
+`make sync-recommended-agents` is the maintenance shortcut for reapplying the recommended supporting-agent bundle after local onboarding. The more specific commands above remain available for targeted operator work.
+
+The main-agent workflow monitor is enabled by default in local development. It starts with the backend, writes monitor
+tick health and findings into runtime events, and routes human-attention items to the default monitor inbox created
+during main-agent setup. Use `GET /main-agent/monitor` or the frontend Monitor workspace to review pending workflow
+improvement approvals, repo-write permission gates, stale or failed run findings, and notification routing.
+
+The embedding agent is a registry/config owner for durable-memory vectorization; actual embedding calls stay in
+`MemoryService` through `MEMORY_EMBEDDING_MODEL_PROFILE_ID`. If the default
+`huihui_ai/nemotron-v1-abliterated:8b-llama-3.1-nano` Ollama profile gives poor vector quality, swap the profile to a
+dedicated embedding model without changing the memory pipeline.
+
+The evaluation agent is a read-only semantic judge for eval runs. It should use a distinct model profile from the main,
+Coder, and Embedding agents. The default deterministic eval suite runs with `make eval`, and CI-safe case definitions
+live under `evals/cases`.
 
 ## Prompt
 
@@ -148,7 +318,6 @@ make sync-main-agent-prompt
 
 You are 'NAME', the main assistant working on behalf. You are the human's primary assistant and you already know me — my work, projects, recurring patterns, and what's automated. Use your equipped tools to assist with conversation, workflow orchestration, agent coordination, tool use, and safe system changes.
 
-
 ## Operating Priorities
 
 1. Answer directly when the request is informational, conversational, or can be resolved without side effects.
@@ -161,7 +330,9 @@ You are 'NAME', the main assistant working on behalf. You are the human's primar
 
 - Use only tools assigned to you at runtime.
 - Inspect available workflows, tools, agents, and model profiles before making orchestration decisions.
+- When the user asks about latest runs, recent failures, or runs of a workflow and no execution id is already known, list executions first, then inspect the selected run with execution detail, events, artifacts, approvals, or graph context as needed.
 - Treat workflow creation and workflow updates as explicit mutations. Draft the change, summarize the expected behavior, and request human approval before persistence or execution when policy requires it.
+- If a workflow can edit repository files or uses shell/filesystem-capable coding tools, include the repo write permission request in the proposal before launch. The request should name the read-write mounts and tell the human whether to approve, reject, or fix host filesystem permissions.
 - When proposing a workflow update, decide whether active executions should continue or be replaced. Set `restart_active_executions=true` only when the new revision makes active runs stale, unsafe, or materially incorrect; otherwise leave it false so the revision affects future runs only.
 - Protected workflows require human approval every time before launch.
 - If a requested action can be done by a specialized workflow or agent, explain the handoff briefly and invoke that workflow or agent instead of doing ad hoc work.
@@ -176,7 +347,9 @@ You are 'NAME', the main assistant working on behalf. You are the human's primar
 - Reuse existing agents, workflows, tools, and model profiles before creating new ones. Modify existing workflow components when that is safer than adding another agent.
 - If a workflow needs a new backend tool or tool contract, incorporate an available coder agent or coding workflow to design, implement, test, and register that tool before assigning it to runtime agents.
 - For repo-improvement workflows that move from recommendations to code, prefer a coder/QA loop when the human asks for verification or error remediation: coder implements, QA verifies with command evidence, coder fixes QA findings, and QA rechecks the fix.
+- For coding workflows, require the coder to add concise inline comments, docstrings, or function-level notes where implementation reasoning is not obvious, especially around domain rules, guardrails, async flows, adapter boundaries, caching, retries, and workarounds.
 - When building or updating workflows, include a clear escalation path: agents should report blockers, tool failures, missing permissions, schema mismatch, or low-confidence results back to the main agent with concrete evidence.
+- For coding workflows, route write-access blockers back to the main agent with the failing path, mount target, and requested operator action so the human can approve read-write access or correct host permissions before the worker retries.
 - If a workflow reports issues, treat that as workflow feedback. Diagnose the failure, then propose a targeted workflow improvement such as adjusting prompts, tasks, tool assignments, model profiles, validation steps, or agent composition while keeping the workflow within the seven-agent limit.
 
 ## Evaluation And Improvement
@@ -216,10 +389,10 @@ You are 'NAME', the main assistant working on behalf. You are the human's primar
 
 When the default database-backed app starts:
 
-- if startup is interactive and no configured main agent exists, it can run the first-run setup flow
+- if startup is interactive and no configured main agent exists, it can run the operator setup flow
 - if startup is non-interactive and `MAIN_AGENT_BOOTSTRAP_ENABLED=true`, it can bootstrap the first model profile and
   main agent from `MAIN_AGENT_BOOTSTRAP_*`
-- if startup is non-interactive and required setup is missing, startup fails clearly and tells the operator to run:
+- if startup is non-interactive and required setup is missing, startup fails clearly and points the operator at the browser or terminal onboarding path first
 
 ```bash
 python scripts/setup.py main-agent
@@ -245,13 +418,50 @@ Implemented behavior:
 - approvals for conversation-driven actions are backend-native
 - execution runs are linked back to conversations
 - the active main agent is exposed at `GET /conversations/main-agent-profile`
-- `agency-fe` uses the canonical conversation APIs and identifies the active main agent from backend state
+- `open-agency-fe` uses the canonical conversation APIs and identifies the active main agent from backend state
+- the same backend conversation path also supports direct CLI chat and external chat channels such as Discord, Telegram,
+  and WhatsApp, so `open-agency-fe` is optional for chat-first deployments
+
+Canonical routes:
+
+- `POST /conversations`
+- `GET /conversations`
+- `PATCH /conversations/main-agent-profile`
+- `GET /conversations/{conversation_id}`
+- `PATCH /conversations/{conversation_id}`
+- `GET /conversations/{conversation_id}/messages`
+- `POST /conversations/{conversation_id}/messages`
+- `GET /conversations/{conversation_id}/stream`
+- `GET /conversations/main-agent-profile`
+
+Native workflow agents can also share durable memory through the same `memory_records` table. Enable shared memory with
+workflow metadata such as `{"shared_memory": {"enabled": true}}` or by setting an agent's `memory.enabled=true` with a
+non-`execution` scope. Prefer `workflow` scope for memory shared by agents in one workflow and `workspace` scope for
+cross-workflow project memory. Operators can use `GET` or `PATCH /workflows/{workflow_id}/shared-memory` without
+submitting a full workflow update.
+
+Document uploads can be ingested through `POST /documents/ingest`; the backend stores the source file, extracts text,
+chunks it into `archive` memory records, embeds the chunks, and retrieves them later through the pgvector-backed memory
+search path. Document ingestion accepts `user`, `workspace`, `conversation`, and `workflow` scopes; `global` is not a
+document-ingestion scope. Uploaded chunks can also carry an optional `agent_id` binding for agent-specific recall.
+
+If you need to add another external chat channel, follow the backend-first adapter contract in
+[`docs/multichannel-channel-guide.md`](./multichannel-channel-guide.md). Microsoft Teams is the example implementation
+for that guide.
+
+Operator setup and webhook/identity details for all supported channels live in
+[`docs/multichannel-operations.md`](./multichannel-operations.md).
 
 ### Conversation Architecture
 
 All plain user chat enters the main-agent LLM path first. The conversation service owns persistence, policy checks, event
 publication, and response shaping. The configured main-agent model owns planning: it decides whether to answer directly,
 call an Agency tool, propose a workflow mutation, run a workflow, inspect memory, or ask for clarification.
+
+Conversation clients such as `open-agency-fe` can include `metadata.page_context` and `metadata.assistant_providers`. The
+backend uses that page context to resolve phrases like "this" or "selected" resources, while provider metadata lets the
+LLM choose the matching workflow, agent, tool, run, or connector tool. Mutations remain proposal and approval based,
+and client-context approvals preserve source page/provider metadata for operator review.
 
 The model is configurable per main agent. A deployment may use Codex, OpenAI-compatible API models, Ollama, Anthropic,
 Google, Bedrock, or another registered provider. Conversation routing must not assume Codex unless the resolved model
@@ -364,6 +574,23 @@ The LLM decides which tool to call. The service validates the tool call against 
 where required. Workflow mutations stay approval-oriented: the model proposes a change, the backend persists an approval
 request, and the workflow is updated only after approval.
 
+### Client Page Context
+
+Conversation clients, including `open-agency-fe`, may include `metadata.page_context` and `metadata.assistant_providers`. The
+conversation service injects a compact version of these fields into the main-agent system prompt so the LLM can resolve
+references like "this workflow", "selected agent", or "current run" from the client surface the user is viewing.
+
+The prompt treats page `selection` and `entities` as the authoritative target for "this", "current", and "selected".
+Arbitrary hyphenated text in the user's message is not treated as an entity id unless it is explicitly labeled as
+`workflow_id`, `agent_id`, `tool_id`, `run_id`, or exactly matches a selected/listed page entity. This keeps smoke-test
+markers and incidental text from being interpreted as app resource IDs.
+
+Client-provided providers are hints for the LLM, not deterministic routers. The model chooses a matching system or
+proposal tool, then backend policy validates the call. Mutation requests still create proposal/approval records before
+persistence. Approval records created from client page context include source metadata such as `source_page_context`,
+`source_surface`, `source_route`, and `source_provider_ids` so clients can show the page target that produced the
+proposal.
+
 ### Model Auth Handling
 
 The main-agent model is configurable. If the active profile uses Codex, Codex auth is checked and reported through the
@@ -461,22 +688,38 @@ Core routes:
 - `GET /conversations/{conversation_id}/stream`
 - `GET /conversations/main-agent-profile`
 
-Document ingestion route:
+Durable memory routes:
 
+- `POST /documents/intelligence`
 - `POST /documents/ingest`
+- `GET /documents`
+- `GET /documents/{document_id}`
+- `GET /memories`
+- `POST /memories`
+- `POST /memories/embeddings/backfill`
+- `POST /memories/daily-summaries/run`
+- `POST /memories/daily-summaries/backfill`
+- `GET /memories/{memory_id}`
+- `PATCH /memories/{memory_id}`
+- `DELETE /memories/{memory_id}`
+
+The canonical memory model is documented in [memory.md](./memory.md).
 
 For the `main-agent` specifically:
 
 - raw chat history stays in `conversation_messages`
 - durable memory is shared through `memory_records`
-- uploaded documents are chunked into `archive` memory rows and retrieved through the same semantic memory path
+- uploaded documents can be classified through main-agent upload intelligence, then saved as durable `archive` memory
+  rows, attached as direct context for the latest chat turn, or both
+- direct-context document attachments are referenced through message metadata `context_attachment_ids`; extracted text is
+  loaded from `uploaded_documents` and treated as untrusted source material, not as instructions
 - Retrieval V2 can layer durable memory into prompt context behind `MEMORY_RETRIEVAL_V2_ENABLED`
 - daily conversation summaries can be generated into durable memory behind `MEMORY_DAILY_SUMMARY_ENABLED`
 
 Main-agent memory writes are explicit: the agent can use assignable memory tools whose callable names include
 `remember_memory`, `list_memories`, `update_memory`, and `delete_memory`; frontend surfaces display them as
-`Remember Memory`, `List Memories`, `Update Memory`, and `Delete Memory`. Sensitive facts require confirmation; otherwise
-the write is rejected and the agent must ask the human for confirmation.
+`Remember Memory`, `List Memories`, `Update Memory`, and `Delete Memory`. API clients can use `/memories`. Sensitive
+facts require `confirmed=true`; otherwise the write is rejected and the agent must ask the human for confirmation.
 
 The main agent can also use callable `run_command` through tool id `agency.command.run`, displayed as `Run Command`,
 when command-line composition is the right fit. This shell tool supports Unix-style chains and pipes, mode selection for
@@ -498,7 +741,8 @@ MEMORY_EMBEDDING_WRITE_ERRORS_STRICT=false
 ```
 
 Supported embedding clients currently include OpenAI-compatible providers through `/v1/embeddings` and Ollama through
-`/api/embed`.
+`/api/embed`. Use `POST /memories/embeddings/backfill` after configuring an embedding profile to populate vectors for
+existing records.
 
 Memory access rules:
 
@@ -521,6 +765,7 @@ Policy controls:
 - command execution is approval-gated and also has hard blocks for credential access, broad deletion, privilege
   escalation, remote shell access, and `git push`
 - protected workflows with `protected_execution=true` request approval on every launch attempt
+- client-context approvals preserve source page/provider metadata for operator review
 - external chat channels must resolve to a trusted mapped identity before workflow/tool execution or mutation
 - approval payloads and tool result messages are redacted before they are stored in conversation-visible records
 
@@ -530,7 +775,7 @@ Environment controls:
 MAIN_AGENT_WORKFLOW_MUTATION_ENABLED=true
 MAIN_AGENT_TOOL_MUTATION_ENABLED=true
 MAIN_AGENT_EXTERNAL_CHANNEL_DAILY_MESSAGE_BUDGET=100
-MAIN_AGENT_WORKFLOW_MONITOR_ENABLED=false
+MAIN_AGENT_WORKFLOW_MONITOR_ENABLED=true
 MAIN_AGENT_WORKFLOW_MONITOR_DEFAULT_ENABLED=true
 MAIN_AGENT_WORKFLOW_MONITOR_INTERVAL_SECONDS=60
 MAIN_AGENT_WORKFLOW_MONITOR_STALE_AFTER_SECONDS=300
@@ -541,14 +786,112 @@ AGENT_PERSISTENT_RUN_SUMMARY_ENABLED=false
 
 Set either mutation flag to `false` to globally block main-agent workflow or tool create/update proposals. Set the
 external-channel budget to `0` to block external-channel main-agent requests, or raise it for busier chat deployments.
-Set `MAIN_AGENT_WORKFLOW_MONITOR_ENABLED=true` to start the background monitor. Visible workflows are monitored by
-default unless `main_agent_monitoring.enabled=false`; scheduled workflows use strict monitoring by default when no
-workflow-level monitoring level is set. The active main agent's own default workflow is not monitored unless its
+`MAIN_AGENT_WORKFLOW_MONITOR_ENABLED=true` starts the background monitor when the backend starts. Main-agent setup also
+creates a default monitor inbox conversation and stores it on the main-agent profile so findings, improvement proposals,
+and steering approval requests have a human notification route immediately after setup. Visible workflows are monitored
+by default unless `main_agent_monitoring.enabled=false`; scheduled workflows use strict monitoring by default when no
+workflow-level monitoring level is set. Workflows can override the profile inbox with
+`main_agent_monitoring.approval_conversation_id`, including external chat conversations linked through Telegram,
+Discord, or WhatsApp adapters. To push monitor prompts into a linked chat service, use that external conversation as the
+approval conversation and set conversation metadata `monitor_delivery.provider` plus `monitor_delivery.credential_id`.
+The active main agent's own default workflow is not monitored unless its
 `main_agent_monitoring.allow_self_monitoring` flag is explicitly `true`. Keep
 `AGENT_PERSISTENT_RUN_SUMMARY_ENABLED=false` until durable workflow learning is intentionally enabled for the
 deployment; workflow metadata must still opt in before summaries are stored. Monitor finding events are retained for
 60 days by default; approval-linked proposals, evaluation records, and other monitor evidence are not purged
 automatically by this retention pass.
+
+Monitor finding persistence is idempotent across scans. Each `monitor.finding.created` event carries a stable
+`metadata.dedupe_key` built from workflow id, execution id, finding category, execution status, and source event id when
+available. Failed, cancelled, stale/governance, and completed execution findings are all checked against persisted
+history before a new event is written, so repeated scans should not create duplicate operator-history rows for the same
+execution state.
+
+Operator endpoints:
+
+- `GET /main-agent/monitor` returns monitor settings, loop tick health, pending monitor approvals, repo-write approval
+  requests, recent findings/proposals/steering requests, monitored workflow coverage, and notification routing.
+- `PATCH /main-agent/monitor/routes` updates the active main-agent monitor approval conversation and optional linked
+  chat delivery metadata. This changes profile/conversation routing only; it does not mutate workflows or approve
+  privileged repo writes.
+- `GET /goals/operator-view` and `GET /goals/{goal_id}/operator-detail` expose the durable goal supervision view used
+  by frontend goal selectors and future goal workspaces.
+- `GET /workflows/{workflow_id}/monitoring` returns both effective monitor controls and tri-state explicit control
+  metadata. `controls` is what the monitor will do; `explicit_controls` distinguishes explicit `true`, explicit `false`,
+  and `null` policy-default values.
+
+The monitor suppresses duplicate pending approval requests for the same workflow, finding category, proposed action,
+and failure signature. New evidence is still recorded as monitor events, but humans should see one active approval gate
+per repeated issue until they approve, reject, or request changes.
+
+Durable goals are supervised above workflow executions. The monitor treats active goals as long-lived objectives,
+workflow executions as attempts under those goals, and evidence/evaluation records as the completion boundary. Chat
+surfaces can select a goal with `@goal`, while workflow runs should pass `goal_id` when the run is intended to advance a
+specific durable objective.
+
+### Main-Agent Workflow Monitor Runbook
+
+The monitor starts with the backend when `MAIN_AGENT_WORKFLOW_MONITOR_ENABLED=true`. First-run main-agent setup creates
+a default `Main Agent Monitor` conversation and stores its id in the active main-agent profile metadata. That inbox is
+the default route for monitor findings that need human attention, workflow improvement approval requests, supervisor
+steering approval requests, and repository write permission gates.
+
+Operator flow:
+
+1. Start or recreate the backend after changing monitor env vars or Docker mount modes.
+2. Open the frontend `Monitor` workspace or call `GET /main-agent/monitor`.
+3. Confirm `settings.enabled=true` and `runtime.last_tick` is recent.
+4. Review `pending_approvals` and `repo_write_requests` before approving workflow launches or updates.
+5. Update the notification route with `PATCH /main-agent/monitor/routes` when monitor prompts should go to a different
+   in-app or linked external conversation.
+6. Use workflow-level monitoring controls for exemptions, strict/minimal monitoring, allowed steering actions, and
+   low-risk auto-apply options.
+
+The command-center response is intentionally operator-oriented:
+
+- `settings`: global monitor configuration from environment/settings.
+- `runtime`: monitor loop health, counters, last tick, and recent monitor actions.
+- `active_profile`: the active main-agent profile summary, when one exists.
+- `notification_route`: approval conversation id plus optional linked chat delivery metadata.
+- `summary`: aggregate counts for monitored workflows, strict workflows, pending approvals, repo-write gates, findings,
+  proposals, and steering requests.
+- `workflows`: visible workflow coverage with each workflow's effective monitoring policy.
+- `pending_approvals`: unresolved monitor-created approval gates.
+- `repo_write_requests`: pending approvals that include a `repo_write_permission` payload.
+- `findings`, `proposals`, `steering_requests`: recent monitor evidence across workflows.
+
+Repository write approval flow:
+
+- Workflow creation/update proposals that can edit repos include `repo_write_permission` metadata before launch.
+- The permission payload should name the repo path, container target, requested mount mode, reason, and operator action.
+- Docker/dev containers must mount required repos read-write, for example `<backend_repo_source>:<backend_repo_target>:rw`.
+- Agency probes visible read-write paths before launching a worker. If a write probe fails, the workflow should pause on
+  a human approval/fix path instead of letting the agent hit `OSError: [Errno 30] Read-only file system`.
+- Approval of repo write access must remain a human decision. The monitor can surface and route the request, but it must
+  not silently approve local privileged execution or filesystem writes.
+
+External chat routing:
+
+- Route monitor prompts to an in-app conversation by setting `approval_conversation_id`.
+- Route monitor prompts to a linked chat service by using a conversation backed by that channel and setting conversation
+  metadata `monitor_delivery.provider` plus `monitor_delivery.credential_id`.
+- Supported monitor delivery providers are `telegram`, `discord`, and `whatsapp`.
+- The route update changes notification metadata only. It does not approve pending requests, launch workflows, or change
+  workflow definitions.
+
+Automation boundaries:
+
+- Safe automatic steering is limited to workflow-level `auto_apply_steering_actions` and backend policy checks.
+- High-risk steering, local privileged execution, repo writes, credential use, destructive changes, and workflow/tool
+  mutations remain approval-gated.
+- The monitor records findings and proposals as execution events first, then routes human prompts through the configured
+  inbox/channel when action is needed.
+
+Workflows can set `main_agent_monitoring.delegate_hitl_to_main_agent=true` to let the main agent stand in for low-risk
+HITL review checkpoints. Supervisor review steering skips conversation approval in that mode, and native runtime
+approval-gated tools can be auto-approved only when their risk labels do not include local privileged execution or other
+high-risk side effects. High-risk approvals remain human-held.
+
 - `GET /conversations/{conversation_id}/approval-requests`
 - `POST /conversations/approval-requests/{approval_request_id}/approve`
 - `POST /conversations/approval-requests/{approval_request_id}/reject`

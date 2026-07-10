@@ -46,7 +46,7 @@ python -m alembic upgrade head
 
 echo "Starting backend..."
 if [ "${BACKEND_RELOAD:-false}" = "true" ]; then
-  exec python -m uvicorn app.api.main:create_app --factory --host 0.0.0.0 --port 8000 --reload --reload-dir /app/app
+  exec python -m uvicorn app:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/app
 fi
 
-exec python -m uvicorn app.api.main:create_app --factory --host 0.0.0.0 --port 8000
+exec python -m uvicorn app:app --host 0.0.0.0 --port 8000

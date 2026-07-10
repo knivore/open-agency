@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from fastapi.testclient import TestClient
 
@@ -19,6 +20,22 @@ class CredentialsApiTests(unittest.TestCase):
             "x-agency-user-id": "user-2",
             "x-agency-user-email": "other@example.com",
         }
+        self.client.post(
+            "/users/sync",
+            json={
+                "id": "user-1",
+                "email": "owner@example.com",
+                "display_name": "Owner One",
+            },
+        )
+        self.client.post(
+            "/users/sync",
+            json={
+                "id": "user-2",
+                "email": "other@example.com",
+                "display_name": "Owner Two",
+            },
+        )
 
     def test_credential_reference_crud_round_trip(self) -> None:
         create_response = self.client.post(
@@ -69,6 +86,55 @@ class CredentialsApiTests(unittest.TestCase):
         missing_response = self.client.get("/credentials/credential-openai", headers=self.owner_headers)
         self.assertEqual(missing_response.status_code, 404)
 
+    def test_revoking_onecli_credential_ref_disables_owner_mappings(self) -> None:
+        mapping_response = self.client.post(
+            "/onecli/identity-mappings",
+            headers=self.owner_headers,
+            json={
+                "id": "mapping-onecli-credential-revoke",
+                "name": "OneCLI Credential Revoke",
+                "onecli_agent_id": "onecli-agent-credential-revoke",
+                "agent_token_secret_ref": "env://ONECLI_CREDENTIAL_REVOKE_TOKEN",
+            },
+        )
+        self.assertEqual(mapping_response.status_code, 200)
+
+        credential_response = self.client.post(
+            "/credentials",
+            headers=self.owner_headers,
+            json={
+                "id": "credential-onecli-ref",
+                "name": "OneCLI Ref",
+                "provider": "slack",
+                "secret_ref": "onecli://users/user-1/slack/bot-token",
+            },
+        )
+        self.assertEqual(credential_response.status_code, 200)
+
+        revoke_response = self.client.post("/credentials/credential-onecli-ref/revoke", headers=self.owner_headers)
+        self.assertEqual(revoke_response.status_code, 200)
+        self.assertEqual(revoke_response.json()["status"], "revoked")
+
+        mapping = asyncio.run(
+            self.context.onecli_identity_mapping_repo.get(
+                "mapping-onecli-credential-revoke",
+                include_deleted=True,
+            )
+        )
+        self.assertIsNotNone(mapping)
+        self.assertEqual(mapping.status.value, "disabled")
+
+        actions = self.context.runtime_operations.snapshot_dict()["recent_actions"]
+        disabled_actions = [
+            item for item in actions
+            if item["action"] == "onecli.identity_mapping.disabled"
+            and item["mapping_id"] == "mapping-onecli-credential-revoke"
+        ]
+        self.assertTrue(disabled_actions)
+        self.assertEqual(disabled_actions[-1]["reason"], "credential_revoked")
+        self.assertEqual(disabled_actions[-1]["credential_id"], "credential-onecli-ref")
+        self.assertNotIn("ONECLI_CREDENTIAL_REVOKE_TOKEN", str(disabled_actions))
+
     def test_connector_schema_and_validation_routes_expose_backend_requirements(self) -> None:
         schema_response = self.client.get(
             "/credentials/connectors/whatsapp/schema",
@@ -117,6 +183,51 @@ class CredentialsApiTests(unittest.TestCase):
         self.assertEqual(update_response.json()["provider"], "whatsapp-cloud-api")
         self.assertEqual(update_response.json()["metadata"]["phone_number_id"], "1234567890")
 
+    def test_connector_resolver_matches_repeated_installations_by_identity_metadata(self) -> None:
+        for credential_id, owner, repo in (
+            ("credential-github-api", "acme", "api"),
+            ("credential-github-web", "acme", "web"),
+            ("credential-github-other", "other", "api"),
+        ):
+            response = self.client.post(
+                "/credentials/connectors/github",
+                headers=self.owner_headers,
+                json={
+                    "id": credential_id,
+                    "name": f"GitHub {owner}/{repo}",
+                    "secret_ref": f"env://{credential_id.upper().replace('-', '_')}",
+                    "metadata": {"owner": owner, "repo": repo},
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+
+        matched = self.client.post(
+            "/credentials/connectors/resolve",
+            headers=self.owner_headers,
+            json={"provider": "github", "filters": {"owner": "acme", "repo": "api"}},
+        )
+        self.assertEqual(matched.status_code, 200)
+        self.assertEqual(matched.json()["status"], "matched")
+        self.assertEqual(matched.json()["credential"]["id"], "credential-github-api")
+        self.assertIn("owner: acme", matched.json()["credential"]["identity_summary"])
+
+        ambiguous = self.client.post(
+            "/credentials/connectors/resolve",
+            headers=self.owner_headers,
+            json={"provider": "github", "filters": {"owner": "acme"}},
+        )
+        self.assertEqual(ambiguous.status_code, 200)
+        self.assertEqual(ambiguous.json()["status"], "ambiguous")
+        self.assertEqual(ambiguous.json()["match_count"], 2)
+
+        cross_owner = self.client.post(
+            "/credentials/connectors/resolve",
+            headers=self.other_owner_headers,
+            json={"provider": "github", "filters": {"owner": "acme", "repo": "api"}},
+        )
+        self.assertEqual(cross_owner.status_code, 200)
+        self.assertEqual(cross_owner.json()["status"], "not_found")
+
     def test_connector_create_validation_rejects_raw_secret_payload_material(self) -> None:
         create_response = self.client.post(
             "/credentials/connectors/telegram",
@@ -129,6 +240,111 @@ class CredentialsApiTests(unittest.TestCase):
             },
         )
         self.assertEqual(create_response.status_code, 400)
+
+    def test_connector_create_accepts_owner_scoped_onecli_reference(self) -> None:
+        create_response = self.client.post(
+            "/credentials/connectors/discord",
+            headers=self.owner_headers,
+            json={
+                "id": "credential-discord-onecli-owner",
+                "name": "Discord Bot OneCLI",
+                "secret_ref": "onecli://users/user-1/discord/dev-bot",
+            },
+        )
+
+        self.assertEqual(create_response.status_code, 200)
+        body = create_response.json()
+        self.assertEqual(body["provider"], "discord-bot")
+        self.assertEqual(body["secret_ref"], "onecli://users/user-1/discord/dev-bot")
+        self.assertEqual(body["owner_user_id"], "user-1")
+
+    def test_connector_create_rejects_cross_owner_onecli_reference(self) -> None:
+        validate_response = self.client.post(
+            "/credentials/connectors/discord/validate",
+            headers=self.owner_headers,
+            json={
+                "name": "Discord Bot OneCLI",
+                "secret_ref": "onecli://users/user-2/discord/dev-bot",
+            },
+        )
+        self.assertEqual(validate_response.status_code, 200)
+        self.assertFalse(validate_response.json()["valid"])
+        self.assertIn("onecli://users/user-1/", validate_response.json()["errors"][0])
+
+        create_response = self.client.post(
+            "/credentials/connectors/discord",
+            headers=self.owner_headers,
+            json={
+                "id": "credential-discord-onecli-cross-owner",
+                "name": "Discord Bot OneCLI",
+                "secret_ref": "onecli://users/user-2/discord/dev-bot",
+            },
+        )
+
+        self.assertEqual(create_response.status_code, 400)
+        self.assertIn("onecli://users/user-1/", create_response.json()["detail"])
+
+    def test_generic_credential_create_and_update_reject_cross_owner_onecli_reference(self) -> None:
+        create_response = self.client.post(
+            "/credentials",
+            headers=self.owner_headers,
+            json={
+                "id": "credential-generic-onecli-cross-owner",
+                "name": "Generic OneCLI Cross Owner",
+                "provider": "slack",
+                "secret_ref": "onecli://users/user-2/slack/bot-token",
+            },
+        )
+        self.assertEqual(create_response.status_code, 400)
+        self.assertIn("onecli://users/user-1/", create_response.json()["detail"])
+
+        owner_create_response = self.client.post(
+            "/credentials",
+            headers=self.owner_headers,
+            json={
+                "id": "credential-generic-onecli-owner",
+                "name": "Generic OneCLI Owner",
+                "provider": "slack",
+                "secret_ref": "onecli://users/user-1/slack/bot-token",
+            },
+        )
+        self.assertEqual(owner_create_response.status_code, 200)
+
+        update_response = self.client.put(
+            "/credentials/credential-generic-onecli-owner",
+            headers=self.owner_headers,
+            json={"secret_ref": "onecli://users/user-2/slack/bot-token"},
+        )
+        self.assertEqual(update_response.status_code, 400)
+        self.assertIn("onecli://users/user-1/", update_response.json()["detail"])
+
+    def test_update_and_rotate_reject_cross_owner_onecli_reference(self) -> None:
+        create_response = self.client.post(
+            "/credentials/connectors/discord",
+            headers=self.owner_headers,
+            json={
+                "id": "credential-discord-onecli-rotation",
+                "name": "Discord Bot OneCLI",
+                "secret_ref": "onecli://users/user-1/discord/dev-bot",
+            },
+        )
+        self.assertEqual(create_response.status_code, 200)
+
+        update_response = self.client.put(
+            "/credentials/credential-discord-onecli-rotation/connector",
+            headers=self.owner_headers,
+            json={"secret_ref": "onecli://users/user-2/discord/dev-bot"},
+        )
+        self.assertEqual(update_response.status_code, 400)
+        self.assertIn("onecli://users/user-1/", update_response.json()["detail"])
+
+        rotate_response = self.client.post(
+            "/credentials/credential-discord-onecli-rotation/rotate",
+            headers=self.owner_headers,
+            json={"secret_ref": "onecli://users/user-2/discord/dev-bot-v2"},
+        )
+        self.assertEqual(rotate_response.status_code, 400)
+        self.assertIn("onecli://users/user-1/", rotate_response.json()["detail"])
 
     def test_connector_provider_aliases_are_normalized_on_create_and_update(self) -> None:
         create_response = self.client.post(

@@ -30,7 +30,10 @@
               "description": "Unified diff content for this file."
             }
           },
-          "required": ["path", "patch"],
+          "required": [
+            "path",
+            "patch"
+          ],
           "additionalProperties": false
         },
         "default": []
@@ -41,7 +44,10 @@
         "description": "When true, validate and preview without applying persistent changes."
       }
     },
-    "required": ["repo", "ref"],
+    "required": [
+      "repo",
+      "ref"
+    ],
     "additionalProperties": false
   },
   "outputs": {
@@ -49,16 +55,29 @@
     "properties": {
       "verdict": {
         "type": "string",
-        "enum": ["ok", "warn", "deny"]
+        "enum": [
+          "ok",
+          "warn",
+          "deny"
+        ]
       },
       "policyVerdict": {
-        "type": ["object", "null"]
+        "type": [
+          "object",
+          "null"
+        ]
       },
       "result": {
-        "type": ["object", "null"]
+        "type": [
+          "object",
+          "null"
+        ]
       },
       "patch": {
-        "type": ["string", "null"]
+        "type": [
+          "string",
+          "null"
+        ]
       },
       "filesChanged": {
         "type": "array",
@@ -79,13 +98,23 @@
         "type": "string"
       },
       "actor": {
-        "type": ["string", "null"]
+        "type": [
+          "string",
+          "null"
+        ]
       },
       "signature": {
-        "type": ["string", "null"]
+        "type": [
+          "string",
+          "null"
+        ]
       }
     },
-    "required": ["verdict", "dryRun", "timestamp"],
+    "required": [
+      "verdict",
+      "dryRun",
+      "timestamp"
+    ],
     "additionalProperties": false
   }
 }

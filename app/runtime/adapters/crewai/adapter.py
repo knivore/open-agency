@@ -1,10 +1,16 @@
+"""CrewAI compatibility runtime adapter.
+
+This adapter preserves support for CrewAI-backed workflows while the native
+runtime remains the primary execution path. Unsupported lifecycle operations are
+reported explicitly instead of being silently ignored.
+"""
+
 from __future__ import annotations
 
 import asyncio
 import json
 import os
 from dataclasses import dataclass
-from datetime import datetime
 from queue import Queue
 from typing import Any, Awaitable, Callable, Optional
 
@@ -38,6 +44,7 @@ def execute_crewai_workflow(
         model_profiles: dict[str, ModelProfileDefinition] | None = None,
         model_provider_registry: ModelProviderRegistry | None = None,
         model_event_loop: asyncio.AbstractEventLoop | None = None,
+        execution_store: ExecutionStore | None = None,
 ):
     return run_workflow(
         workflow,
@@ -49,6 +56,7 @@ def execute_crewai_workflow(
         model_profiles=model_profiles,
         model_provider_registry=model_provider_registry,
         model_event_loop=model_event_loop,
+        execution_store=execution_store,
     )
 
 
@@ -140,6 +148,7 @@ class CrewAIRuntimeAdapter(BaseRuntimeAdapter):
                 model_profiles=model_profiles,
                 model_provider_registry=self.model_provider_registry,
                 model_event_loop=model_event_loop,
+                execution_store=self.execution_store,
             )
             if result is None and not queue.empty():
                 result = queue.get_nowait()
@@ -224,7 +233,8 @@ class CrewAIRuntimeAdapter(BaseRuntimeAdapter):
         for agent in workflow.agent_definitions:
             runtime_config = self._agent_runtime_config(agent)
             runtime_profile_id = runtime_config.get("model_profile_id")
-            requested_profile_id = runtime_profile_id if isinstance(runtime_profile_id, str) and runtime_profile_id else agent.model_profile_id
+            requested_profile_id = runtime_profile_id if isinstance(runtime_profile_id,
+                                                                    str) and runtime_profile_id else agent.model_profile_id
             base_profile: ModelProfileDefinition | None = None
             if requested_profile_id:
                 base_profile = await self.model_profile_repository.get_profile(requested_profile_id)

@@ -1,3 +1,5 @@
+"""Domain contracts for agent definitions and runtime framework hints."""
+
 from __future__ import annotations
 
 from pydantic import Field, model_validator
@@ -25,6 +27,21 @@ class MemorySettings(DomainModel):
     config: Dict[str, Any] = Field(default_factory=dict)
 
 
+class GraphContextSettings(DomainModel):
+    enabled: bool = False
+    auto_retrieval_enabled: Optional[bool] = None
+    subagent_steering_enabled: Optional[bool] = None
+    coding_agent_resume_enabled: Optional[bool] = None
+    default_intent: Optional[
+        Literal["resume", "debug", "steer", "plan", "audit", "learn", "handoff", "root_cause"]] = None
+    default_budget: Optional[Literal["brief", "balanced", "full", "raw_graph"]] = None
+    include_memories: bool = True
+    include_events: bool = False
+    include_raw_graph: bool = False
+    max_records: Optional[int] = None
+    config: Dict[str, Any] = Field(default_factory=dict)
+
+
 class FrameworkHints(DomainModel):
     preferred_adapter: Optional[str] = None
     adapter_config: Dict[str, Any] = Field(default_factory=dict)
@@ -45,6 +62,7 @@ class AgentDefinition(DomainModel):
     handoff_agent_ids: List[str] = Field(default_factory=list)
     guardrails: List[GuardrailDefinition] = Field(default_factory=list)
     memory: MemorySettings = Field(default_factory=MemorySettings)
+    graph_context: GraphContextSettings = Field(default_factory=GraphContextSettings)
     framework_hints: FrameworkHints = Field(default_factory=FrameworkHints)
     metadata: Dict[str, Any] = Field(default_factory=dict)
 

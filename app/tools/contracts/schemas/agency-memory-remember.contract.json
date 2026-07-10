@@ -7,35 +7,141 @@
   "inputs": {
     "type": "object",
     "properties": {
-      "scope": { "type": "string", "enum": ["user", "workspace", "conversation", "workflow", "global"] },
-      "content": { "type": "string", "minLength": 1 },
-      "summary": { "type": ["string", "null"] },
-      "tags": { "type": "array", "items": { "type": "string" }, "default": [] },
-      "sensitive": { "type": ["boolean", "null"], "default": false },
-      "confirmed": { "type": "boolean", "default": false },
-      "created_by_user_id": { "type": ["string", "null"] },
-      "workspace_id": { "type": ["string", "null"] },
-      "conversation_id": { "type": ["string", "null"] },
-      "workflow_id": { "type": ["string", "null"] }
+      "scope": {
+        "type": "string",
+        "enum": [
+          "user",
+          "workspace",
+          "conversation",
+          "workflow",
+          "global"
+        ]
+      },
+      "content": {
+        "type": "string",
+        "minLength": 1
+      },
+      "summary": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "tags": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": []
+      },
+      "sensitive": {
+        "type": [
+          "boolean",
+          "null"
+        ],
+        "default": false
+      },
+      "confirmed": {
+        "type": "boolean",
+        "default": false
+      },
+      "created_by_user_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "workspace_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "conversation_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "workflow_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
     },
-    "required": ["scope", "content"],
+    "required": [
+      "scope",
+      "content"
+    ],
     "additionalProperties": false
   },
   "outputs": {
     "type": "object",
     "properties": {
-      "verdict": { "type": "string", "enum": ["ok", "warn", "deny"] },
-      "policyVerdict": { "type": ["object", "null"] },
-      "result": { "type": ["object", "null"], "additionalProperties": true },
-      "patch": { "type": ["string", "null"] },
-      "filesChanged": { "type": "array", "items": { "type": "object" } },
-      "errors": { "type": "array", "items": { "type": "string" } },
-      "dryRun": { "type": "boolean" },
-      "timestamp": { "type": "string" },
-      "actor": { "type": ["string", "null"] },
-      "signature": { "type": ["string", "null"] }
+      "verdict": {
+        "type": "string",
+        "enum": [
+          "ok",
+          "warn",
+          "deny"
+        ]
+      },
+      "policyVerdict": {
+        "type": [
+          "object",
+          "null"
+        ]
+      },
+      "result": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "additionalProperties": true
+      },
+      "patch": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "filesChanged": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      },
+      "errors": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "dryRun": {
+        "type": "boolean"
+      },
+      "timestamp": {
+        "type": "string"
+      },
+      "actor": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "signature": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
     },
-    "required": ["verdict", "dryRun", "timestamp"],
+    "required": [
+      "verdict",
+      "dryRun",
+      "timestamp"
+    ],
     "additionalProperties": false
   }
 }

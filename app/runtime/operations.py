@@ -1,7 +1,9 @@
+"""Lightweight in-process runtime operations counters and recent-action log."""
+
 from __future__ import annotations
 
 from collections import Counter, deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from threading import Lock
 from typing import Any
 
@@ -13,6 +15,8 @@ class RuntimeOperationsSnapshot:
 
 
 class RuntimeOperationsRecorder:
+    """Record runtime counters without coupling callers to a metrics backend."""
+
     def __init__(self, *, max_recent_actions: int = 50):
         self._lock = Lock()
         self._counters: Counter[str] = Counter()

@@ -1,3 +1,5 @@
+"""Runtime adapter wrapper around the native execution engine."""
+
 from __future__ import annotations
 
 from app.domain import Execution, WorkflowDefinition
@@ -6,6 +8,8 @@ from app.runtime.native.engine import ExecutionEngine
 
 
 class NativeRuntimeAdapter(BaseRuntimeAdapter):
+    """Expose `ExecutionEngine` through the common runtime adapter protocol."""
+
     adapter_name = "native"
 
     def __init__(self, engine: ExecutionEngine):

@@ -1,12 +1,15 @@
-import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
-import time
 import asyncio
+import json
+import time
+import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from app.utils.oauth_pkce import OAuthPKCEHandler
-from app.llm.openai_codex import OpenAICodexModelClient
+from unittest.mock import AsyncMock, MagicMock, patch
+
 from app.domain import ModelProfileDefinition, ModelProviderDefinition
+from app.llm.base import ModelMessage
+from app.llm.openai_codex import OpenAICodexModelClient
+from app.utils.oauth_pkce import OAuthPKCEHandler
 
 class TestOpenAICodexEnhancedAuth(unittest.TestCase):
 
@@ -297,6 +300,215 @@ class TestOpenAICodexEnhancedAuth(unittest.TestCase):
         sandbox_index = command.index("--sandbox")
         self.assertEqual(response.content, "CLI response")
         self.assertEqual(command[sandbox_index + 1], "danger-full-access")
+
+    def test_codex_oauth_cli_returns_agency_native_tool_call(self):
+        profile = ModelProfileDefinition(
+            id="test-profile",
+            name="Test Profile",
+            provider="openai_codex",
+            model="gpt-5.4",
+            parameters={"auth_mode": "chatgpt", "access_token": "chatgpt-token"},
+        )
+        env_config = MagicMock(openai_api_key=None, model_provider_repo=None)
+        tool_payload = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_agency_graph_context",
+                    "description": "Read bounded Agency graph context.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+
+        with TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "last-message.txt"
+
+            def fake_run(command, **kwargs):
+                Path(command[command.index("--output-last-message") + 1]).write_text(
+                    json.dumps(
+                        {
+                            "action": "tool_call",
+                            "tool_name": "get_agency_graph_context",
+                            "arguments_json": json.dumps({"query": "Agency architecture"}),
+                            "content": "",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return MagicMock(returncode=0, stdout="", stderr="")
+
+            client = OpenAICodexModelClient(profile, env_config)
+            with patch("app.llm.openai_codex.shutil.which", return_value="codex"), patch(
+                "app.llm.openai_codex.subprocess.run", side_effect=fake_run
+            ) as mock_run, patch("app.llm.openai_codex.tempfile.NamedTemporaryFile") as mock_tmp:
+                output_handle = MagicMock()
+                output_handle.name = str(output_path)
+                schema_handle = MagicMock()
+                schema_handle.name = str(Path(tmpdir) / "schema.json")
+                mock_tmp.return_value.__enter__.side_effect = [output_handle, schema_handle]
+                response = client.generate_text(
+                    [ModelMessage(role="user", content="Map the Agency repository")],
+                    tools=tool_payload,
+                )
+
+        self.assertIsNone(response.content)
+        self.assertEqual(len(response.tool_calls), 1)
+        self.assertEqual(response.tool_calls[0].name, "get_agency_graph_context")
+        self.assertEqual(response.tool_calls[0].arguments, {"query": "Agency architecture"})
+        command = mock_run.call_args.args[0]
+        self.assertIn("--output-schema", command)
+        self.assertIn("--ephemeral", command)
+        self.assertIn("--ignore-user-config", command)
+        self.assertIn("--ignore-rules", command)
+        prompt = mock_run.call_args.kwargs["input"]
+        self.assertIn("Agency owns all tool execution and policy checks", prompt)
+        self.assertIn("get_agency_graph_context", prompt)
+
+    def test_codex_oauth_cli_returns_final_after_agency_tool_result(self):
+        profile = ModelProfileDefinition(
+            id="test-profile",
+            name="Test Profile",
+            provider="openai_codex",
+            model="gpt-5.4",
+            parameters={"auth_mode": "chatgpt", "access_token": "chatgpt-token"},
+        )
+        client = OpenAICodexModelClient(
+            profile,
+            MagicMock(openai_api_key=None, model_provider_repo=None),
+        )
+        response = MagicMock(
+            content=json.dumps(
+                {
+                    "action": "final",
+                    "tool_name": "",
+                    "arguments_json": "{}",
+                    "content": "Agency graph context loaded.",
+                }
+            ),
+            tool_calls=[],
+        )
+
+        parsed = client._parse_cli_tool_response(
+            response,
+            allowed_tool_names={"get_agency_graph_context"},
+        )
+
+        self.assertEqual(parsed.content, "Agency graph context loaded.")
+        self.assertEqual(parsed.tool_calls, [])
+
+    def test_codex_structured_oauth_uses_cli_profile_model(self):
+        profile = ModelProfileDefinition(
+            id="test-profile",
+            name="Test Profile",
+            provider="openai_codex",
+            model="gpt-5.4",
+            base_url="https://api.openai.com/v1",
+            parameters={
+                "auth_mode": "chatgpt",
+                "access_token": "chatgpt-token",
+            },
+        )
+        env_config = MagicMock()
+        env_config.openai_api_key = None
+        env_config.model_provider_repo = None
+
+        with TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "last-message.txt"
+
+            def fake_run(command, **kwargs):
+                output_index = command.index("--output-last-message") + 1
+                Path(command[output_index]).write_text('{"label": "sop", "confidence": 0.91}', encoding="utf-8")
+                completed = MagicMock()
+                completed.returncode = 0
+                completed.stdout = ""
+                completed.stderr = ""
+                return completed
+
+            client = OpenAICodexModelClient(profile, env_config)
+            with patch("app.llm.openai_codex.shutil.which", return_value="codex"), patch(
+                "app.llm.openai_codex.subprocess.run",
+                side_effect=fake_run,
+            ) as mock_run, patch("app.llm.openai_codex.tempfile.NamedTemporaryFile") as mock_tmp, patch.object(
+                client.client.chat.completions,
+                "create",
+            ) as mock_create:
+                handle = MagicMock()
+                handle.name = str(output_path)
+                mock_tmp.return_value.__enter__.return_value = handle
+                response = client.generate_structured(
+                    [ModelMessage(role="user", content="classify this source")],
+                    schema={
+                        "type": "object",
+                        "properties": {"label": {"type": "string"}, "confidence": {"type": "number"}},
+                        "required": ["label", "confidence"],
+                    },
+                    schema_name="source_intelligence_classification",
+                )
+
+        command = mock_run.call_args.args[0]
+        model_index = command.index("--model")
+        prompt = mock_run.call_args.kwargs["input"]
+        self.assertEqual(command[model_index + 1], "gpt-5.4")
+        self.assertIn("source_intelligence_classification", prompt)
+        self.assertEqual(response.content, {"label": "sop", "confidence": 0.91})
+        mock_create.assert_not_called()
+
+    def test_codex_async_structured_oauth_uses_cli_profile_model(self):
+        profile = ModelProfileDefinition(
+            id="test-profile",
+            name="Test Profile",
+            provider="openai_codex",
+            model="gpt-5.4",
+            base_url="https://api.openai.com/v1",
+            parameters={
+                "auth_mode": "chatgpt",
+                "access_token": "chatgpt-token",
+            },
+        )
+        env_config = MagicMock()
+        env_config.openai_api_key = None
+        env_config.model_provider_repo = None
+
+        with TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "last-message.txt"
+
+            def fake_run(command, **kwargs):
+                output_index = command.index("--output-last-message") + 1
+                Path(command[output_index]).write_text('{"label": "policy"}', encoding="utf-8")
+                completed = MagicMock()
+                completed.returncode = 0
+                completed.stdout = ""
+                completed.stderr = ""
+                return completed
+
+            client = OpenAICodexModelClient(profile, env_config)
+            with patch("app.llm.openai_codex.shutil.which", return_value="codex"), patch(
+                "app.llm.openai_codex.subprocess.run",
+                side_effect=fake_run,
+            ) as mock_run, patch("app.llm.openai_codex.tempfile.NamedTemporaryFile") as mock_tmp, patch.object(
+                client.client.chat.completions,
+                "create",
+            ) as mock_create:
+                handle = MagicMock()
+                handle.name = str(output_path)
+                mock_tmp.return_value.__enter__.return_value = handle
+                response = asyncio.run(
+                    client.agenerate_structured(
+                        [ModelMessage(role="user", content="classify this source")],
+                        schema={"type": "object", "properties": {"label": {"type": "string"}}},
+                        schema_name="source_intelligence_classification",
+                    )
+                )
+
+        command = mock_run.call_args.args[0]
+        model_index = command.index("--model")
+        self.assertEqual(command[model_index + 1], "gpt-5.4")
+        self.assertEqual(response.content, {"label": "policy"})
+        mock_create.assert_not_called()
 
     def test_codex_health_reports_oauth_ready_without_public_api_scope_check(self):
         profile = ModelProfileDefinition(

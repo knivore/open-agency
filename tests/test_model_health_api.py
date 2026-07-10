@@ -66,6 +66,10 @@ class ModelHealthApiTests(unittest.TestCase):
             "x-agency-user-id": "user-models",
             "x-agency-user-email": "models@example.com",
         }
+        self.client.post(
+            "/users/sync",
+            json={"id": "user-models", "email": "models@example.com", "display_name": "Models User"},
+        )
 
     def _run(self, awaitable):
         import asyncio
@@ -114,6 +118,50 @@ class ModelHealthApiTests(unittest.TestCase):
         self.assertEqual(payload["source"], "curated")
         model_ids = {item["id"] for item in payload["models"]}
         self.assertIn("gpt-4.1", model_ids)
+
+    def test_model_provider_models_endpoint_returns_deepseek_curated_models(self) -> None:
+        self._run(
+            self.context.model_provider_repo.create(
+                ModelProviderDefinition(
+                    id="provider-deepseek",
+                    name="DeepSeek",
+                    provider_type="deepseek",
+                )
+            )
+        )
+
+        response = self.client.get("/model-providers/provider-deepseek/models", headers=self.owner_headers)
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["provider_type"], "deepseek")
+        self.assertEqual(payload["provider_family"], "deepseek")
+        self.assertEqual(payload["source"], "curated")
+        model_ids = {item["id"] for item in payload["models"]}
+        self.assertIn("deepseek-v4-flash", model_ids)
+        self.assertIn("deepseek-v4-pro", model_ids)
+
+    def test_model_provider_models_endpoint_returns_qwen_curated_models(self) -> None:
+        self._run(
+            self.context.model_provider_repo.create(
+                ModelProviderDefinition(
+                    id="provider-qwen",
+                    name="Qwen",
+                    provider_type="qwen",
+                )
+            )
+        )
+
+        response = self.client.get("/model-providers/provider-qwen/models", headers=self.owner_headers)
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["provider_type"], "qwen")
+        self.assertEqual(payload["provider_family"], "qwen")
+        self.assertEqual(payload["source"], "curated")
+        model_ids = {item["id"] for item in payload["models"]}
+        self.assertIn("qwen-plus", model_ids)
+        self.assertIn("qwen3-coder-plus", model_ids)
 
     def test_model_profile_health_endpoint(self) -> None:
         self._run(

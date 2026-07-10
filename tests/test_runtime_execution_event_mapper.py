@@ -23,12 +23,9 @@ from app.runtime.native.state import (
     InMemoryWorkflowRepository,
     NativeExecutionState,
 )
-from app.runtime.streaming import (
-    RuntimeEventBus,
-    RuntimeEventType,
-    map_execution_event_to_runtime_events,
-    set_default_runtime_event_bus,
-)
+from app.runtime.streaming.event_bus import RuntimeEventBus, set_default_runtime_event_bus
+from app.runtime.streaming.execution_event_mapper import map_execution_event_to_runtime_events
+from app.runtime.streaming.runtime_event_models import RuntimeEventLevel, RuntimeEventType
 
 
 class _RuntimeStreamFakeModelClient:
@@ -126,6 +123,102 @@ class RuntimeExecutionEventMapperTests(unittest.IsolatedAsyncioTestCase):
                 RuntimeEventType.LOG_RECEIVED,
             }.issubset(runtime_types)
         )
+
+    def test_subagent_progress_maps_to_progress_and_log_events(self):
+        event = ExecutionEvent(
+            id="event-subagent-progress",
+            execution_id="execution-1",
+            workflow_id="workflow-1",
+            agent_id="agent-1",
+            task_id="task-1",
+            actor="subagent:agent-1",
+            event_type=ExecutionEventType.SUBAGENT_PROGRESS_UPDATED,
+            status="running",
+            payload={
+                "status": "blocked",
+                "current_task": "Validate rollout",
+                "blocker": "Missing production window",
+                "progress_percent": 50,
+                "confidence": 0.4,
+            },
+        )
+
+        runtime_events = map_execution_event_to_runtime_events(event)
+        progress_event = next(item for item in runtime_events if item.type == RuntimeEventType.TASK_PROGRESS)
+        log_event = next(item for item in runtime_events if item.type == RuntimeEventType.LOG_RECEIVED)
+
+        self.assertEqual(progress_event.level.value, "warning")
+        self.assertEqual(progress_event.task.progress, 0.5)
+        self.assertEqual(progress_event.metadata["phase"], "subagent_status")
+        self.assertIn("Sub-agent blocked", progress_event.message)
+        self.assertIn("Sub-agent blocked", log_event.message)
+
+    def test_supervisor_steering_request_maps_to_progress_and_log_events(self):
+        event = ExecutionEvent(
+            id="event-supervisor-steering",
+            execution_id="execution-1",
+            workflow_id="workflow-1",
+            event_type=ExecutionEventType.SUPERVISOR_STEERING_REQUESTED,
+            actor="main_agent_monitor",
+            payload={
+                "category": "token_budget_exceeded",
+                "recommended_action": "request_replan",
+                "status": "requested",
+            },
+        )
+
+        runtime_events = map_execution_event_to_runtime_events(event)
+        progress_event = next(item for item in runtime_events if item.type == RuntimeEventType.TASK_PROGRESS)
+        log_event = next(item for item in runtime_events if item.type == RuntimeEventType.LOG_RECEIVED)
+
+        self.assertEqual(progress_event.level.value, "warning")
+        self.assertEqual(progress_event.metadata["phase"], "supervisor_steering")
+        self.assertEqual(progress_event.metadata["recommendedAction"], "request_replan")
+        self.assertIn("Supervisor steering requested", progress_event.message)
+        self.assertIn("Supervisor steering requested", log_event.message)
+
+    def test_model_fallback_events_map_to_visible_runtime_logs(self):
+        used_event = ExecutionEvent(
+            id="event-model-fallback-used",
+            execution_id="execution-1",
+            workflow_id="workflow-1",
+            agent_id="agent-1",
+            task_id="task-1",
+            actor="Agent One",
+            event_type=ExecutionEventType.MODEL_FALLBACK_USED,
+            payload={
+                "primary_provider": "fake",
+                "primary_model": "primary-timeout-model",
+                "fallback_provider": "fake",
+                "fallback_model": "backup-model",
+            },
+        )
+        failed_event = ExecutionEvent(
+            id="event-model-fallback-failed",
+            execution_id="execution-1",
+            workflow_id="workflow-1",
+            agent_id="agent-1",
+            task_id="task-1",
+            actor="Agent One",
+            event_type=ExecutionEventType.MODEL_FALLBACK_FAILED,
+            payload={"error": "backup-model timed out"},
+        )
+
+        used_log = next(
+            item
+            for item in map_execution_event_to_runtime_events(used_event)
+            if item.type == RuntimeEventType.LOG_RECEIVED
+        )
+        failed_log = next(
+            item
+            for item in map_execution_event_to_runtime_events(failed_event)
+            if item.type == RuntimeEventType.LOG_RECEIVED
+        )
+
+        self.assertEqual(used_log.level, RuntimeEventLevel.WARNING)
+        self.assertIn("primary-timeout-model -> fake:backup-model", used_log.message)
+        self.assertEqual(failed_log.level, RuntimeEventLevel.ERROR)
+        self.assertIn("backup-model timed out", failed_log.message)
 
     async def test_execution_emitter_publishes_runtime_events_to_default_bus(self):
         bus = RuntimeEventBus()

@@ -1,32 +1,22 @@
 #!/usr/bin/env python3
+"""Smoke-test native/CrewAI runtime execution paths against a running backend."""
+
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import threading
 import time
-from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+try:
+    from scripts._bootstrap import bootstrap_repo
+except ModuleNotFoundError:
+    from _bootstrap import bootstrap_repo
 
-def _bootstrap_repo(script_file: str, *, reexec: bool) -> Path:
-    script_path = Path(script_file).resolve()
-    repo_root = script_path.parents[1]
-    if reexec:
-        venv_dir = repo_root / ".venv"
-        venv_python = venv_dir / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
-        if venv_python.exists() and Path(sys.prefix).resolve() != venv_dir.resolve():
-            os.execv(str(venv_python), [str(venv_python), str(script_path), *sys.argv[1:]])
-    repo_root_text = str(repo_root)
-    if repo_root_text not in sys.path:
-        sys.path.insert(0, repo_root_text)
-    return repo_root
-
-
-_bootstrap_repo(__file__, reexec=__name__ == "__main__")
+bootstrap_repo(__file__, reexec=__name__ == "__main__")
 
 import httpx
 
@@ -145,7 +135,8 @@ def build_workflow_payload(
 def _capture_execution_events(base_url: str, execution_id: str, timeout_seconds: float,
                               sink: list[dict[str, Any]]) -> None:
     deadline = time.time() + timeout_seconds
-    with httpx.Client(base_url=base_url.rstrip("/"), timeout=None) as client:
+    timeout = httpx.Timeout(timeout_seconds, connect=10.0)
+    with httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout) as client:
         with client.stream("GET", f"/executions/{execution_id}/stream") as response:
             response.raise_for_status()
             for line in response.iter_lines():
@@ -164,7 +155,8 @@ def _capture_execution_events(base_url: str, execution_id: str, timeout_seconds:
 
 def _wait_for_hitl_prompt(base_url: str, execution_id: str, timeout_seconds: float, holder: dict[str, Any]) -> None:
     deadline = time.time() + timeout_seconds
-    with httpx.Client(base_url=base_url.rstrip("/"), timeout=None) as client:
+    timeout = httpx.Timeout(timeout_seconds, connect=10.0)
+    with httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout) as client:
         with client.stream("GET", f"/executions/{execution_id}/hitl/stream") as response:
             response.raise_for_status()
             for line in response.iter_lines():

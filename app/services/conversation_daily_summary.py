@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
-from zoneinfo import ZoneInfo
 from typing import TYPE_CHECKING, Any
+from zoneinfo import ZoneInfo
 
 from app.core.config import get_settings
 from app.domain import Conversation, ConversationMessage, ConversationMessageType
@@ -11,7 +11,6 @@ from app.services.memory import MemoryService
 
 if TYPE_CHECKING:
     from app.api.context import ApiContext
-
 
 MEANINGFUL_MESSAGE_TYPES = {
     ConversationMessageType.TOOL_RESULT,
@@ -123,7 +122,7 @@ class ConversationDailySummaryService:
 
     async def _summary_exists(self, conversation_id: str, target_date: date) -> bool:
         items = await self.context.memory_repo.query(
-            memory_kinds=["daily_summary"],
+            memory_types=["daily_summary"],
             source_conversation_id=conversation_id,
             summary_date_from=target_date,
             summary_date_to=target_date,
@@ -149,8 +148,8 @@ class ConversationDailySummaryService:
             item.plain_text.strip()
             for item in messages
             if item.message_type in {ConversationMessageType.USER_TEXT, ConversationMessageType.ASSISTANT_TEXT}
-            and item.plain_text
-            and item.plain_text.strip()
+               and item.plain_text
+               and item.plain_text.strip()
         ]
         first_lines = text_messages[:4]
         summary = self._truncate(

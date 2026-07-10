@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 from app.domain import AgentDefinition, ModelProfileDefinition, TaskDefinition, WorkflowDefinition, \
     WorkflowNodeDefinition
 from app.llm.registry import ModelProviderRegistry
+from app.runtime.native.state import ExecutionStore
 from .availability import ensure_crewai_available
 from .events import print_agent_output_to_json
 from .llm_bridge import AgencyModelClientLLM
@@ -30,6 +31,10 @@ def create_llm_model(
         profile: ModelProfileDefinition | None = None,
         model_provider_registry: ModelProviderRegistry | None = None,
         model_event_loop: asyncio.AbstractEventLoop | None = None,
+        execution_store: ExecutionStore | None = None,
+        execution_id: str | None = None,
+        workflow_id: str | None = None,
+        agent_id: str | None = None,
 ):
     ensure_crewai_available()
     from crewai import LLM
@@ -39,6 +44,10 @@ def create_llm_model(
             profile=profile,
             model_client=model_provider_registry.resolve(profile),
             model_event_loop=model_event_loop,
+            execution_store=execution_store,
+            execution_id=execution_id,
+            workflow_id=workflow_id,
+            agent_id=agent_id,
         )
 
     model_name = llm_string or (profile.model if profile is not None else None) or LLMmodel.GPT4oMini.value
@@ -88,6 +97,10 @@ def select_llm_model(
         profile: ModelProfileDefinition | None = None,
         model_provider_registry: ModelProviderRegistry | None = None,
         model_event_loop: asyncio.AbstractEventLoop | None = None,
+        execution_store: ExecutionStore | None = None,
+        execution_id: str | None = None,
+        workflow_id: str | None = None,
+        agent_id: str | None = None,
 ):
     selected_model = llm_string or (profile.model if profile is not None else None) or LLMmodel.GPT4oMini.value
     return create_llm_model(
@@ -96,6 +109,10 @@ def select_llm_model(
         profile=profile,
         model_provider_registry=model_provider_registry,
         model_event_loop=model_event_loop,
+        execution_store=execution_store,
+        execution_id=execution_id,
+        workflow_id=workflow_id,
+        agent_id=agent_id,
     )
 
 
@@ -189,6 +206,9 @@ def get_agents(
         model_profiles: dict[str, ModelProfileDefinition] | None = None,
         model_provider_registry: ModelProviderRegistry | None = None,
         model_event_loop: asyncio.AbstractEventLoop | None = None,
+        execution_store: ExecutionStore | None = None,
+        execution_id: str | None = None,
+        workflow_id: str | None = None,
 ) -> list[Any]:
     return [
         convert_agent(
@@ -199,6 +219,9 @@ def get_agents(
             model_profile=(model_profiles or {}).get(agent.id),
             model_provider_registry=model_provider_registry,
             model_event_loop=model_event_loop,
+            execution_store=execution_store,
+            execution_id=execution_id,
+            workflow_id=workflow_id,
         )
         for agent in agents
     ]
@@ -213,6 +236,9 @@ def convert_agent(
         model_profile: ModelProfileDefinition | None = None,
         model_provider_registry: ModelProviderRegistry | None = None,
         model_event_loop: asyncio.AbstractEventLoop | None = None,
+        execution_store: ExecutionStore | None = None,
+        execution_id: str | None = None,
+        workflow_id: str | None = None,
 ):
     ensure_crewai_available()
     from crewai import Agent
@@ -236,6 +262,10 @@ def convert_agent(
         profile=model_profile,
         model_provider_registry=model_provider_registry,
         model_event_loop=model_event_loop,
+        execution_store=execution_store,
+        execution_id=execution_id,
+        workflow_id=workflow_id,
+        agent_id=agent.id,
     )
     return Agent(
         role=agent_config["role"],
@@ -328,6 +358,7 @@ def convert_workflow(
         model_profiles: dict[str, ModelProfileDefinition] | None = None,
         model_provider_registry: ModelProviderRegistry | None = None,
         model_event_loop: asyncio.AbstractEventLoop | None = None,
+        execution_store: ExecutionStore | None = None,
 ):
     ensure_crewai_available()
     from crewai import Crew
@@ -347,6 +378,9 @@ def convert_workflow(
         model_profiles=model_profiles,
         model_provider_registry=model_provider_registry,
         model_event_loop=model_event_loop,
+        execution_store=execution_store,
+        execution_id=process_id,
+        workflow_id=workflow.id,
     )
     agent_lookup = get_agent_lookup(workflow.agent_definitions, crewai_agents)
     crewai_tasks = get_tasks(workflow, agent_lookup, process_id, run_by)
@@ -388,6 +422,7 @@ def run_workflow(
         model_profiles: dict[str, ModelProfileDefinition] | None = None,
         model_provider_registry: ModelProviderRegistry | None = None,
         model_event_loop: asyncio.AbstractEventLoop | None = None,
+        execution_store: ExecutionStore | None = None,
 ) -> str:
     raw_output = ""
     try:
@@ -399,6 +434,7 @@ def run_workflow(
             model_profiles=model_profiles,
             model_provider_registry=model_provider_registry,
             model_event_loop=model_event_loop,
+            execution_store=execution_store,
         )
         crew_output = crew.kickoff(inputs=inputs)
         raw_output = getattr(crew_output, "raw", str(crew_output))

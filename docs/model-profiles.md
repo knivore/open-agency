@@ -92,6 +92,116 @@ Backend model profile records are managed through:
 Profiles hold the selected provider id, model id, endpoint override, credentials reference, temperature, max tokens, top
 p, and capability flags.
 
+### Model Fallbacks
+
+Model fallbacks are configured on each model preset. They let a run continue with a backup model when the primary model
+fails for an allowed retryable reason such as rate limiting, timeout, temporary provider unavailability, network
+failure, or auth/access errors.
+
+Fallback settings live on the model profile:
+
+- `fallback_strategy`: one of `auto`, `manual`, or `disabled`
+- `fallback_models`: ordered list of up to five manual backup targets
+- `fallback_policy`: rules that decide which failures and targets are eligible
+
+The frontend exposes these settings in `LLM Models` -> `Edit preset` -> `Fallback models`.
+
+Strategy behavior:
+
+- `auto`: the runtime chooses up to two curated provider-default backup models and filters them through the capability
+  policy.
+- `manual`: the runtime tries the configured `fallback_models` in order.
+- `disabled`: the runtime does not switch models; the primary model error fails the current model call.
+
+Manual fallback targets can override provider, model, endpoint, auth reference, tuning, context window, capability
+flags, and provider-specific parameters:
+
+```json
+{
+  "fallback_strategy": "manual",
+  "fallback_models": [
+    {
+      "provider": "provider-openai",
+      "model": "gpt-4o-mini"
+    },
+    {
+      "provider": "provider-anthropic",
+      "model": "claude-3-5-haiku-latest",
+      "supports_tools": true,
+      "supports_vision": true
+    }
+  ]
+}
+```
+
+Fallback policy controls when a switch is allowed:
+
+```json
+{
+  "fallback_policy": {
+    "retry_on": ["rate_limit", "timeout", "service_unavailable", "network"],
+    "same_provider_only": false,
+    "require_capability_match": true
+  }
+}
+```
+
+`retry_on` supports:
+
+- `rate_limit`: quota/rate-limit errors such as HTTP 429
+- `timeout`: request timeout and timeout-like HTTP statuses
+- `service_unavailable`: temporary provider/service failures such as HTTP 500, 502, or 503
+- `network`: connection and network transport failures
+- `auth`: access failures such as HTTP 401 or 403
+
+`same_provider_only=true` rejects manual targets that specify a different provider id from the primary profile.
+`require_capability_match=true` requires backup targets to satisfy the primary profile's enabled capability flags:
+
+- `supports_tools`
+- `supports_structured_output`
+- `supports_vision`
+- `supports_streaming`
+
+Auto fallback uses a curated capability catalog for known provider defaults. Manual custom targets can provide explicit
+capability flags in `fallback_models`; when a manual custom target does not provide flags, the runtime allows it and
+assumes the operator has verified compatibility.
+
+Complete profile update example:
+
+```http
+PUT /model-profiles/{profile_id}
+Content-Type: application/json
+
+{
+  "name": "OpenAI Fast",
+  "provider": "provider-openai",
+  "model": "gpt-4.1-mini",
+  "supports_tools": true,
+  "supports_structured_output": true,
+  "supports_vision": false,
+  "supports_streaming": true,
+  "fallback_strategy": "manual",
+  "fallback_models": [
+    {"provider": "provider-openai", "model": "gpt-4o-mini"},
+    {"provider": "provider-anthropic", "model": "claude-3-5-haiku-latest"}
+  ],
+  "fallback_policy": {
+    "retry_on": ["rate_limit", "timeout", "service_unavailable", "network"],
+    "same_provider_only": false,
+    "require_capability_match": true
+  }
+}
+```
+
+Troubleshooting:
+
+- No switch happened: confirm `fallback_strategy` is not `disabled` and the failure category is present in
+  `fallback_policy.retry_on`.
+- A manual backup was skipped: check `same_provider_only` and capability flags.
+- Auto fallback produced fewer than two backups: compatible curated targets may not exist for the primary provider and
+  enabled capabilities.
+- Fallback exhausted: every eligible target failed; inspect `model.fallback.failed` events for attempt-level errors.
+
 For OAuth-backed providers, profiles should not own the tokens themselves. The only OAuth-specific profile field the FE
 should edit is:
 
@@ -126,7 +236,9 @@ prefer `http://host.docker.internal:11434`.
 
 Large local models can take longer than cloud APIs, especially on the first request while Ollama loads the model. Docker
 Compose defaults `LLM_REQUEST_TIMEOUT_SECONDS` to `180`; override it in `.env` if your hardware or model needs more
-time. A single model profile can also set `request_timeout_seconds` in its parameters to override the app default.
+time. Runtime executions resolve this value into `execution.metadata.runtime_policy`, where workflow, task, agent,
+trigger, or input metadata can also set `llm_request_timeout_seconds`. A single model profile can still set
+`request_timeout_seconds` in its parameters to override the app default for that profile.
 For Qwen thinking models, set `think` to `false` in profile parameters when you want normal chat responses instead of a
 separate hidden reasoning field.
 
@@ -167,7 +279,8 @@ Supported embedding paths:
 - Ollama profiles call `/api/embed`; local embedding models such as `nomic-embed-text` or `mxbai-embed-large` should be
   pulled into Ollama before use.
 
-New memory writes embed automatically when the profile resolves successfully.
+After setting the env var, run `POST /memories/embeddings/backfill` to embed existing memories. New memory writes embed
+automatically when the profile resolves successfully.
 
 ## FE Surfaces
 

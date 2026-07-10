@@ -15,10 +15,11 @@ from .browser_navigation import goto_with_readiness
 from .browser_session_state import BrowserActionResult, BrowserSessionState
 from .browser_signals import detect_page_challenge, overlay_selectors
 from .documents import save_markdown_to_word
-from .file_reader import read_text_file
 from .http_integrations import execute_custom_api
 from .human_input import request_human_input
+from .media import publish_media, send_media
 from .spreadsheets import write_excel_image, write_excel_json, write_excel_text
+from .voice import generate_voice
 
 __all__ = [
     "click_element",
@@ -27,13 +28,15 @@ __all__ = [
     "detect_page_challenge",
     "dismiss_common_overlays",
     "execute_custom_api",
+    "generate_voice",
     "goto_with_readiness",
     "humanize_page",
     "open_browser",
     "overlay_selectors",
-    "read_text_file",
+    "publish_media",
     "request_human_input",
     "save_markdown_to_word",
+    "send_media",
     "screenshot",
     "screenshot_and_analyse",
     "screenshot_and_extract",

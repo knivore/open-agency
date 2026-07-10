@@ -32,6 +32,11 @@ executed through the same native tool path as any other tool.
 
 `transport = "stdio"` is the active path. HTTP/SSE transport is intentionally stubbed for now.
 
+For stdio servers, `env_refs` are resolved before the MCP subprocess starts. Use `CredentialReference.key` as the
+environment variable name passed to the subprocess and `CredentialReference.ref` as the secret reference, for example
+`{"key": "FIRECRAWL_API_KEY", "ref": "env://FIRECRAWL_API_KEY"}`. Secret values are not persisted in the MCP server
+record.
+
 ## Discovery Flow
 
 Discovery is on-demand through the shared API context:
@@ -67,8 +72,56 @@ This keeps MCP as an adapter layer, not a new execution model.
 - MCP servers are disabled by default.
 - MCP server commands must be allowlisted with `MCP_SERVER_COMMAND_ALLOWLIST` or explicitly in the in-memory registry
   configuration.
+- Stdio MCP subprocesses receive a normalized PATH from `MCP_SERVER_EXTRA_PATHS` plus common system locations so `npx`,
+  `uvx`, `node`, and Docker-backed servers are discoverable without hardcoding machine-specific absolute paths.
 - No command string is constructed from user input; `command` and `args` come from saved server definitions.
 - Discovered MCP tools are constrained with `security.allowlisted_mcp_servers`.
 - High-risk MCP tools are inferred from MCP annotations and metadata, and they default to `requires_approval = true`.
 - MCP tool calls are logged as normal `ExecutionEvent` records.
 - When `redaction_enabled` is set, event payloads are redacted using configured rules before logging.
+
+## Built-In Research MCP
+
+The backend seeds a built-in Firecrawl MCP server record with id `research-firecrawl`. It uses stdio by default:
+
+```json
+{
+  "command": "npx",
+  "args": ["-y", "firecrawl-mcp"],
+  "env_refs": [{"key": "FIRECRAWL_API_KEY", "ref": "env://FIRECRAWL_API_KEY"}]
+}
+```
+
+Set `FIRECRAWL_API_KEY` to enable it automatically at startup. The startup path discovers it when enabled, which turns
+Firecrawl MCP capabilities such as web search, scraping, crawling, and extraction into normal Agency tools.
+
+Configuration knobs:
+
+- `FIRECRAWL_MCP_ENABLED`
+- `FIRECRAWL_MCP_COMMAND`
+- `FIRECRAWL_MCP_ARGS`
+- `FIRECRAWL_MCP_API_KEY_REF`
+
+## Built-In Developer Docs MCP
+
+The backend seeds a built-in Context7 MCP server record with id `docs-context7`. It uses stdio by default:
+
+```json
+{
+  "command": "npx",
+  "args": ["-y", "@upstash/context7-mcp"],
+  "env_refs": [{"key": "CONTEXT7_API_KEY", "ref": "env://CONTEXT7_API_KEY"}]
+}
+```
+
+Set `CONTEXT7_API_KEY` to enable it automatically at startup. You may also set `CONTEXT7_MCP_ENABLED=true` to run the
+public Context7 MCP server without a key at lower public rate limits. Context7 exposes documentation tools such as
+library-id resolution and documentation querying for current library/API references.
+
+Configuration knobs:
+
+- `CONTEXT7_API_KEY`
+- `CONTEXT7_MCP_ENABLED`
+- `CONTEXT7_MCP_COMMAND`
+- `CONTEXT7_MCP_ARGS`
+- `CONTEXT7_MCP_API_KEY_REF`

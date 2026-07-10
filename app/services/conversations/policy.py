@@ -1,3 +1,5 @@
+"""Policy decisions that constrain main-agent autonomy in conversations."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -98,19 +100,19 @@ class MainAgentPolicyService:
 
     def workflow_is_visible(self, workflow: WorkflowDefinition) -> bool:
         return (
-            not self._metadata_denies(workflow.metadata)
-            and (
-                workflow.metadata.get("visible_to_agent") is True
-                or workflow.metadata.get("visible_to_main_agent") is True
-            )
+                not self._metadata_denies(workflow.metadata)
+                and (
+                        workflow.metadata.get("visible_to_agent") is True
+                        or workflow.metadata.get("visible_to_main_agent") is True
+                )
         )
 
     def workflow_is_mutable(self, workflow: WorkflowDefinition) -> bool:
         return (
-            self.settings.main_agent_workflow_mutation_enabled
-            and self.workflow_is_visible(workflow)
-            and workflow.metadata.get("mutable_by_main_agent") is True
-            and not self._metadata_denies(workflow.metadata)
+                self.settings.main_agent_workflow_mutation_enabled
+                and self.workflow_is_visible(workflow)
+                and workflow.metadata.get("mutable_by_main_agent") is True
+                and not self._metadata_denies(workflow.metadata)
         )
 
     def workflow_requires_execution_approval(self, workflow: WorkflowDefinition) -> bool:

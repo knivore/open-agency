@@ -3,17 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from pydantic import Field
 from threading import Lock
 from typing import Any
 from uuid import uuid4
-
-from pydantic import Field
 
 from app.core.config import get_settings
 from app.core.time import utc_now
 from app.domain import DomainModel
 from app.tools.contracts.models import ToolRunResponse
-
 
 DEFAULT_TOOL_RUN_STORE_PATH = Path(".data/executions/tool_runs.jsonl")
 
@@ -26,6 +24,8 @@ class ToolRunRecord(DomainModel):
     input_json: dict[str, Any]
     output_json: dict[str, Any]
     policy_verdict_json: dict[str, Any] | None = None
+    risk_labels: list[str] = Field(default_factory=list)
+    risk_metadata_json: dict[str, Any] | None = None
     verdict: str
     dry_run: bool
     created_at: str = Field(default_factory=lambda: utc_now().isoformat())
@@ -47,6 +47,8 @@ class JsonlToolRunStore:
             actor: str | None,
             input_payload: dict[str, Any],
             output: ToolRunResponse,
+            risk_labels: list[str] | None = None,
+            risk_metadata: dict[str, Any] | None = None,
     ) -> ToolRunRecord:
         output_payload = output.model_dump(mode="json")
         record = ToolRunRecord(
@@ -58,6 +60,8 @@ class JsonlToolRunStore:
             policy_verdict_json=(
                 output.policyVerdict.model_dump(mode="json") if output.policyVerdict is not None else None
             ),
+            risk_labels=risk_labels or [],
+            risk_metadata_json=risk_metadata,
             verdict=output.verdict,
             dry_run=output.dryRun,
             input_hash=_hash_payload(input_payload),

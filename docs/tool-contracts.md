@@ -20,12 +20,19 @@ Current endpoints:
 - `GET /tools/contracts` lists available contracts.
 - `GET /tools/contracts/{tool_name}` returns one JSON-LD contract.
 - `POST /tools/{tool_name}/run` validates, policy-checks, executes, persists, signs, and returns a structured result.
-- `GET /capabilities` exposes contract URLs, run URLs, execution-mode metadata, side-effect hints, policy notes, and event-stream URLs for external agents.
+- `GET /capabilities` exposes contract URLs, run URLs, execution-mode metadata, side-effect hints, policy notes, event-stream URLs, and optional module availability for external agents.
+- The `modules` block in `GET /capabilities` advertises optional backend module availability for frontend gating. Setting `SMART_HOME_MODULE_ENABLED=false` or `PHYSICAL_DEVICES_MODULE_ENABLED=false` keeps those surfaces hidden/disabled on compatible frontends.
 
 Current contract-backed tools:
 
 - `sandbox-edit` validates and returns dry-run patch output in `patch` and `filesChanged`.
-- All 35 active built-in tools are present in the default contract registry. Fully bridged tools use hand-authored JSON contracts; remaining context-bound built-ins use generated contracts derived from canonical `ToolDefinition` input schemas.
+- Active built-in tools are present in the default contract registry. Fully bridged tools use hand-authored JSON contracts; remaining context-bound built-ins use generated contracts derived from canonical `ToolDefinition` input schemas.
+- Generated built-in contracts preserve Agency schema extensions such as `x-agency-filled-by` and
+  `x-agency-user-visible`, so callers can distinguish workflow-author defaults from agent-supplied
+  runtime inputs without reverse-engineering individual tool behavior.
+- Generated built-in contracts are derived from the assembled builtin registry in
+  `app/tools/builtins.py`, so contract generation tracks the same tool surface used by CLI discovery,
+  runtime inspection, and seed data.
 - Browser tools, `agency.human.ask`, and `agency.workflow.run` now have hand-authored contracts with explicit input schemas and wrapped `ToolRunResponse.result` output shapes.
 - `agency.tool.list` returns the live built-in tool catalog in `result.items` with `result.count`.
 - `agency.command.run` runs one policy-mediated shell command and returns stdout, stderr, exit code, duration, truncation state, and overflow path metadata in `result`.
@@ -36,6 +43,9 @@ Current contract-backed tools:
 - `agency.workflow.list`, `agency.workflow.get`, and `agency.tool.get` expose read-only workflow/tool discovery through signed contract responses. Workflow reads require an API context-backed runtime route.
 - `agency.execution.get`, `agency.execution.events`, and `agency.execution.artifacts` expose read-only execution
   inspection for eval agents and contract clients.
+- `agency.graph.context` exposes read-only Agency Graph context when `AGENCY_GRAPH_CONTEXT_TOOLS_ENABLED=true`.
+  Anchor-based calls use `anchor_type` plus `anchor_id`; query-based calls use `query` with optional scope labels.
+  Responses are bounded, signed, provenance-carrying `ToolRunResponse.result` payloads.
 - `agency.memory.list`, `agency.memory.remember`, `agency.memory.update`, and `agency.memory.delete` expose durable memory CRUD through signed contract responses and use `MemoryService` for ownership and sensitive-confirmation policy.
 - `agency.workflow.propose-create`, `agency.workflow.propose-update`, `agency.tool.propose-create`, and `agency.tool.propose-update` are contracted as approval-mediated proposal tools. Calls with `conversation_id` create approval requests; calls without conversation context return signed `requires_conversation_context` responses.
 - `agency.workflow.run` creates and queues unprotected workflow executions through `ExecutionService`, then returns execution id, workflow id, queued status, and the execution payload in `result`.
@@ -55,4 +65,5 @@ To add a contract:
 
 Tool runs are persisted to `TOOL_RUN_STORE_PATH`, defaulting to `.data/executions/tool_runs.jsonl`.
 File-write and spreadsheet-writer contract runs are constrained by `TOOL_FILE_WRITE_ALLOWED_DIRS`, defaulting to the backend and frontend workspace roots.
+Sandbox edit contract runs are constrained by `SANDBOX_EDIT_ALLOWED_REPOS`, defaulting to the backend and frontend workspace roots.
 HTTP contract runs are constrained by `TOOL_HTTP_ALLOWED_HOSTS`, defaulting to `*`.

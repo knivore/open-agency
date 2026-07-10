@@ -1,23 +1,24 @@
 from __future__ import annotations
 
 import json
-
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, ValidationError
 from typing import Any, Optional
+from urllib.parse import parse_qs
 
 from app.api.context import ApiContext, get_default_api_context
 from app.api.identity import resolve_current_user
 from app.services.channel_identity import ChannelIdentityMappingService
-from app.services.conversations import (
+from app.services.conversations.channel_adapters import create_chat_channel_adapter
+from app.services.conversations.channel_delivery import ChannelOutboundDeliveryService
+from app.services.conversations.channel_webhooks import ChannelWebhookVerificationService
+from app.services.conversations.channels import ConversationChannelService
+from app.services.conversations.core import (
     ConversationApprovalNotFoundError,
     ConversationApprovalPermissionError,
     ConversationApprovalStateError,
-    ConversationChannelService,
-    ChannelOutboundDeliveryService,
-    ChannelWebhookVerificationService,
 )
-from app.services.conversations.channel_adapters import create_chat_channel_adapter
+from app.services.credentials import CredentialService
 from .._crud import serializable_validation_errors
 
 
@@ -54,6 +55,11 @@ class ChannelIdentityMappingRequest(BaseModel):
 class ChannelDeliveryRequest(BaseModel):
     credential_id: str
     provider_outbound_messages: list[dict[str, Any]]
+
+
+class ChannelConversationDeliveryRequest(BaseModel):
+    credential_id: str
+    outbound_messages: list[dict[str, Any]]
 
 
 def create_conversation_channels_router(context: Optional[ApiContext] = None) -> APIRouter:
@@ -161,11 +167,39 @@ def create_conversation_channels_router(context: Optional[ApiContext] = None) ->
                 headers={key.lower(): value for key, value in request.headers.items()},
                 body=body,
             )
-            payload = json.loads(body) if body else {}
+            payload = _parse_adapter_payload(request, body)
             if not isinstance(payload, dict):
                 raise ValueError("Webhook payload must be a JSON object.")
             adapter = create_chat_channel_adapter(context, provider)
             result = await adapter.handle_webhook(payload)
+            if credential_id and result.get("provider_outbound_messages"):
+                credential = await context.credential_repo.get(credential_id)
+                if credential is None:
+                    raise ValueError("Credential not found.")
+                resolved_secret = await CredentialService(context).resolve_credential_secret(credential)
+                if resolved_secret.value is None:
+                    result["delivery"] = {
+                        "ok": False,
+                        "skipped": True,
+                        "reason": resolved_secret.error or "Credential secret could not be resolved.",
+                    }
+                else:
+                    try:
+                        delivery_result = await delivery_service.deliver_for_owner(
+                            provider=provider,
+                            credential_id=credential.id,
+                            owner_user_id=credential.owner_user_id,
+                            provider_outbound_messages=result["provider_outbound_messages"],
+                        )
+                    except Exception as exc:  # best-effort delivery: never fail the inbound webhook response
+                        result["delivery"] = {
+                            "ok": False,
+                            "skipped": True,
+                            "reason": f"Outbound delivery failed: {exc}",
+                        }
+                    else:
+                        if delivery_result is not None:
+                            result["delivery"] = delivery_result
             result["webhook_verification"] = verification
             return result
         except json.JSONDecodeError as exc:
@@ -196,7 +230,50 @@ def create_conversation_channels_router(context: Optional[ApiContext] = None) ->
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Credential not found")
         return result
 
+    @router.post("/channels/{conversation_id}/deliver", summary="Deliver Conversation-Bound Outbound Messages")
+    async def deliver_conversation_bound_messages(
+            conversation_id: str,
+            payload: ChannelConversationDeliveryRequest,
+            request: Request,
+    ):
+        current_user = await resolve_current_user(request, context, required_scopes=["integrations:write"])
+        try:
+            result = await delivery_service.deliver_conversation_messages_for_owner(
+                conversation_id=conversation_id,
+                credential_id=payload.credential_id,
+                owner_user_id=current_user.id,
+                outbound_messages=payload.outbound_messages,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+        if result is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation or credential not found")
+        return result
+
     return router
+
+
+def _parse_adapter_payload(request: Request, body: bytes) -> dict[str, Any]:
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type == "application/x-www-form-urlencoded":
+        form = parse_qs(body.decode("utf-8"))
+        if "payload" in form and form["payload"]:
+            parsed = json.loads(form["payload"][0])
+            return parsed if isinstance(parsed, dict) else {}
+        return {key: values[0] for key, values in form.items() if values}
+    if content_type == "application/json" or not content_type:
+        return json.loads(body) if body else {}
+    try:
+        parsed = json.loads(body) if body else {}
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    form = parse_qs(body.decode("utf-8"))
+    if "payload" in form and form["payload"]:
+        parsed = json.loads(form["payload"][0])
+        return parsed if isinstance(parsed, dict) else {}
+    return {key: values[0] for key, values in form.items() if values}
 
 
 __all__ = ["create_conversation_channels_router"]

@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Set
 
 from app.api.context import ApiContext
 from app.domain import ToolType, WorkflowDefinition
+from app.domain.tools import ToolDefinition
+from app.integrations.connectors import normalize_connector_provider_key
 
 
 @dataclass
@@ -129,6 +131,12 @@ class WorkflowValidationService:
             tool for tool in available_tools
             if tool.id in referenced_tool_ids and tool.id not in local_tool_ids
         ]
+        workflow_connector_bindings = self._workflow_connector_bindings(workflow)
+        workflow_connector_binding_providers = {
+            str(binding.get("provider") or "").strip()
+            for binding in workflow_connector_bindings
+            if str(binding.get("provider") or "").strip()
+        }
         for tool in all_tools:
             if not tool.input_schema:
                 errors.append(ValidationIssue(code="tool.input_schema.missing",
@@ -183,6 +191,46 @@ class WorkflowValidationService:
                 if not tool.security.sandbox_required:
                     errors.append(ValidationIssue(code="tool.shell.sandbox.missing",
                                                   message=f"Shell tool '{tool.name}' requires sandboxing"))
+            if self._is_connector_backed_tool(tool):
+                provider_hint = self._connector_provider_hint(tool)
+                tool_bindings = tool.security.connector_bindings
+                if not tool_bindings:
+                    if provider_hint and provider_hint not in workflow_connector_binding_providers:
+                        errors.append(
+                            ValidationIssue(
+                                code="tool.connector_binding.missing",
+                                message=(
+                                    f"Connector-backed tool '{tool.name}' requires a connector binding for "
+                                    f"provider '{provider_hint}'. Add ToolDefinition.security.connector_bindings "
+                                    "or workflow.metadata.connector_bindings."
+                                ),
+                                field="connector_bindings",
+                            )
+                        )
+                    elif not workflow_connector_bindings:
+                        errors.append(
+                            ValidationIssue(
+                                code="tool.connector_binding.missing",
+                                message=(
+                                    f"Connector-backed tool '{tool.name}' requires a connector binding. "
+                                    "Add ToolDefinition.security.connector_bindings or "
+                                    "workflow.metadata.connector_bindings before approval."
+                                ),
+                                field="connector_bindings",
+                            )
+                        )
+                    elif len(workflow_connector_bindings) > 1 and provider_hint is None:
+                        warnings.append(
+                            ValidationIssue(
+                                code="tool.connector_binding.ambiguous",
+                                message=(
+                                    f"Connector-backed tool '{tool.name}' has multiple workflow connector defaults; "
+                                    "the tool call should pass provider or credential_id to avoid runtime ambiguity."
+                                ),
+                                severity="warning",
+                                field="connector_bindings",
+                            )
+                        )
 
         if workflow.default_runtime_adapter_id and workflow.default_runtime_adapter_id not in runtime_adapter_ids:
             errors.append(ValidationIssue(code="runtime_adapter.missing",
@@ -216,3 +264,39 @@ class WorkflowValidationService:
             available_agents=[agent.model_dump(mode="json") for agent in available_agents],
             compatible_runtime_adapters=compatible_runtime_adapters,
         )
+
+    def _workflow_connector_bindings(self, workflow: WorkflowDefinition) -> list[dict[str, Any]]:
+        bindings = workflow.metadata.get("connector_bindings") if isinstance(workflow.metadata, dict) else None
+        if not isinstance(bindings, list):
+            return []
+        normalized: list[dict[str, Any]] = []
+        for binding in bindings:
+            if not isinstance(binding, dict):
+                continue
+            legacy_ref = str(binding.get("ref") or "").strip()
+            credential_id = str(binding.get("credential_id") or legacy_ref or "").strip()
+            provider = normalize_connector_provider_key(str(binding.get("provider") or ""))
+            if not provider:
+                purpose = str(binding.get("purpose") or "").strip()
+                if purpose:
+                    provider = normalize_connector_provider_key(purpose.split("_", 1)[0].split("-", 1)[0])
+            if provider and credential_id:
+                normalized.append({**binding, "provider": provider, "credential_id": credential_id})
+        return normalized
+
+    def _connector_provider_hint(self, tool: ToolDefinition) -> str | None:
+        config = tool.implementation.config or {}
+        for key in ("provider", "provider_key", "connector", "connector_provider"):
+            value = config.get(key)
+            if isinstance(value, str) and value.strip():
+                return normalize_connector_provider_key(value.strip())
+        return None
+
+    def _is_connector_backed_tool(self, tool: ToolDefinition) -> bool:
+        tags = {tag.strip().lower() for tag in tool.tags if isinstance(tag, str)}
+        if tool.implementation.target == "agency.system.connector" or "system" in tags:
+            return False
+        if {"connector", "integration"} & tags:
+            return True
+        config = tool.implementation.config or {}
+        return any(key in config for key in ("provider", "provider_key", "connector", "connector_provider"))

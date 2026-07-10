@@ -4,7 +4,6 @@ from typing import Any
 
 from app.core.config import get_settings
 from app.tools.contracts.models import PolicyVerdict
-
 from .browser import evaluate_browser_policy
 from .command import evaluate_command_run_policy
 from .files import evaluate_file_write_text_policy, evaluate_markdown_to_word_policy, evaluate_spreadsheet_write_policy

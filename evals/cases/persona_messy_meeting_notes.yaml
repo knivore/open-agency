@@ -1,0 +1,73 @@
+id: persona_messy_meeting_notes
+suite: persona_distillation
+name: Persona messy meeting-note extraction
+mode: persona_distillation_fixture
+description: Checks whether LLM-backed extraction recovers decisions from noisy notes.
+persona_distillation:
+  source_memories:
+    - id: messy-access-review-notes
+      title: Access review meeting notes
+      content: |
+        Messy notes from audit sync. We found admin accounts were not in the access review.
+        Decision: escalate missing administrator review coverage as an audit observation unless the owner provides evidence.
+        Follow-up: control owner signs off by Friday after validating the admin population.
+      tags: ["persona-live-eval", "meeting-notes", "audit"]
+  expected_items:
+    - id: escalation_decision
+      item_type: decision_pattern
+      memory_layer: procedural
+      content_keywords: ["escalate missing administrator review"]
+      evidence: "Decision: escalate missing administrator review coverage as an audit observation unless the owner provides evidence."
+    - id: owner_context
+      item_type: workflow
+      memory_layer: procedural
+      content_keywords: ["control owner signs off"]
+      evidence: "control owner signs off by Friday"
+  results:
+    deterministic:
+      items:
+        - title: Access review note
+          content: "Meeting discussed access review."
+          item_type: domain_knowledge
+          memory_layer: semantic
+          source_evidence: "access review"
+          evidence_verified: true
+      metrics: {latency_ms: 7, cost_usd: 0.0}
+    llm:
+      items:
+        - title: Escalate missing administrator review
+          content: "Escalate missing administrator review coverage."
+          item_type: decision_pattern
+          memory_layer: procedural
+          source_evidence: "Decision: escalate missing administrator review coverage as an audit observation unless the owner provides evidence."
+          evidence_verified: true
+        - title: Control owner signoff
+          content: "Control owner signs off by Friday."
+          item_type: workflow
+          memory_layer: procedural
+          source_evidence: "control owner signs off by Friday"
+          evidence_verified: true
+      metrics: {latency_ms: 122, cost_usd: 0.018}
+    hybrid:
+      items:
+        - title: Escalate missing administrator review
+          content: "Escalate missing administrator review coverage."
+          item_type: decision_pattern
+          memory_layer: procedural
+          source_evidence: "Decision: escalate missing administrator review coverage as an audit observation unless the owner provides evidence."
+          evidence_verified: true
+        - title: Control owner signoff
+          content: "Control owner signs off by Friday."
+          item_type: workflow
+          memory_layer: procedural
+          source_evidence: "control owner signs off by Friday"
+          evidence_verified: true
+      metrics: {latency_ms: 129, cost_usd: 0.018}
+assertions:
+  - type: persona_best_mode
+    mode: llm
+    metric: recall
+  - type: persona_metric_min
+    mode: hybrid
+    metric: evidence_grounding
+    value: 1.0

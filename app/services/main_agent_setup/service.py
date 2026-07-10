@@ -1,3 +1,13 @@
+"""Main-agent bootstrap and startup readiness service.
+
+The service owns the database shape behind local onboarding and headless
+bootstrap: it verifies that a chat-capable model profile exists, creates or
+validates the active ``MainAgentProfile``, and keeps the default workflow/agent
+references intact. Launch scripts call ``scripts/setup.py`` for
+terminal/operator setup, while application startup calls this service directly
+to decide whether the API can safely accept main-agent conversation traffic.
+"""
+
 from __future__ import annotations
 
 import os
@@ -8,6 +18,9 @@ from uuid import uuid4
 from app.core.config import Settings, get_settings
 from app.domain import (
     AgentDefinition,
+    Conversation,
+    ConversationChannelType,
+    GraphContextSettings,
     MainAgentProfile,
     ModelProfileDefinition,
     ModelProviderDefinition,
@@ -22,8 +35,25 @@ if TYPE_CHECKING:
     from app.api.context import ApiContext
 
 
+def _graph_context_tools_allowed(policy: dict[str, Any]) -> bool:
+    return bool(policy.get("can_read_graph_context", False) and get_settings().agency_graph_context_tools_enabled)
+
+
+def _agent_graph_context_settings(policy: dict[str, Any]) -> GraphContextSettings:
+    return GraphContextSettings(
+        enabled=_graph_context_tools_allowed(policy),
+        auto_retrieval_enabled=bool(policy.get("graph_context_auto_retrieval_enabled", False)),
+        subagent_steering_enabled=bool(policy.get("graph_context_subagent_steering_enabled", False)),
+        coding_agent_resume_enabled=bool(policy.get("graph_context_coding_agent_resume_enabled", False)),
+        default_budget=policy.get("graph_context_default_budget"),
+        default_intent=policy.get("graph_context_default_intent"),
+    )
+
+
 @dataclass(slots=True)
 class MainAgentSetupConfig:
+    """Fully resolved settings for creating the persisted main-agent bundle."""
+
     agent_name: str
     agent_instructions: str
     model_profile_id: str
@@ -39,7 +69,16 @@ class MainAgentSetupConfig:
             "can_create_workflows": False,
             "can_update_workflows": False,
             "can_manage_tools": True,
+            "can_manage_agents": True,
+            "can_manage_integrations": True,
+            "can_inspect_executions": True,
             "can_run_commands": True,
+            "can_read_graph_context": True,
+            "graph_context_auto_retrieval_enabled": True,
+            "graph_context_subagent_steering_enabled": True,
+            "graph_context_coding_agent_resume_enabled": False,
+            "graph_context_default_intent": "handoff",
+            "graph_context_default_budget": "balanced",
             "require_approval_for_mutations": True,
             "enable_computer_use": True,
         }
@@ -54,6 +93,8 @@ class MainAgentSetupConfig:
 
 @dataclass(slots=True)
 class MainAgentBootstrapConfig:
+    """Environment-derived bootstrap settings for headless first-run setup."""
+
     existing_model_profile_id: str | None = None
     provider_family: str | None = None
     provider_name: str | None = None
@@ -92,6 +133,8 @@ class MainAgentSetupInvalidError(MainAgentSetupError):
 
 @dataclass(slots=True)
 class MainAgentSetupService:
+    """Coordinates model, agent, workflow, and profile records for the main agent."""
+
     context: ApiContext
 
     async def list_visible_computer_use_tools(self) -> list[Any]:
@@ -170,7 +213,7 @@ class MainAgentSetupService:
             elif not interactive:
                 raise MainAgentModelProfileRequiredError(
                     "Main-agent setup requires at least one configured model profile. "
-                    "Run first-run setup interactively or configure MAIN_AGENT_BOOTSTRAP_* env vars."
+                    "Complete interactive onboarding or configure MAIN_AGENT_BOOTSTRAP_* env vars."
                 )
             else:
                 profile = await self._prompt_and_create_model_profile()
@@ -208,10 +251,77 @@ class MainAgentSetupService:
         base = str(exc).strip() or exc.__class__.__name__
         return (
             f"{base}\n\n"
-            "To complete first-run setup interactively, run:\n"
+            "For normal local setup, complete onboarding in one of these ways:\n"
+            "  browser path: open /setup when agency-fe is available\n"
+            "  terminal path: python scripts/setup.py local-onboarding\n\n"
+            "For the older operator-style main-agent flow, run:\n"
             "  python scripts/setup.py main-agent\n\n"
+            "After setup, you can chat directly in the terminal with:\n"
+            "  python -m app.cli chat-main-agent\n\n"
+            "Or prepare Discord/Telegram/WhatsApp bot access and route chats through those channels instead.\n\n"
             "For headless startup, configure MAIN_AGENT_BOOTSTRAP_ENABLED=true and the required MAIN_AGENT_BOOTSTRAP_* variables.\n"
         )
+
+    @staticmethod
+    def chat_channel_setup_guidance(channel: str) -> str:
+        normalized = channel.strip().lower()
+        if normalized not in {"discord", "telegram", "whatsapp"}:
+            raise MainAgentSetupInvalidError(
+                "Chat channel guidance is only available for discord, telegram, or whatsapp.")
+
+        extra_step: str
+        webhook_url: str
+        verification_step: str
+        channel_step: str
+        if normalized == "discord":
+            verification_step = (
+                "Configure the Discord interaction/webhook signature public key on the credential. "
+                "Use the Discord application Public Key hex value, not a Discord webhook URL."
+            )
+            webhook_url = "/integrations/conversations/adapters/discord/webhook"
+            channel_step = "If you want the same assistant to reply in a specific guild/channel, store the channel thread id on the conversation."
+            extra_step = (
+                "Use Discord components for approve/reject actions, and create a trusted channel identity mapping "
+                "for your Discord user id before testing protected mutations."
+            )
+        elif normalized == "telegram":
+            verification_step = "Configure the Telegram webhook secret token on the credential."
+            webhook_url = "/integrations/conversations/adapters/telegram/webhook?credential_id=<installation_id>"
+            channel_step = "Use inline keyboard callbacks for approve/reject actions."
+            extra_step = (
+                "Set up the bot token with BotFather, run Telegram getMe to capture the numeric bot user id, and confirm the webhook can reach the backend. "
+                "Use the installation id as the credential_id query parameter so Agency can send replies back through the same installation."
+            )
+        else:
+            verification_step = "Configure the WhatsApp app secret and phone number metadata on the credential."
+            webhook_url = "/integrations/conversations/adapters/whatsapp/webhook"
+            channel_step = "Use WhatsApp interactive reply buttons for approve/reject actions."
+            extra_step = "Ensure the connected WhatsApp business number can receive webhook events."
+
+        lines = [
+            f"{normalized.title()} bot setup checklist:",
+            "1. Create or select the bot/app in the provider console.",
+            "2. Create a connector credential in Agency for that provider.",
+            f"3. {verification_step}",
+            f"4. Set the webhook URL to `{webhook_url}`.",
+            "5. Map the external channel user id to an internal user if you want trusted approvals and mutations.",
+            "6. Send a test message to confirm inbound and outbound chat both work.",
+            f"7. {channel_step}",
+            f"8. {extra_step}",
+        ]
+        if normalized == "discord":
+            lines.extend(
+                [
+                    "",
+                    "Discord-specific notes:",
+                    "- Store the bot token as a secret reference, not as metadata.",
+                    "- Store application_id, bot_user_id, default_guild_id, and webhook_public_key as metadata.",
+                    "- webhook_public_key must be the Discord application Public Key hex string.",
+                    "- The webhook/interactions endpoint URL and the public key are different values.",
+                    "- After setup, run `python -m app.cli smoke-test-discord --owner-user-id YOUR_USER_ID --discord-user-id YOUR_DISCORD_USER_ID`.",
+                ]
+            )
+        return "\n".join(lines)
 
     @staticmethod
     def bootstrap_config_from_settings(
@@ -221,14 +331,18 @@ class MainAgentSetupService:
     ) -> MainAgentBootstrapConfig | None:
         if settings is None or not settings.main_agent_bootstrap_enabled:
             return None
+
+        def optional_text(value: str | None) -> str | None:
+            return value.strip() or None if value is not None else None
+
         return MainAgentBootstrapConfig(
-            existing_model_profile_id=settings.main_agent_bootstrap_existing_model_profile_id,
-            provider_family=settings.main_agent_bootstrap_provider_family,
-            provider_name=settings.main_agent_bootstrap_provider_name,
-            base_url=settings.main_agent_bootstrap_base_url,
-            api_key=settings.main_agent_bootstrap_api_key,
-            profile_name=settings.main_agent_bootstrap_profile_name,
-            model_name=settings.main_agent_bootstrap_model_name,
+            existing_model_profile_id=optional_text(settings.main_agent_bootstrap_existing_model_profile_id),
+            provider_family=optional_text(settings.main_agent_bootstrap_provider_family),
+            provider_name=optional_text(settings.main_agent_bootstrap_provider_name),
+            base_url=optional_text(settings.main_agent_bootstrap_base_url),
+            api_key=optional_text(settings.main_agent_bootstrap_api_key),
+            profile_name=optional_text(settings.main_agent_bootstrap_profile_name),
+            model_name=optional_text(settings.main_agent_bootstrap_model_name),
             temperature=settings.main_agent_bootstrap_temperature,
             max_tokens=settings.main_agent_bootstrap_max_tokens,
             agent_name=settings.main_agent_bootstrap_agent_name or "Main Agent",
@@ -283,14 +397,35 @@ class MainAgentSetupService:
         system_tools = await tool_resolver.ensure_workflow_system_tools(
             can_trigger_workflows=config.policy.get("can_trigger_workflows", True)
         )
+        system_tools.extend(await tool_resolver.ensure_default_main_agent_speech_tools())
         system_tools.extend(
             await tool_resolver.ensure_tool_management_system_tools(
                 can_manage_tools=config.policy.get("can_manage_tools", True)
             )
         )
         system_tools.extend(
+            await tool_resolver.ensure_agent_management_system_tools(
+                can_manage_agents=config.policy.get("can_manage_agents", True)
+            )
+        )
+        system_tools.extend(
+            await tool_resolver.ensure_connector_system_tools(
+                can_manage_integrations=config.policy.get("can_manage_integrations", True)
+            )
+        )
+        system_tools.extend(
             await tool_resolver.ensure_memory_system_tools(
                 can_manage_memory=config.policy.get("can_manage_memory", True)
+            )
+        )
+        system_tools.extend(
+            await tool_resolver.ensure_graph_system_tools(
+                can_read_graph_context=_graph_context_tools_allowed(config.policy)
+            )
+        )
+        system_tools.extend(
+            await tool_resolver.ensure_execution_system_tools(
+                can_inspect_executions=config.policy.get("can_inspect_executions", True)
             )
         )
         system_tools.extend(
@@ -307,11 +442,14 @@ class MainAgentSetupService:
             instructions=config.agent_instructions.strip(),
             model_profile_id=model_profile.id,
             tool_ids=[*[tool.id for tool in system_tools], *[tool.id for tool in computer_use_tools]],
+            graph_context=_agent_graph_context_settings(config.policy),
             metadata=dict(config.agent_metadata),
         )
         saved_agent = await self.context.agent_repo.save(agent)
 
         workflow_id = config.workflow_id or str(uuid4())
+        profile_id = config.profile_id or str(uuid4())
+        monitor_conversation = await self._ensure_monitor_conversation(profile_id=profile_id)
         node_id = f"{workflow_id}-node"
         workflow = WorkflowDefinition(
             id=workflow_id,
@@ -331,17 +469,70 @@ class MainAgentSetupService:
         )
         saved_workflow = await self.context.workflow_repo.save(workflow)
 
+        profile_metadata = self._profile_metadata_with_monitoring_defaults(
+            config.profile_metadata,
+            approval_conversation_id=monitor_conversation.id,
+        )
         profile = MainAgentProfile(
-            id=config.profile_id or str(uuid4()),
+            id=profile_id,
             name=config.profile_name,
             description=config.profile_description,
             agent_id=saved_agent.id,
             default_workflow_id=saved_workflow.id,
             default_model_profile_id=model_profile.id,
             policy=dict(config.policy),
-            metadata=dict(config.profile_metadata),
+            metadata=profile_metadata,
         )
         return await self.context.main_agent_profile_repo.save(profile)
+
+    async def _ensure_monitor_conversation(self, *, profile_id: str) -> Conversation:
+        conversation_id = f"{profile_id}-monitor"
+        conversation = Conversation(
+            id=conversation_id,
+            title="Main Agent Monitor",
+            main_agent_profile_id=profile_id,
+            channel_type=ConversationChannelType.API,
+            metadata={
+                "source": "main_agent_setup",
+                "purpose": "main_agent_monitor_notifications",
+                "monitor_inbox": True,
+                "delivery": {
+                    "primary": "conversation",
+                    "external_channels": "Use workflow/profile monitoring metadata to route to a linked chat channel.",
+                },
+            },
+        )
+        repo = self.context.conversation_repo
+        if hasattr(repo, "save"):
+            return await repo.save(conversation)
+        existing = await repo.get(conversation_id)
+        return existing if existing is not None else await repo.create(conversation)
+
+    def _profile_metadata_with_monitoring_defaults(
+            self,
+            metadata: dict[str, Any],
+            *,
+            approval_conversation_id: str,
+    ) -> dict[str, Any]:
+        updated = dict(metadata)
+        monitoring = dict(updated.get("main_agent_monitoring") or {})
+        monitoring.setdefault("enabled", True)
+        monitoring.setdefault("approval_conversation_id", approval_conversation_id)
+        monitoring.setdefault("route_improvement_proposals_to_approval", True)
+        monitoring.setdefault("route_steering_requests_to_approval", True)
+        monitoring.setdefault("notification_routes", ["conversation"])
+        monitoring.setdefault(
+            "human_prompt_policy",
+            {
+                "prompt_for_findings": True,
+                "prompt_for_improvement_proposals": True,
+                "prompt_for_supervisor_steering": True,
+                "never_auto_approve_high_risk": True,
+                "never_auto_approve_repo_write": True,
+            },
+        )
+        updated["main_agent_monitoring"] = monitoring
+        return updated
 
     async def update_active_main_agent_profile(
             self,
@@ -425,14 +616,35 @@ class MainAgentSetupService:
         system_tools = await tool_resolver.ensure_workflow_system_tools(
             can_trigger_workflows=profile.policy.get("can_trigger_workflows", True)
         )
+        system_tools.extend(await tool_resolver.ensure_default_main_agent_speech_tools())
         system_tools.extend(
             await tool_resolver.ensure_tool_management_system_tools(
                 can_manage_tools=profile.policy.get("can_manage_tools", True)
             )
         )
         system_tools.extend(
+            await tool_resolver.ensure_agent_management_system_tools(
+                can_manage_agents=profile.policy.get("can_manage_agents", True)
+            )
+        )
+        system_tools.extend(
+            await tool_resolver.ensure_connector_system_tools(
+                can_manage_integrations=profile.policy.get("can_manage_integrations", True)
+            )
+        )
+        system_tools.extend(
             await tool_resolver.ensure_memory_system_tools(
                 can_manage_memory=profile.policy.get("can_manage_memory", True)
+            )
+        )
+        system_tools.extend(
+            await tool_resolver.ensure_graph_system_tools(
+                can_read_graph_context=_graph_context_tools_allowed(profile.policy)
+            )
+        )
+        system_tools.extend(
+            await tool_resolver.ensure_execution_system_tools(
+                can_inspect_executions=profile.policy.get("can_inspect_executions", True)
             )
         )
         system_tools.extend(
@@ -452,7 +664,11 @@ class MainAgentSetupService:
                and tool_id not in system_ids
         ]
         updated_agent = agent.model_copy(
-            update={"tool_ids": [*preserved_ids, *sorted(system_ids), *sorted(visible_ids)]})
+            update={
+                "tool_ids": [*preserved_ids, *sorted(system_ids), *sorted(visible_ids)],
+                "graph_context": _agent_graph_context_settings(profile.policy),
+            }
+        )
         await self.context.agent_repo.save(updated_agent)
         return profile
 
@@ -471,6 +687,7 @@ class MainAgentSetupService:
             supports_structured_output: bool = False,
             supports_vision: bool = False,
             supports_streaming: bool = True,
+            parameters: dict[str, Any] | None = None,
     ) -> ModelProfileDefinition:
         provider = await self.context.model_provider_repo.get(provider_id)
         if provider is None:
@@ -494,6 +711,7 @@ class MainAgentSetupService:
             supports_structured_output=supports_structured_output,
             supports_vision=supports_vision,
             supports_streaming=supports_streaming,
+            parameters=parameters or {},
         )
         return await self.context.model_profile_repo.save(profile)
 
@@ -521,7 +739,7 @@ class MainAgentSetupService:
         except KeyError as exc:
             raise MainAgentSetupInvalidError(
                 "MAIN_AGENT_BOOTSTRAP_PROVIDER_FAMILY must be one of: "
-                "openai, anthropic, google, xai, ollama, openai_compatible."
+                "openai, anthropic, google, xai, deepseek, qwen, ollama, openai_compatible, openai_codex."
             ) from exc
         effective_provider_id = provider_key
         effective_provider_type = provider_type
@@ -535,6 +753,10 @@ class MainAgentSetupService:
             raise MainAgentSetupInvalidError(
                 f"MAIN_AGENT_BOOTSTRAP_API_KEY is required for provider family '{provider_key}'."
             )
+        parameters: dict[str, Any] = {}
+        if provider_key == "openai_codex":
+            parameters["auth_mode"] = "api" if bootstrap.api_key else "chatgpt"
+            parameters["codex_cli_timeout_seconds"] = 1800
         return await self.create_provider_and_model_profile(
             provider_id=effective_provider_id,
             provider_name=effective_provider_name,
@@ -545,6 +767,7 @@ class MainAgentSetupService:
             api_key=bootstrap.api_key,
             temperature=0.2 if bootstrap.temperature is None else bootstrap.temperature,
             max_tokens=400 if bootstrap.max_tokens is None else bootstrap.max_tokens,
+            parameters=parameters,
         )
 
     def _build_main_agent_config_from_bootstrap(
@@ -573,6 +796,8 @@ class MainAgentSetupService:
                 "can_trigger_workflows": bootstrap.can_trigger_workflows,
                 "can_create_workflows": bootstrap.can_create_workflows,
                 "can_update_workflows": bootstrap.can_update_workflows,
+                "can_manage_integrations": True,
+                "can_inspect_executions": True,
                 "can_run_commands": True,
                 "require_approval_for_mutations": bootstrap.require_approval_for_mutations,
             },
@@ -675,6 +900,7 @@ class MainAgentSetupService:
             "Default workflow description",
             default="Default workflow for main-agent orchestration.",
         )
+        chat_access = self._prompt_chat_access_path()
 
         config = MainAgentSetupConfig(
             agent_name=agent_name,
@@ -690,9 +916,15 @@ class MainAgentSetupService:
                 "can_trigger_workflows": can_trigger,
                 "can_create_workflows": can_create,
                 "can_update_workflows": can_update,
+                "can_manage_integrations": True,
+                "can_inspect_executions": True,
                 "require_approval_for_mutations": require_approval,
             },
-            profile_metadata={"system": True, "setup_mode": "interactive"},
+            profile_metadata={
+                "system": True,
+                "setup_mode": "interactive",
+                "operator_chat_access": chat_access,
+            },
         )
 
         print("\nMain-agent setup summary:")
@@ -703,6 +935,11 @@ class MainAgentSetupService:
         print(f"  can_create_workflows: {config.policy['can_create_workflows']}")
         print(f"  can_update_workflows: {config.policy['can_update_workflows']}")
         print(f"  require_approval_for_mutations: {config.policy['require_approval_for_mutations']}")
+        if chat_access["mode"] == "direct_cli":
+            print("  chat access: direct CLI chat (`python -m app.cli chat-main-agent`)")
+        else:
+            print(f"  chat access: prepare {chat_access['channel']} bot setup")
+            print(f"  next step: python -m app.cli setup-chat-channel {chat_access['channel'].lower()}")
         confirmed = self._prompt_bool("Create this main agent now?", default=True)
         if not confirmed:
             raise MainAgentSetupRequiredError(
@@ -770,6 +1007,8 @@ class MainAgentSetupService:
             ("anthropic", "Anthropic (Claude)"),
             ("google", "Google Gemini"),
             ("xai", "xAI / Grok"),
+            ("deepseek", "DeepSeek"),
+            ("qwen", "Qwen / DashScope"),
             ("ollama", "Ollama / local models"),
             ("openai_compatible", "Custom OpenAI-compatible endpoint"),
         ]
@@ -801,10 +1040,12 @@ class MainAgentSetupService:
             "anthropic": ("Anthropic", ModelProviderType.ANTHROPIC, "https://api.anthropic.com", True),
             "google": ("Google Gemini", ModelProviderType.GOOGLE, "https://generativelanguage.googleapis.com", True),
             "xai": ("xAI", ModelProviderType.OPENAI_COMPATIBLE, "https://api.x.ai/v1", True),
+            "deepseek": ("DeepSeek", ModelProviderType.DEEPSEEK, "https://api.deepseek.com", True),
+            "qwen": ("Qwen", ModelProviderType.QWEN, "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", True),
             "ollama": ("Ollama", ModelProviderType.OLLAMA, local_ollama_url, False),
             "openai_compatible": ("OpenAI-Compatible", ModelProviderType.OPENAI_COMPATIBLE, "http://localhost:8001/v1",
                                   True),
-            "openai_codex": ("OpenAI Codex", ModelProviderType.OPENAI_CODEX, "https://api.openai.com/v1", True),
+            "openai_codex": ("OpenAI Codex", ModelProviderType.OPENAI_CODEX, "https://api.openai.com/v1", False),
         }
         return mapping[provider_key]
 
@@ -816,6 +1057,53 @@ class MainAgentSetupService:
         if default is not None:
             return default
         raise MainAgentSetupInvalidError(f"{label} is required.")
+
+    def _prompt_chat_access_path(self) -> dict[str, Any]:
+        print(
+            "\nChoose how you want to chat with the main agent after setup.\n"
+            "You can keep using the backend CLI directly, or prepare a Discord or Telegram bot later.\n"
+        )
+        options = [
+            {
+                "mode": "direct_cli",
+                "label": "Direct CLI chat (recommended)",
+                "channel": None,
+                "guidance": "Use the backend CLI to chat with the agent immediately after setup.",
+            },
+            {
+                "mode": "discord_bot",
+                "label": "Discord bot",
+                "channel": "Discord",
+                "guidance": "Prepare Discord webhook credentials so the same assistant can be reached in Discord.",
+            },
+            {
+                "mode": "telegram_bot",
+                "label": "Telegram bot",
+                "channel": "Telegram",
+                "guidance": "Prepare Telegram bot credentials so the same assistant can be reached in Telegram.",
+            },
+        ]
+        for index, option in enumerate(options, start=1):
+            print(f"  {index}. {option['label']}")
+        while True:
+            raw = input(f"Select chat access path [1-{len(options)}] [1]: ").strip()
+            if not raw:
+                selection = options[0]
+                break
+            try:
+                selected = int(raw)
+            except ValueError:
+                print("Please enter a valid number.")
+                continue
+            if 1 <= selected <= len(options):
+                selection = options[selected - 1]
+                break
+            print("Selection out of range.")
+        return {
+            "mode": selection["mode"],
+            "channel": selection["channel"],
+            "guidance": selection["guidance"],
+        }
 
     def _prompt_multiline(self, label: str, *, default: str | None = None) -> str:
         print(f"{label}:")

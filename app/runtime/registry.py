@@ -1,13 +1,20 @@
+"""Runtime adapter registry and execution-host selection.
+
+The registry is the boundary between workflow definitions and concrete runtime
+adapters. It persists prepared executions through the selected adapter while
+keeping adapter lookup, host metadata, and lifecycle dispatch in one place.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Optional
 
+from app.core.config import get_settings
 from app.core.time import utc_now
 from app.domain import Execution, ExecutionStatus, RuntimeAdapterType, WorkflowDefinition
 from app.runtime.adapters.base import BaseRuntimeAdapter
-from app.runtime.execution_lifecycle import build_execution_lifecycle_metadata
+from app.runtime.execution_lifecycle import build_execution_lifecycle_metadata, resolve_execution_runtime_policy
 from app.runtime.native.errors import ExecutionNotFoundError, WorkflowNotFoundError
 from app.runtime.native.state import ExecutionStore, ModelProfileRepository, WorkflowRepository
 
@@ -24,6 +31,7 @@ def _normalized_execution_host(value: object) -> str | None:
 
 
 def resolve_execution_host(trigger: dict, workflow_metadata: dict) -> str | None:
+    """Resolve local-vs-Docker execution preference from trigger and workflow metadata."""
     workflow_runtime_metadata = workflow_metadata.get("runtime_execution")
     if not isinstance(workflow_runtime_metadata, dict):
         workflow_runtime_metadata = {}
@@ -43,8 +51,17 @@ def resolve_execution_host(trigger: dict, workflow_metadata: dict) -> str | None
     return None
 
 
+def _normalized_runtime_adapter_id(runtime_adapter_id: Optional[str]) -> str | None:
+    if runtime_adapter_id is None:
+        return None
+    normalized = runtime_adapter_id.strip()
+    return normalized or None
+
+
 @dataclass
 class RuntimeAdapterRegistry:
+    """Dispatch execution lifecycle operations to registered runtime adapters."""
+
     workflow_repository: WorkflowRepository
     model_profile_repository: ModelProfileRepository
     execution_store: ExecutionStore
@@ -79,7 +96,7 @@ class RuntimeAdapterRegistry:
             workflow: WorkflowDefinition,
             runtime_adapter_id: Optional[str] = None,
     ) -> BaseRuntimeAdapter:
-        adapter_name = runtime_adapter_id or workflow.default_runtime_adapter_id or RuntimeAdapterType.NATIVE.value
+        adapter_name = _normalized_runtime_adapter_id(runtime_adapter_id) or RuntimeAdapterType.NATIVE.value
         adapter = self.get(adapter_name)
         if not await adapter.supports(workflow):
             raise WorkflowNotFoundError(f"Workflow '{workflow.id}' is not supported by adapter '{adapter_name}'")
@@ -98,11 +115,13 @@ class RuntimeAdapterRegistry:
             input_payload: dict,
             trigger: dict,
             runtime_adapter_id: Optional[str] = None,
+            goal_id: str | None = None,
     ) -> Execution:
         workflow = await self.workflow_repository.get_workflow(workflow_id)
         if workflow is None:
             raise WorkflowNotFoundError(f"Workflow '{workflow_id}' was not found")
-        adapter = await self._resolve_adapter_for_workflow(workflow, runtime_adapter_id)
+        requested_adapter_id = _normalized_runtime_adapter_id(runtime_adapter_id)
+        adapter = await self._resolve_adapter_for_workflow(workflow, requested_adapter_id)
         agent_ids = [agent.id for agent in workflow.agent_definitions]
         execution_lifecycle = build_execution_lifecycle_metadata(
             trigger=trigger,
@@ -110,6 +129,7 @@ class RuntimeAdapterRegistry:
         )
         execution = Execution(
             workflow_id=workflow_id,
+            goal_id=goal_id,
             runtime_adapter_id=adapter.adapter_name,
             status=ExecutionStatus.CREATED,
             trigger_type=trigger.get("type", "manual"),
@@ -118,12 +138,20 @@ class RuntimeAdapterRegistry:
             created_by=trigger.get("created_by") or trigger.get("run_by"),
             metadata={
                 "trigger": trigger,
-                "requested_adapter": runtime_adapter_id,
+                "goal_id": goal_id,
+                "requested_adapter": requested_adapter_id,
                 "execution_host": resolve_execution_host(trigger, workflow.metadata),
                 "agent_ids": agent_ids,
                 "execution_lifecycle": execution_lifecycle,
             },
         )
+        runtime_policy = resolve_execution_runtime_policy(
+            settings=get_settings(),
+            workflow=workflow,
+            execution=execution,
+            include_workflow_member_maxima=True,
+        )
+        execution.metadata["runtime_policy"] = runtime_policy.model_dump()
         await adapter.prepare_execution(execution)
         return execution
 

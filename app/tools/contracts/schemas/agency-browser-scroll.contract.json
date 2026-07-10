@@ -7,36 +7,107 @@
   "inputs": {
     "type": "object",
     "properties": {
-      "instruction": { "type": ["string", "null"], "description": "Optional element-finding instruction." },
-      "scroll_direction": { "type": "string", "minLength": 1, "description": "Direction to scroll, for example 'scroll down 2 times'." }
+      "instruction": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Optional element-finding instruction."
+      },
+      "scroll_direction": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Direction to scroll, for example 'scroll down 2 times'."
+      }
     },
-    "required": ["scroll_direction"],
+    "required": [
+      "scroll_direction"
+    ],
     "additionalProperties": false
   },
   "outputs": {
     "type": "object",
     "properties": {
-      "verdict": { "type": "string", "enum": ["ok", "warn", "deny"] },
-      "policyVerdict": { "type": ["object", "null"] },
+      "verdict": {
+        "type": "string",
+        "enum": [
+          "ok",
+          "warn",
+          "deny"
+        ]
+      },
+      "policyVerdict": {
+        "type": [
+          "object",
+          "null"
+        ]
+      },
       "result": {
-        "type": ["object", "null"],
+        "type": [
+          "object",
+          "null"
+        ],
         "properties": {
-          "status": { "type": "string", "enum": ["ok", "error"] },
-          "tool": { "type": "string", "const": "agency.browser.scroll" },
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "error"
+            ]
+          },
+          "tool": {
+            "type": "string",
+            "const": "agency.browser.scroll"
+          },
           "output": {},
-          "error": { "type": "string" }
+          "error": {
+            "type": "string"
+          }
         },
         "additionalProperties": true
       },
-      "patch": { "type": ["string", "null"] },
-      "filesChanged": { "type": "array", "items": { "type": "object" } },
-      "errors": { "type": "array", "items": { "type": "string" } },
-      "dryRun": { "type": "boolean" },
-      "timestamp": { "type": "string" },
-      "actor": { "type": ["string", "null"] },
-      "signature": { "type": ["string", "null"] }
+      "patch": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "filesChanged": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      },
+      "errors": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "dryRun": {
+        "type": "boolean"
+      },
+      "timestamp": {
+        "type": "string"
+      },
+      "actor": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "signature": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
     },
-    "required": ["verdict", "dryRun", "timestamp"],
+    "required": [
+      "verdict",
+      "dryRun",
+      "timestamp"
+    ],
     "additionalProperties": false
   }
 }

@@ -1,20 +1,20 @@
+"""Request identity and API-token resolution helpers.
+
+Routes use this module to validate trusted frontend identity headers, bearer
+tokens, required scopes, and disabled-user checks without embedding auth policy
+inside each endpoint.
+"""
+
 from __future__ import annotations
 
+import hashlib
+from datetime import datetime, timezone
 from fastapi import HTTPException, Request, status
 from typing import Iterable
 
 from app.api.context import ApiContext
-from app.domain import UserDefinition
-
-
-LOCAL_SYSTEM_USER = UserDefinition(
-    id="local-user",
-    email="local@agency.local",
-    display_name="Local User",
-    roles=["admin"],
-    provider="local",
-    provider_subject="local-user",
-)
+from app.core.config import get_settings
+from app.domain import ApiTokenDefinition, UserDefinition
 
 
 def require_active_user(user: UserDefinition) -> None:
@@ -29,7 +29,21 @@ def header_value(request: Request, name: str) -> str | None:
 
 
 def require_trusted_identity_source(request: Request) -> None:
-    return None
+    settings = get_settings()
+    configured_key = settings.agency_internal_api_key
+    provided_key = header_value(request, "x-agency-internal-api-key")
+
+    if configured_key:
+        if provided_key != configured_key:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Trusted identity source is required")
+        return
+
+    if settings.app_env == "production":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Trusted identity source is required")
+
+
+def hash_bearer_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def bearer_token(request: Request) -> str | None:
@@ -44,13 +58,147 @@ def bearer_token(request: Request) -> str | None:
 
 def request_has_identity(request: Request) -> bool:
     return bool(
-        header_value(request, "x-agency-user-id")
+        bearer_token(request)
+        or header_value(request, "x-agency-user-id")
         or header_value(request, "x-agency-user-email")
     )
 
 
+def _is_privileged_management_scope(scope: str) -> bool:
+    _, _, action = scope.partition(":")
+    return action in {"write", "run", "admin"}
+
+
+def _record_management_console_action(
+        request: Request,
+        context: ApiContext,
+        user: UserDefinition,
+        required_scopes: Iterable[str] | None,
+        *,
+        identity_mode: str,
+) -> None:
+    client_name = header_value(request, "x-agency-client")
+    if client_name != "agency-fe":
+        return
+    scopes = [scope for scope in (required_scopes or []) if scope]
+    if request.method.upper() in {"GET", "HEAD", "OPTIONS"} and not any(
+            _is_privileged_management_scope(scope) for scope in scopes
+    ):
+        return
+    if getattr(request.state, "management_console_action_logged", False):
+        return
+
+    request.state.management_console_action_logged = True
+    context.runtime_operations.record_action(
+        "management_console.privileged_request",
+        actor_user_id=user.id,
+        actor_user_email=user.email,
+        client=client_name,
+        identity_mode=identity_mode,
+        method=request.method,
+        path=request.url.path,
+        required_scopes=scopes,
+    )
+
+
+def _record_authorization_failure(
+        request: Request,
+        context: ApiContext,
+        *,
+        reason: str,
+        status_code: int,
+        required_scopes: Iterable[str] | None = None,
+        missing_scopes: Iterable[str] | None = None,
+) -> None:
+    context.runtime_operations.record_action(
+        "authorization.failure",
+        reason=reason,
+        status_code=status_code,
+        method=request.method,
+        path=request.url.path,
+        client=header_value(request, "x-agency-client"),
+        required_scopes=[scope for scope in (required_scopes or []) if scope],
+        missing_scopes=[scope for scope in (missing_scopes or []) if scope],
+        has_bearer_token=bool(bearer_token(request)),
+        has_trusted_identity_headers=bool(
+            header_value(request, "x-agency-user-id") or header_value(request, "x-agency-user-email")
+        ),
+    )
+
+
+def is_expired(expires_at: datetime | None) -> bool:
+    if expires_at is None:
+        return False
+    now = datetime.now(timezone.utc)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return expires_at <= now
+
+
+async def resolve_bearer_token_auth(
+        request: Request, context: ApiContext
+) -> tuple[ApiTokenDefinition, UserDefinition] | None:
+    raw_token = bearer_token(request)
+    if raw_token is None or not hasattr(context, "api_token_repo"):
+        return None
+    token = await context.api_token_repo.find_by_hash(hash_bearer_token(raw_token))
+    if token is None or token.revoked_at is not None or is_expired(token.expires_at):
+        _record_authorization_failure(
+            request,
+            context,
+            reason="invalid_or_revoked_api_token",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or revoked API token")
+    user = await context.user_repo.get(token.owner_user_id)
+    if user is None:
+        _record_authorization_failure(
+            request,
+            context,
+            reason="api_token_owner_unavailable",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="API token owner is unavailable")
+    require_active_user(user)
+    used_at = datetime.now(timezone.utc)
+    await context.api_token_repo.update(token.id, {"last_used_at": used_at})
+    context.runtime_operations.record_action(
+        "api_token.used",
+        token_id=token.id,
+        owner_user_id=token.owner_user_id,
+        scopes=token.scopes,
+        prefix=token.prefix,
+        last4=token.last4,
+        path=request.url.path,
+        method=request.method,
+        used_at=used_at.isoformat(),
+    )
+    return token, user
+
+
+def _require_token_scopes(token: ApiTokenDefinition, required_scopes: Iterable[str]) -> None:
+    required = {scope.strip() for scope in required_scopes if scope.strip()}
+    if not required:
+        return
+    granted = set(token.scopes)
+    if not required.issubset(granted):
+        missing = sorted(required.difference(granted))
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "message": "API token does not grant the required scopes.",
+                "missingScopes": missing,
+                "grantedScopes": sorted(granted),
+            },
+        )
+
+
 async def resolve_user_from_bearer_token(request: Request, context: ApiContext) -> UserDefinition | None:
-    return None
+    resolved = await resolve_bearer_token_auth(request, context)
+    if resolved is None:
+        return None
+    _, user = resolved
+    return user
 
 
 async def resolve_current_user(
@@ -58,20 +206,98 @@ async def resolve_current_user(
         context: ApiContext,
         required_scopes: Iterable[str] | None = None,
 ) -> UserDefinition:
-    user_id = header_value(request, "x-agency-user-id")
-    email = header_value(request, "x-agency-user-email")
+    has_trusted_identity_headers = bool(
+        header_value(request, "x-agency-user-id") or header_value(request, "x-agency-user-email")
+    )
 
-    if user_id or email:
-        return UserDefinition(
-            id=user_id or email or LOCAL_SYSTEM_USER.id,
-            email=email or f"{user_id}@agency.local",
-            display_name=header_value(request, "x-agency-user-name"),
-            roles=["admin"],
-            provider=header_value(request, "x-agency-auth-provider") or "local",
-            provider_subject=header_value(request, "x-agency-provider-subject") or user_id,
-            provider_account_id=header_value(request, "x-agency-provider-account-id") or email,
+    try:
+        bearer_auth = await resolve_bearer_token_auth(request, context)
+    except HTTPException as exc:
+        if exc.status_code != status.HTTP_401_UNAUTHORIZED or not has_trusted_identity_headers:
+            raise
+        bearer_auth = None
+
+    if bearer_auth is not None:
+        token, bearer_user = bearer_auth
+        if required_scopes is not None:
+            try:
+                _require_token_scopes(token, required_scopes)
+            except HTTPException as exc:
+                detail = exc.detail if isinstance(exc.detail, dict) else {}
+                _record_authorization_failure(
+                    request,
+                    context,
+                    reason="api_token_scope_missing",
+                    status_code=exc.status_code,
+                    required_scopes=required_scopes,
+                    missing_scopes=detail.get("missingScopes", []),
+                )
+                raise
+        _record_management_console_action(
+            request,
+            context,
+            bearer_user,
+            required_scopes,
+            identity_mode="bearer_token",
         )
-    return LOCAL_SYSTEM_USER
+        return bearer_user
+
+    try:
+        require_trusted_identity_source(request)
+    except HTTPException as exc:
+        _record_authorization_failure(
+            request,
+            context,
+            reason="trusted_identity_source_required",
+            status_code=exc.status_code,
+            required_scopes=required_scopes,
+        )
+        raise
+
+    user_id = header_value(request, "x-agency-user-id")
+    if user_id:
+        user = await context.user_repo.get(user_id)
+        if user is not None:
+            require_active_user(user)
+            _record_management_console_action(
+                request,
+                context,
+                user,
+                required_scopes,
+                identity_mode="trusted_identity_headers",
+            )
+            return user
+
+    email = header_value(request, "x-agency-user-email")
+    if email:
+        user = await context.user_repo.find_by_email(email)
+        if user is not None:
+            require_active_user(user)
+            _record_management_console_action(
+                request,
+                context,
+                user,
+                required_scopes,
+                identity_mode="trusted_identity_headers",
+            )
+            return user
+        _record_authorization_failure(
+            request,
+            context,
+            reason="current_user_not_synced",
+            status_code=status.HTTP_404_NOT_FOUND,
+            required_scopes=required_scopes,
+        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Current user has not been synced")
+
+    _record_authorization_failure(
+        request,
+        context,
+        reason="current_user_identity_required",
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        required_scopes=required_scopes,
+    )
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Current user identity is required")
 
 
 async def resolve_current_user_if_present(
@@ -79,4 +305,13 @@ async def resolve_current_user_if_present(
         context: ApiContext,
         required_scopes: Iterable[str] | None = None,
 ) -> UserDefinition | None:
-    return await resolve_current_user(request, context, required_scopes=required_scopes)
+    if not request_has_identity(request):
+        return None
+    try:
+        return await resolve_current_user(request, context, required_scopes=required_scopes)
+    except HTTPException as exc:
+        # Optional-auth routes should remain usable when callers attach a non-Agency
+        # bearer token (for example, an upstream app session token).
+        if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+            return None
+        raise

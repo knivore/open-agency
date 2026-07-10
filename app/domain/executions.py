@@ -1,3 +1,5 @@
+"""Domain contracts for executions and persisted execution artifacts."""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -40,6 +42,7 @@ class ExecutionArtifact(DomainModel):
 class Execution(DomainModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     workflow_id: str
+    goal_id: Optional[str] = None
     workflow_version_id: Optional[str] = None
     runtime_adapter_id: str = Field(alias="runtime_adapter")
     runtime_revision_id: Optional[str] = None

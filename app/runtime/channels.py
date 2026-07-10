@@ -1,3 +1,5 @@
+"""Redis-or-in-memory channel helpers for worker and human-input messaging."""
+
 from __future__ import annotations
 
 import asyncio

@@ -7,14 +7,16 @@ import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from openpyxl import Workbook, load_workbook
 
-from app.cli import main
+from app.cli import _print_json, main
 from app.core.config import reset_settings_cache
-from app.tools.runtime import JsonlToolRunStore
+from app.tools.cli_discovery import list_builtin_tool_definitions
+from app.tools.runtime.store import JsonlToolRunStore
 
 
 README_PATCH = """diff --git a/README.md b/README.md
@@ -45,11 +47,21 @@ class ToolDiscoveryCliTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         payload = json.loads(stdout.getvalue())
-        self.assertEqual(payload["count"], 35)
+        self.assertEqual(payload["count"], len(list_builtin_tool_definitions()))
         tool_ids = {item["id"] for item in payload["items"]}
-        self.assertIn("agency.audio.transcribe", tool_ids)
+        self.assertIn("agency.speech.listen", tool_ids)
+        self.assertIn("agency.speech.speak", tool_ids)
+        self.assertIn("agency.speech.continue", tool_ids)
         self.assertIn("agency.browser.open", tool_ids)
         self.assertIn("agency.command.run", tool_ids)
+
+    def test_print_json_serializes_datetime_values(self) -> None:
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            _print_json({"last_projected_at": datetime(2026, 5, 25, 1, 2, 3, tzinfo=timezone.utc)})
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["last_projected_at"], "2026-05-25T01:02:03+00:00")
 
     def test_tool_describe_accepts_command_alias(self) -> None:
         stdout = io.StringIO()
@@ -236,8 +248,8 @@ class ToolDiscoveryCliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             response = json.loads(stdout.getvalue())
             self.assertEqual(response["verdict"], "ok")
-            self.assertEqual(response["result"]["count"], 35)
-            self.assertIn("agency.audio.transcribe", {item["id"] for item in response["result"]["items"]})
+            self.assertEqual(response["result"]["count"], len(list_builtin_tool_definitions()))
+            self.assertIn("agency.speech.listen", {item["id"] for item in response["result"]["items"]})
             self.assertIn("agency.tool.list", {item["id"] for item in response["result"]["items"]})
 
     def test_tool_run_executes_contract_backed_tool_get(self) -> None:

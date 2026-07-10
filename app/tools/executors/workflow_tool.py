@@ -4,11 +4,25 @@ import json
 
 from app.domain import ToolDefinition, ToolType
 from app.runtime.native.errors import ToolExecutionError
+from app.runtime.native.state import (
+    add_graph_working_set_items,
+    create_graph_working_set,
+    prune_expired_graph_working_sets,
+    remove_graph_working_set_items,
+)
 from app.services.agent_tools import (
     SYSTEM_EXECUTION_ARTIFACTS_TOOL_ID,
     SYSTEM_EXECUTION_EVENTS_TOOL_ID,
     SYSTEM_EXECUTION_GET_TOOL_ID,
+    SYSTEM_EXECUTION_LIST_TOOL_ID,
     SYSTEM_EXECUTION_TOOL_TARGET,
+    SYSTEM_GRAPH_TOOL_TARGET,
+    SYSTEM_GRAPH_WORKING_SET_ADD_TOOL_ID,
+    SYSTEM_GRAPH_WORKING_SET_CLEAR_TOOL_ID,
+    SYSTEM_GRAPH_WORKING_SET_CREATE_TOOL_ID,
+    SYSTEM_GRAPH_WORKING_SET_PERSIST_CONTEXT_PACK_TOOL_ID,
+    SYSTEM_GRAPH_WORKING_SET_REMOVE_TOOL_ID,
+    SYSTEM_GRAPH_WORKING_SET_SUMMARIZE_TOOL_ID,
     SYSTEM_WORKFLOW_GET_TOOL_ID,
     SYSTEM_WORKFLOW_LIST_TOOL_ID,
     SYSTEM_WORKFLOW_PROPOSE_CREATE_TOOL_ID,
@@ -18,6 +32,15 @@ from app.services.agent_tools import (
 )
 from .base import ToolExecutionContext
 
+_GRAPH_WORKING_SET_TOOL_IDS = {
+    SYSTEM_GRAPH_WORKING_SET_CREATE_TOOL_ID,
+    SYSTEM_GRAPH_WORKING_SET_ADD_TOOL_ID,
+    SYSTEM_GRAPH_WORKING_SET_REMOVE_TOOL_ID,
+    SYSTEM_GRAPH_WORKING_SET_SUMMARIZE_TOOL_ID,
+    SYSTEM_GRAPH_WORKING_SET_CLEAR_TOOL_ID,
+    SYSTEM_GRAPH_WORKING_SET_PERSIST_CONTEXT_PACK_TOOL_ID,
+}
+
 
 class WorkflowToolExecutor:
     tool_type = ToolType.WORKFLOW_TOOL
@@ -26,6 +49,7 @@ class WorkflowToolExecutor:
     async def aexecute(self, tool: ToolDefinition, arguments: dict[str, object], context: ToolExecutionContext) -> dict[
         str, object]:
         if tool.implementation.target == SYSTEM_EXECUTION_TOOL_TARGET or tool.id in {
+            SYSTEM_EXECUTION_LIST_TOOL_ID,
             SYSTEM_EXECUTION_GET_TOOL_ID,
             SYSTEM_EXECUTION_EVENTS_TOOL_ID,
             SYSTEM_EXECUTION_ARTIFACTS_TOOL_ID,
@@ -39,6 +63,8 @@ class WorkflowToolExecutor:
             SYSTEM_WORKFLOW_PROPOSE_UPDATE_TOOL_ID,
         }:
             return await self._execute_system_workflow_tool(tool, arguments, context)
+        if tool.implementation.target == SYSTEM_GRAPH_TOOL_TARGET and tool.id in _GRAPH_WORKING_SET_TOOL_IDS:
+            return await self._execute_graph_working_set_tool(tool, arguments, context)
         if context.runtime_registry is None:
             raise ToolExecutionError(f"Workflow tool '{tool.id}' cannot execute without a runtime registry")
         workflow_id = arguments.get("workflow_id") or tool.implementation.config.get(
@@ -55,6 +81,79 @@ class WorkflowToolExecutor:
             "output": result.output_payload,
             "error": result.error,
         }
+
+    async def _execute_graph_working_set_tool(
+            self,
+            tool: ToolDefinition,
+            arguments: dict[str, object],
+            context: ToolExecutionContext,
+    ) -> dict[str, object]:
+        state, error = await _graph_working_set_state(arguments, context)
+        if error:
+            return {"status": "error", "error": error}
+        if tool.id == SYSTEM_GRAPH_WORKING_SET_CREATE_TOOL_ID:
+            working_set = create_graph_working_set(
+                state,
+                working_set_id=_optional_string(arguments.get("working_set_id")),
+                owner_agent_id=_optional_string(arguments.get("owner_agent_id")) or context.agent_id,
+                conversation_id=_optional_string(arguments.get("conversation_id")),
+                workflow_id=_optional_string(arguments.get("workflow_id")) or context.workflow_id or state.workflow_id,
+                run_id=_optional_string(arguments.get("run_id")) or context.execution_id,
+                execution_id=_optional_string(arguments.get("execution_id")) or context.execution_id,
+                anchors=_dict_list(arguments.get("anchors")),
+                notes=_dict_list(arguments.get("notes")),
+                ttl_seconds=_bounded_int(arguments.get("ttl_seconds") or 21600, minimum=60, maximum=86400),
+            )
+            return {"status": "ok", "working_set": working_set.to_dict()}
+        working_set_id = str(arguments.get("working_set_id") or "")
+        working_set = state.graph_working_sets.get(working_set_id)
+        if working_set is None:
+            return {"status": "error", "error": f"Graph working set '{working_set_id}' was not found."}
+        if tool.id == SYSTEM_GRAPH_WORKING_SET_ADD_TOOL_ID:
+            add_graph_working_set_items(
+                working_set,
+                anchors=_dict_list(arguments.get("anchors")),
+                visited_nodes=_dict_list(arguments.get("visited_nodes")),
+                selected_nodes=_dict_list(arguments.get("selected_nodes")),
+                notes=_dict_list(arguments.get("notes")),
+                ttl_seconds=_bounded_int(arguments.get("ttl_seconds") or 21600, minimum=60, maximum=86400),
+            )
+            return {"status": "ok", "working_set": working_set.to_dict()}
+        if tool.id == SYSTEM_GRAPH_WORKING_SET_REMOVE_TOOL_ID:
+            remove_graph_working_set_items(
+                working_set,
+                anchor_ids=_string_list(arguments.get("anchor_ids")),
+                visited_node_ids=_string_list(arguments.get("visited_node_ids")),
+                selected_node_ids=_string_list(arguments.get("selected_node_ids")),
+                clear_notes=bool(arguments.get("clear_notes") is True),
+                ttl_seconds=_bounded_int(arguments.get("ttl_seconds") or 21600, minimum=60, maximum=86400),
+            )
+            return {"status": "ok", "working_set": working_set.to_dict()}
+        if tool.id == SYSTEM_GRAPH_WORKING_SET_SUMMARIZE_TOOL_ID:
+            return {
+                "status": "ok",
+                "summary": (
+                    f"Graph working set {working_set.working_set_id}: {len(working_set.anchors)} anchors, "
+                    f"{len(working_set.visited_nodes)} visited nodes, "
+                    f"{len(working_set.selected_nodes)} selected nodes, {len(working_set.notes)} notes."
+                ),
+                "working_set": working_set.to_dict(),
+                "counts": {
+                    "anchors": len(working_set.anchors),
+                    "visited_nodes": len(working_set.visited_nodes),
+                    "selected_nodes": len(working_set.selected_nodes),
+                    "notes": len(working_set.notes),
+                },
+            }
+        if tool.id == SYSTEM_GRAPH_WORKING_SET_CLEAR_TOOL_ID:
+            removed = state.graph_working_sets.pop(working_set_id, None)
+            return {"status": "ok", "working_set_id": working_set_id, "cleared": removed is not None}
+        if tool.id == SYSTEM_GRAPH_WORKING_SET_PERSIST_CONTEXT_PACK_TOOL_ID:
+            return {
+                "status": "requires_api_context",
+                "error": f"{tool.id} requires ApiContext-backed ToolRuntimeExecutor to write durable memory.",
+            }
+        return {"status": "error", "error": f"Unknown graph working set tool '{tool.id}'."}
 
     async def _execute_system_workflow_tool(
             self,
@@ -110,6 +209,41 @@ class WorkflowToolExecutor:
     ) -> dict[str, object]:
         if context.execution_store is None:
             raise ToolExecutionError(f"Execution inspection tool '{tool.id}' cannot execute without an execution store")
+        if tool.id == SYSTEM_EXECUTION_LIST_TOOL_ID:
+            workflow_id = _optional_string(arguments.get("workflow_id"))
+            agent_id = _optional_string(arguments.get("agent_id"))
+            active_only = bool(arguments.get("active_only"))
+            statuses = {
+                item.strip().lower()
+                for item in arguments.get("status", [])
+                if isinstance(item, str) and item.strip()
+            } if isinstance(arguments.get("status"), list) else set()
+            limit = _bounded_int(arguments.get("limit") or 20, minimum=1, maximum=200)
+
+            if workflow_id:
+                executions = await context.execution_store.list_executions_by_workflow(workflow_id)
+            elif agent_id:
+                executions = await context.execution_store.list_executions_by_agent(agent_id)
+            elif active_only:
+                executions = await context.execution_store.list_active_executions()
+            else:
+                executions = await context.execution_store.list_executions()
+
+            if statuses:
+                executions = [execution for execution in executions if execution.status.value.lower() in statuses]
+            executions = sorted(executions, key=lambda execution: execution.created_at, reverse=True)[:limit]
+            return {
+                "status": "ok",
+                "items": [execution.model_dump(mode="json") for execution in executions],
+                "count": len(executions),
+                "filters": {
+                    "workflow_id": workflow_id,
+                    "agent_id": agent_id,
+                    "status": sorted(statuses),
+                    "active_only": active_only,
+                    "limit": limit,
+                },
+            }
         execution_id = str(arguments.get("execution_id") or "")
         if not execution_id:
             return {"status": "error", "error": "execution_id is required."}
@@ -159,7 +293,51 @@ class WorkflowToolExecutor:
         return {"status": "error", "error": f"Unknown execution inspection tool '{tool.id}'."}
 
 
-def _artifact_payload(payload: dict[str, object], *, include_content: bool, max_content_chars: int) -> dict[str, object]:
+async def _graph_working_set_state(arguments: dict[str, object], context: ToolExecutionContext):
+    if context.runtime_registry is None:
+        return None, "Runtime registry is unavailable."
+    execution_id = _optional_string(arguments.get("execution_id")) or context.execution_id
+    if not execution_id:
+        return None, "execution_id is required."
+    try:
+        snapshot = await context.runtime_registry.get_execution_state(execution_id)
+    except Exception as exc:
+        return None, str(exc)
+    state = getattr(snapshot, "state", None)
+    if state is None:
+        return None, f"Execution '{execution_id}' has no active native runtime state."
+    prune_expired_graph_working_sets(state)
+    return state, None
+
+
+def _optional_string(value: object) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+
+def _dict_list(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]
+
+
+def _bounded_int(value: object, *, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = minimum
+    return max(min(parsed, maximum), minimum)
+
+
+def _artifact_payload(payload: dict[str, object], *, include_content: bool, max_content_chars: int) -> dict[
+    str, object]:
     if not include_content:
         payload.pop("content_json", None)
         payload.pop("content_text", None)

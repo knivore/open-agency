@@ -50,6 +50,7 @@ Properties:
 - full control-plane support for pause, resume, and cancel
 - canonical execution events emitted directly by the native runtime
 - the only adapter currently supported for isolated container-hosted execution
+- supports runtime Agency Graph context retrieval and graph working-set state when graph context is enabled
 
 ## CrewAI Adapter
 
@@ -88,5 +89,13 @@ Current behavior:
 - `resume_execution`: unsupported
 - `cancel_execution`: unsupported
 - isolated container-hosted execution: unsupported
+- automatic Agency Graph runtime-context retrieval: unsupported
 
 Unsupported operations raise clear adapter errors rather than pretending the framework supports them.
+
+## Agency Graph Context Boundary
+
+Agency Graph context is a native-runtime capability. The graph context tools are app-owned tool contracts, so any adapter
+can expose them as ordinary read-only tools when the tool is assigned to an agent. Automatic runtime retrieval, loop
+guards, graph working sets, and graph-context prompt injection live in `app/runtime/native/` and are not implemented by
+the CrewAI compatibility adapter.

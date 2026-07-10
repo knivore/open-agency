@@ -9,12 +9,13 @@ from unittest.mock import patch
 from app.core.config import reset_settings_cache
 from app.db.models import Base
 from app.db.repositories.domain_sql import (
+    SQLAgentRepository,
     SQLConversationApprovalRequestRepository,
     SQLConversationMessageRepository,
     SQLConversationRepository,
 )
 from app.db.session import get_async_engine, get_session_maker, reset_session_state
-from app.domain import ApprovalRequest, ApprovalTargetType, ApprovalType, Conversation, ConversationMessage
+from app.domain import AgentDefinition, ApprovalRequest, ApprovalTargetType, ApprovalType, Conversation, ConversationMessage
 
 
 class ConversationRepositoriesTests(unittest.IsolatedAsyncioTestCase):
@@ -114,6 +115,45 @@ class ConversationRepositoriesTests(unittest.IsolatedAsyncioTestCase):
         )
         assert approved is not None
         self.assertEqual(approved.status.value, "approved")
+
+    async def test_agent_metadata_round_trips(self) -> None:
+        agent_repo = SQLAgentRepository(self.session_factory)
+
+        created = await agent_repo.create(
+            AgentDefinition(
+                id="agent-metadata",
+                name="Metadata Agent",
+                description="Tracks provenance.",
+                instructions="Answer briefly.",
+                metadata={
+                    "enabled": True,
+                    "provenance": {
+                        "source": "test",
+                        "approval_request_id": "approval-1",
+                    },
+                },
+            )
+        )
+        self.assertEqual(created.metadata["provenance"]["approval_request_id"], "approval-1")
+
+        loaded = await agent_repo.get("agent-metadata")
+        assert loaded is not None
+        self.assertTrue(loaded.metadata["enabled"])
+        self.assertEqual(loaded.metadata["provenance"]["source"], "test")
+
+        updated = await agent_repo.update(
+            "agent-metadata",
+            {"metadata": {"provenance": {"source": "updated"}, "owner": "qa"}},
+        )
+        assert updated is not None
+        self.assertEqual(updated.metadata["owner"], "qa")
+        self.assertEqual(updated.metadata["provenance"]["source"], "updated")
+
+        await agent_repo.soft_delete("agent-metadata")
+        deleted = await agent_repo.get("agent-metadata", include_deleted=True)
+        assert deleted is not None
+        self.assertFalse(deleted.metadata["enabled"])
+        self.assertEqual(deleted.metadata["owner"], "qa")
 
 
 if __name__ == "__main__":

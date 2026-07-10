@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime
 
 from app.core.time import utc_now
 from app.domain import Execution, ExecutionStatus

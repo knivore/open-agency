@@ -6,8 +6,7 @@ from typing import Any
 from app.api.context import ApiContext
 from app.core.time import utc_now
 from app.domain import Execution, ExecutionEvent, ExecutionEventType, ExecutionStatus
-from app.observability import get_default_event_bus
-
+from app.observability.event_bus import get_default_event_bus
 
 CONVERSATION_AUDIT_WORKFLOW_ID = "conversation-main-agent"
 CONVERSATION_AUDIT_RUNTIME_ADAPTER_ID = "conversation"
@@ -18,17 +17,17 @@ class ConversationAuditService:
     context: ApiContext
 
     async def emit(
-        self,
-        *,
-        conversation_id: str,
-        event_type: ExecutionEventType,
-        payload: dict[str, Any] | None = None,
-        metadata: dict[str, Any] | None = None,
-        metrics: dict[str, Any] | None = None,
-        actor: str | None = None,
-        agent_id: str | None = None,
-        tool_call_id: str | None = None,
-        model_request_id: str | None = None,
+            self,
+            *,
+            conversation_id: str,
+            event_type: ExecutionEventType,
+            payload: dict[str, Any] | None = None,
+            metadata: dict[str, Any] | None = None,
+            metrics: dict[str, Any] | None = None,
+            actor: str | None = None,
+            agent_id: str | None = None,
+            tool_call_id: str | None = None,
+            model_request_id: str | None = None,
     ) -> ExecutionEvent:
         execution_id = self.audit_execution_id(conversation_id)
         await self._ensure_execution(conversation_id=conversation_id, execution_id=execution_id)

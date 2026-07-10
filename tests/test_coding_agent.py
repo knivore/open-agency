@@ -15,6 +15,8 @@ from app.coding_agent.workspaces import BACKEND_WORKSPACE, WorkspaceResolutionEr
 
 class CodingAgentWorkspaceTests(unittest.TestCase):
     def test_resolve_workspace_accepts_backend_alias_and_exact_path(self) -> None:
+        self.assertEqual(resolve_workspace("open-agency"), BACKEND_WORKSPACE)
+        # Legacy aliases remain accepted for copied workflow definitions.
         self.assertEqual(resolve_workspace("agency"), BACKEND_WORKSPACE)
         self.assertEqual(resolve_workspace(str(BACKEND_WORKSPACE)), BACKEND_WORKSPACE)
 
@@ -44,7 +46,7 @@ class CodingAgentRunnerTests(unittest.TestCase):
             job = create_coding_job(
                 title="Add feature",
                 description="Implement a small feature.",
-                workspace="agency",
+                workspace="open-agency",
                 requested_by="user-1",
                 original_request="Please add the feature.",
                 job_root=temp_dir,
@@ -67,7 +69,7 @@ class CodingAgentRunnerTests(unittest.TestCase):
             with patch("app.coding_agent.codex_runner.shutil.which", return_value="/usr/local/bin/codex"), patch(
                 "app.coding_agent.codex_runner.subprocess.run", return_value=completed
             ) as run:
-                result = run_codex_job("agency", task, timeout_seconds=60)
+                result = run_codex_job("open-agency", task, timeout_seconds=60)
 
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "done")
@@ -79,13 +81,13 @@ class CodingAgentRunnerTests(unittest.TestCase):
 
 class CodingAgentGitAndTestRunnerTests(unittest.TestCase):
     def test_git_status_and_diff_are_read_only(self) -> None:
-        self.assertIsInstance(get_git_status("agency"), str)
-        self.assertIsInstance(get_git_diff("agency"), str)
+        self.assertIsInstance(get_git_status("open-agency"), str)
+        self.assertIsInstance(get_git_diff("open-agency"), str)
         with self.assertRaises(Exception):
-            run_git("agency", ["push"])
+            run_git("open-agency", ["push"])
 
     def test_run_command_uses_argument_list(self) -> None:
-        output = run_command("agency", ["git", "status", "--short"], timeout_seconds=120)
+        output = run_command("open-agency", ["git", "status", "--short"], timeout_seconds=120)
         self.assertIsInstance(output, str)
 
 

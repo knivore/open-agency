@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from app.tools.contracts.models import PolicyRuleResult, PolicyVerdict
-from app.tools.policies.rules import _path_blocked
+from app.tools.policies.paths import path_blocked
 
 DENY_CONTENT_PATTERNS = (
     re.compile(r"OPENAI_API_KEY\s*=", re.IGNORECASE),
@@ -65,7 +65,8 @@ def evaluate_spreadsheet_write_policy(
     rules: list[PolicyRuleResult] = []
     excel_path = _resolve_absolute_path(str(payload.get("excel_file_path") or ""))
     if excel_path is None:
-        rules.append(PolicyRuleResult(id="spreadsheet-workbook-required", outcome="deny", reason="excel_file_path is required"))
+        rules.append(
+            PolicyRuleResult(id="spreadsheet-workbook-required", outcome="deny", reason="excel_file_path is required"))
     else:
         rules.append(PolicyRuleResult(id="spreadsheet-workbook-required", outcome="ok"))
     rules.extend(_allowed_path(excel_path, allowed_dirs, rule_id="spreadsheet-workbook-allowlist"))
@@ -73,13 +74,15 @@ def evaluate_spreadsheet_write_policy(
     for key in source_path_keys:
         source_path = _resolve_absolute_path(str(payload.get(key) or ""))
         if source_path is None:
-            rules.append(PolicyRuleResult(id=f"spreadsheet-source-required:{key}", outcome="deny", reason=f"{key} is required"))
+            rules.append(
+                PolicyRuleResult(id=f"spreadsheet-source-required:{key}", outcome="deny", reason=f"{key} is required"))
         else:
             rules.append(PolicyRuleResult(id=f"spreadsheet-source-required:{key}", outcome="ok"))
         rules.extend(_allowed_path(source_path, allowed_dirs, rule_id=f"spreadsheet-source-allowlist:{key}"))
 
     if actor and actor.startswith("approved/"):
-        rules.append(PolicyRuleResult(id="spreadsheet-write-approval-context", outcome="ok", reason="actor is approved"))
+        rules.append(
+            PolicyRuleResult(id="spreadsheet-write-approval-context", outcome="ok", reason="actor is approved"))
     else:
         rules.append(
             PolicyRuleResult(
@@ -100,7 +103,7 @@ def evaluate_markdown_to_word_policy(payload: dict[str, Any], *, actor: str | No
 
     if not filename:
         rules.append(PolicyRuleResult(id="document-filename-required", outcome="deny", reason="filename is required"))
-    elif "/" in filename or "\\" in filename or _path_blocked(filename):
+    elif "/" in filename or "\\" in filename or path_blocked(filename, include_edit_only=True):
         rules.append(
             PolicyRuleResult(
                 id="document-filename-safe",
@@ -121,7 +124,8 @@ def evaluate_markdown_to_word_policy(payload: dict[str, Any], *, actor: str | No
 
     if not img_directory:
         rules.append(
-            PolicyRuleResult(id="document-artifact-directory-required", outcome="deny", reason="img_directory is required")
+            PolicyRuleResult(id="document-artifact-directory-required", outcome="deny",
+                             reason="img_directory is required")
         )
     elif ".." in img_directory.replace("\\", "/").split("/"):
         rules.append(
@@ -200,7 +204,7 @@ def _resolve_absolute_path(path: str) -> Path | None:
 
 
 def _dangerous_file_path(filename: str) -> list[PolicyRuleResult]:
-    if filename and _path_blocked(filename):
+    if filename and path_blocked(filename, include_edit_only=True):
         return [PolicyRuleResult(id="file-write-safe-path", outcome="deny", reason=f"blocked path: {filename}")]
     return [PolicyRuleResult(id="file-write-safe-path", outcome="ok")]
 

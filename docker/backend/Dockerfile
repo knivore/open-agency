@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-ARG CODEX_CLI_VERSION=0.130.0
+ARG CODEX_CLI_VERSION=0.144.1
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -14,6 +14,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
+        espeak-ng \
         fonts-liberation \
         fonts-unifont \
         gcc \

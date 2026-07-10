@@ -1,3 +1,5 @@
+"""Exit codes and heartbeat constants shared by runtime workers and control plane."""
+
 from __future__ import annotations
 
 WORKER_EXIT_SUCCESS = 0

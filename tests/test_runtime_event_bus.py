@@ -3,15 +3,14 @@ from __future__ import annotations
 import asyncio
 import unittest
 
-from app.runtime.streaming import (
+from app.runtime.streaming.event_bus import (
     DEFAULT_RUNTIME_EVENT_QUEUE_SIZE,
     RuntimeEventBus,
-    RuntimeEventPublisher,
-    RuntimeEventType,
-    RuntimeStreamEvent,
     get_default_runtime_event_bus,
     set_default_runtime_event_bus,
 )
+from app.runtime.streaming.runtime_event_models import RuntimeEventType, RuntimeStreamEvent
+from app.runtime.streaming.runtime_event_publisher import RuntimeEventPublisher
 
 
 class FailingQueue(asyncio.Queue[RuntimeStreamEvent]):

@@ -1,8 +1,10 @@
+"""Domain contracts for workflows, tasks, nodes, edges, and runtime adapters."""
+
 from __future__ import annotations
 
 from enum import Enum
 from pydantic import AliasChoices, Field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from uuid import uuid4
 
 from .agents import AgentDefinition, FrameworkHints
@@ -56,6 +58,11 @@ class TaskDefinition(DomainModel):
     input_schema: Dict[str, Any] = Field(default_factory=dict)
     output_schema: Dict[str, Any] = Field(default_factory=dict)
     human_approval_required: bool = False
+    timeout_seconds: Optional[int] = Field(default=None, gt=0)
+    max_retries: Optional[int] = Field(default=None, ge=0)
+    model_profile_id: Optional[str] = None
+    max_tokens: Optional[int] = Field(default=None, gt=0)
+    approval_policy: Optional[Literal["none", "required", "on_failure"]] = None
     framework_hints: FrameworkHints = Field(default_factory=FrameworkHints)
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
@@ -100,6 +107,10 @@ class WorkflowDefinition(DomainModel):
         validation_alias=AliasChoices("default_runtime_adapter_id", "default_runtime_adapter"),
         serialization_alias="default_runtime_adapter_id",
     )
+    max_runtime_seconds: Optional[int] = Field(default=None, gt=0)
+    max_retries: Optional[int] = Field(default=None, ge=0)
+    concurrency_limit: Optional[int] = Field(default=None, gt=0)
+    approval_mode: Optional[Literal["task_policy", "before_run", "all_tasks"]] = None
     versioning: VersionDefinition = Field(default_factory=VersionDefinition)
     framework_hints: FrameworkHints = Field(default_factory=FrameworkHints)
     metadata: Dict[str, Any] = Field(default_factory=dict)

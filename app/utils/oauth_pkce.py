@@ -1,23 +1,40 @@
+import asyncio
 import base64
+import certifi
 import hashlib
 import httpx
 import json
+import os
 import secrets
 import threading
 import time
 import urllib.parse
 import uvicorn
 import webbrowser
-import asyncio
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 OPENAI_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 OPENAI_CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback"
 OPENAI_CODEX_SCOPE = "openid profile email offline_access"
 LEGACY_OPENAI_CODEX_CLIENT_IDS = {"app_EMoaD9zS2S", "DEFAULT_CLIENT_ID", ""}
 LEGACY_OPENAI_CODEX_REDIRECT_URIS = {"http://127.0.0.1:1455/auth/callback"}
+
+
+def _missing_ca_bundle_env_var() -> Optional[str]:
+    for name in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        value = os.environ.get(name)
+        if value and not os.path.exists(value):
+            return name
+    return None
+
+
+def _oauth_async_client(**kwargs: Any) -> httpx.AsyncClient:
+    """Create an OAuth HTTP client resilient to stale local CA env vars."""
+    if "verify" not in kwargs and _missing_ca_bundle_env_var():
+        kwargs["verify"] = certifi.where()
+    return httpx.AsyncClient(**kwargs)
 
 
 class OAuthPKCEHandler:
@@ -60,7 +77,7 @@ class OAuthPKCEHandler:
             cid = cid_normalized or OPENAI_CODEX_CLIENT_ID
             if redirect_uri in LEGACY_OPENAI_CODEX_REDIRECT_URIS:
                 redirect_uri = None
-            
+
             # Use the provided redirect_uri. We no longer force a fallback to openclaw.org
             # because the user wants to control their own redirection destination.
             # If the user provides "localhost", we respect it.
@@ -148,10 +165,10 @@ class OAuthPKCEHandler:
             return None
 
         for key in (
-            "accountId",
-            "account_id",
-            "https://api.openai.com/account_id",
-            "https://api.openai.com/accountId",
+                "accountId",
+                "account_id",
+                "https://api.openai.com/account_id",
+                "https://api.openai.com/accountId",
         ):
             value = claims.get(key)
             if isinstance(value, str) and value:
@@ -173,7 +190,7 @@ class OAuthPKCEHandler:
             "redirect_uri": self.redirect_uri,
         }
 
-        async with httpx.AsyncClient() as client:
+        async with _oauth_async_client() as client:
             response = await client.post(self.token_url, data=payload)
             response.raise_for_status()
             return response.json()
@@ -185,7 +202,7 @@ class OAuthPKCEHandler:
             "refresh_token": refresh_token,
         }
 
-        async with httpx.AsyncClient() as client:
+        async with _oauth_async_client() as client:
             response = await client.post(self.token_url, data=payload)
             response.raise_for_status()
             return response.json()
@@ -203,7 +220,7 @@ class OAuthPKCEHandler:
         else:
             device_code_path = "/oauth/device/code"
         device_code_url = urllib.parse.urlunparse(parsed._replace(path=device_code_path, query=""))
-        async with httpx.AsyncClient() as client:
+        async with _oauth_async_client() as client:
             response = await client.post(device_code_url, data=payload)
             response.raise_for_status()
             return response.json()
@@ -215,7 +232,7 @@ class OAuthPKCEHandler:
             "client_id": self.client_id,
             "device_code": device_code,
         }
-        async with httpx.AsyncClient() as client:
+        async with _oauth_async_client() as client:
             while True:
                 response = await client.post(self.token_url, data=payload)
                 data = response.json()
@@ -239,24 +256,47 @@ class OAuthPKCEHandler:
         async def callback(request: Request):
             code = request.query_params.get("code")
             state = request.query_params.get("state")
-            
+
             if state and state != self.state:
-                return HTMLResponse(content="<h1>Authorization failed!</h1><p>Invalid state parameter.</p>", status_code=400)
+                self._stop_event.set()
+                server.should_exit = True
+                return HTMLResponse(content="<h1>Authorization failed!</h1><p>Invalid state parameter.</p>",
+                                    status_code=400)
 
             if code:
                 self.authorization_code = code
                 self._stop_event.set()
+                server.should_exit = True
                 return HTMLResponse(content="""
                     <html>
+                        <head>
+                            <script>
+                                (function () {
+                                    var message = {
+                                        type: "agency-oauth-callback",
+                                        redirectUrl: window.location.href
+                                    };
+                                    if (window.opener && !window.opener.closed) {
+                                        window.opener.postMessage(message, "*");
+                                        window.setTimeout(function () {
+                                            window.close();
+                                        }, 750);
+                                    }
+                                }());
+                            </script>
+                        </head>
                         <body style="font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #f9fafb;">
                             <div style="background: white; padding: 2rem; border-radius: 0.5rem; box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1); text-align: center;">
                                 <h1 style="color: #059669;">Authorization Successful!</h1>
-                                <p>You can close this tab and return to the Agency app.</p>
+                                <p>Returning to the Agency app...</p>
                             </div>
                         </body>
                     </html>
                 """)
+            self._stop_event.set()
+            server.should_exit = True
             return HTMLResponse(content="<h1>Authorization failed!</h1><p>No code received.</p>", status_code=400)
+
         app.add_api_route(callback_path, callback, methods=["GET"])
 
         config = uvicorn.Config(app, host=bind_host, port=port, log_level="error")

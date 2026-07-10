@@ -7,35 +7,103 @@
   "inputs": {
     "type": "object",
     "properties": {
-      "text": { "type": "string", "minLength": 1, "description": "Text to compare against the current page content." }
+      "text": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Text to compare against the current page content."
+      }
     },
-    "required": ["text"],
+    "required": [
+      "text"
+    ],
     "additionalProperties": false
   },
   "outputs": {
     "type": "object",
     "properties": {
-      "verdict": { "type": "string", "enum": ["ok", "warn", "deny"] },
-      "policyVerdict": { "type": ["object", "null"] },
+      "verdict": {
+        "type": "string",
+        "enum": [
+          "ok",
+          "warn",
+          "deny"
+        ]
+      },
+      "policyVerdict": {
+        "type": [
+          "object",
+          "null"
+        ]
+      },
       "result": {
-        "type": ["object", "null"],
+        "type": [
+          "object",
+          "null"
+        ],
         "properties": {
-          "status": { "type": "string", "enum": ["ok", "error"] },
-          "tool": { "type": "string", "const": "agency.browser.verify-content" },
-          "output": { "type": "object", "additionalProperties": true },
-          "error": { "type": "string" }
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "error"
+            ]
+          },
+          "tool": {
+            "type": "string",
+            "const": "agency.browser.verify-content"
+          },
+          "output": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "error": {
+            "type": "string"
+          }
         },
         "additionalProperties": true
       },
-      "patch": { "type": ["string", "null"] },
-      "filesChanged": { "type": "array", "items": { "type": "object" } },
-      "errors": { "type": "array", "items": { "type": "string" } },
-      "dryRun": { "type": "boolean" },
-      "timestamp": { "type": "string" },
-      "actor": { "type": ["string", "null"] },
-      "signature": { "type": ["string", "null"] }
+      "patch": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "filesChanged": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      },
+      "errors": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "dryRun": {
+        "type": "boolean"
+      },
+      "timestamp": {
+        "type": "string"
+      },
+      "actor": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "signature": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
     },
-    "required": ["verdict", "dryRun", "timestamp"],
+    "required": [
+      "verdict",
+      "dryRun",
+      "timestamp"
+    ],
     "additionalProperties": false
   }
 }

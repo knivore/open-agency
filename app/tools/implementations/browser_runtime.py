@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 _MIN_FREE_BYTES = int(os.environ.get("BROWSER_RUNTIME_MIN_FREE_BYTES", str(256 * 1024 * 1024)))
@@ -16,8 +17,7 @@ def _candidate_roots() -> list[Path]:
     roots.extend(
         [
             Path.cwd() / ".browser-runtime",
-            Path("/var/tmp/browser-runtime"),
-            Path("/tmp/browser-runtime"),
+            Path(tempfile.gettempdir()) / "browser-runtime",
         ]
     )
     return roots

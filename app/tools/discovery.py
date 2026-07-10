@@ -38,39 +38,7 @@ class DiscoveredIntegration(DomainModel):
         return self.manifest.tool_modules
 
 
-def discover_builtin_tool_modules() -> list[str]:
-    root = Path(__file__).resolve().parent / "implementations"
-    modules: list[str] = []
-    if not root.exists():
-        return modules
-
-    for path in root.rglob("*.py"):
-        if path.name == "__init__.py":
-            continue
-        relative = path.relative_to(root.parent)
-        module = ".".join(relative.with_suffix("").parts)
-        modules.append(module)
-    return sorted(set(modules))
-
-
-def discover_app_tool_modules() -> list[str]:
-    return discover_builtin_tool_modules()
-
-
-def integrations_root() -> Path:
-    return Path(__file__).resolve().parents[2] / "integrations"
-
-
-def _load_manifest_payload(manifest_path: Path) -> dict[str, Any]:
-    with manifest_path.open("r", encoding="utf-8") as handle:
-        payload = yaml.safe_load(handle) or {}
-    if not isinstance(payload, dict):
-        raise ValueError("manifest must be a mapping")
-    return payload
-
-
-def discover_integrations(*, root: Path | None = None, strict: bool = False) -> list[DiscoveredIntegration]:
-    root = root or integrations_root()
+def _discover_manifest_modules(*, root: Path, strict: bool = False) -> list[DiscoveredIntegration]:
     if not root.exists():
         return []
 
@@ -102,9 +70,56 @@ def discover_integrations(*, root: Path | None = None, strict: bool = False) -> 
     return sorted(discovered, key=lambda item: (item.manifest.name.lower(), item.manifest.id))
 
 
+def discover_builtin_tool_modules() -> list[str]:
+    root = Path(__file__).resolve().parent / "implementations"
+    modules: list[str] = []
+    if not root.exists():
+        return modules
+
+    for path in root.rglob("*.py"):
+        if path.name == "__init__.py":
+            continue
+        relative = path.relative_to(root.parent)
+        module = ".".join(relative.with_suffix("").parts)
+        modules.append(module)
+    return sorted(set(modules))
+
+
+def discover_app_tool_modules() -> list[str]:
+    return discover_builtin_tool_modules()
+
+
+def integrations_root() -> Path:
+    return Path(__file__).resolve().parents[2] / "integrations"
+
+
+def generated_tools_root() -> Path:
+    return Path(__file__).resolve().parents[2] / "generated_tools"
+
+
+def _load_manifest_payload(manifest_path: Path) -> dict[str, Any]:
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle) or {}
+    if not isinstance(payload, dict):
+        raise ValueError("manifest must be a mapping")
+    return payload
+
+
+def discover_integrations(*, root: Path | None = None, strict: bool = False) -> list[DiscoveredIntegration]:
+    root = root or integrations_root()
+    return _discover_manifest_modules(root=root, strict=strict)
+
+
 def discover_integration_tool_modules(*, root: Path | None = None, strict: bool = False) -> list[str]:
     modules: list[str] = []
     for integration in discover_integrations(root=root, strict=strict):
+        modules.extend(integration.tool_modules)
+    return sorted(set(modules))
+
+
+def discover_generated_tool_modules(*, root: Path | None = None, strict: bool = False) -> list[str]:
+    modules: list[str] = []
+    for integration in _discover_manifest_modules(root=root or generated_tools_root(), strict=strict):
         modules.extend(integration.tool_modules)
     return sorted(set(modules))
 
@@ -115,6 +130,7 @@ def discover_allowed_python_tool_modules(*, strict: bool = False) -> list[str]:
             [
                 *discover_builtin_tool_modules(),
                 *discover_integration_tool_modules(strict=strict),
+                *discover_generated_tool_modules(strict=strict),
             ]
         )
     )

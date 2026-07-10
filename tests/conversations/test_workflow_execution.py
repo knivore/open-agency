@@ -9,8 +9,8 @@ from app.core.config import reset_settings_cache
 from app.domain import ExecutionStatus, ModelProfileDefinition, WorkflowDefinition
 from app.llm.base import ModelResponse
 from app.llm.registry import LLMEnvironmentConfig
-from app.services.conversations import ConversationService
-from app.services.main_agent_setup import MainAgentSetupConfig, MainAgentSetupService
+from app.services.conversations.core import ConversationService
+from app.services.main_agent_setup.service import MainAgentSetupConfig, MainAgentSetupService
 
 
 class _FakeModelClient:

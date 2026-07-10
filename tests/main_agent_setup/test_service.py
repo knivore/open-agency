@@ -7,7 +7,7 @@ from unittest.mock import patch
 from app.api.context import create_test_api_context
 from app.core.config import get_settings, reset_settings_cache
 from app.domain import ModelProfileDefinition
-from app.services.main_agent_setup import (
+from app.services.main_agent_setup.service import (
     MainAgentModelProfileRequiredError,
     MainAgentSetupConfig,
     MainAgentSetupInvalidError,
@@ -59,6 +59,21 @@ class MainAgentSetupServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.service.is_main_agent_setup_complete())
         resolved = await self.service.require_active_main_agent_profile()
         self.assertEqual(resolved.id, "main-agent-profile")
+        self.assertEqual(
+            resolved.metadata["main_agent_monitoring"]["approval_conversation_id"],
+            "main-agent-profile-monitor",
+        )
+        self.assertTrue(resolved.metadata["main_agent_monitoring"]["route_improvement_proposals_to_approval"])
+        monitor_conversation = await self.context.conversation_repo.get("main-agent-profile-monitor")
+        self.assertIsNotNone(monitor_conversation)
+        assert monitor_conversation is not None
+        self.assertEqual(monitor_conversation.title, "Main Agent Monitor")
+        agent = await self.context.agent_repo.get("main-agent")
+        self.assertIsNotNone(agent)
+        assert agent is not None
+        self.assertIn("agency.speech.listen", agent.tool_ids)
+        self.assertIn("agency.speech.speak", agent.tool_ids)
+        self.assertIn("agency.speech.continue", agent.tool_ids)
 
     async def test_ensure_startup_ready_non_interactive_requires_main_agent(self) -> None:
         await self.context.model_profile_repo.save(
@@ -85,6 +100,7 @@ class MainAgentSetupServiceTests(unittest.IsolatedAsyncioTestCase):
                 "",
                 "Main Workflow",
                 "Workflow for the main agent",
+                "",
                 "y",
             ]
         )
@@ -93,12 +109,13 @@ class MainAgentSetupServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(created.name, "Agency Assistant")
         self.assertEqual(created.default_model_profile_id, "profile-fake")
+        self.assertEqual(created.metadata["operator_chat_access"]["mode"], "direct_cli")
         self.assertTrue(await self.service.is_main_agent_setup_complete())
 
     async def test_ensure_startup_ready_interactive_can_onboard_provider_and_profile(self) -> None:
         answers = iter(
             [
-                "6",
+                "8",
                 "",
                 "",
                 "llama3:8b",
@@ -116,6 +133,7 @@ class MainAgentSetupServiceTests(unittest.IsolatedAsyncioTestCase):
                 "",
                 "Main Workflow",
                 "Workflow for the main agent",
+                "",
                 "y",
             ]
         )
@@ -134,6 +152,16 @@ class MainAgentSetupServiceTests(unittest.IsolatedAsyncioTestCase):
             _, _, base_url, _ = self.service._provider_defaults("ollama")
 
         self.assertEqual(base_url, "http://localhost:11434")
+
+    def test_chat_channel_setup_guidance_lists_provider_specific_steps(self) -> None:
+        discord = self.service.chat_channel_setup_guidance("discord")
+        telegram = self.service.chat_channel_setup_guidance("telegram")
+
+        self.assertIn("Discord bot setup checklist:", discord)
+        self.assertIn("/integrations/conversations/adapters/discord/webhook", discord)
+        self.assertIn("Telegram bot setup checklist:", telegram)
+        self.assertIn("/integrations/conversations/adapters/telegram/webhook", telegram)
+        self.assertIn("trusted approvals and mutations", discord)
 
     async def test_ensure_startup_ready_non_interactive_can_bootstrap_from_env(self) -> None:
         with patch.dict(
@@ -161,6 +189,31 @@ class MainAgentSetupServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(created.name, "Agency Assistant")
         self.assertEqual(created.default_model_profile_id, profiles[0].id)
         self.assertEqual(created.metadata["setup_mode"], "env")
+
+    async def test_ensure_startup_ready_can_bootstrap_codex_cli_profile_without_api_key(self) -> None:
+        with patch.dict(
+                os.environ,
+                {
+                    "MAIN_AGENT_BOOTSTRAP_ENABLED": "true",
+                    "MAIN_AGENT_BOOTSTRAP_PROVIDER_FAMILY": "openai_codex",
+                    "MAIN_AGENT_BOOTSTRAP_MODEL_NAME": "gpt-5.3-codex",
+                    "MAIN_AGENT_BOOTSTRAP_PROFILE_NAME": "Codex Main",
+                    "MAIN_AGENT_BOOTSTRAP_AGENT_NAME": "Agency Assistant",
+                    "MAIN_AGENT_BOOTSTRAP_AGENT_DESCRIPTION": "Main agent for this workspace",
+                    "MAIN_AGENT_BOOTSTRAP_AGENT_INSTRUCTIONS": "Be helpful.",
+                },
+                clear=False,
+        ):
+            reset_settings_cache()
+            created = await self.service.ensure_startup_ready(interactive=False, settings=get_settings())
+
+        profiles = await self.service.list_usable_model_profiles()
+        self.assertEqual(len(profiles), 1)
+        self.assertEqual(profiles[0].provider, "openai_codex")
+        self.assertEqual(profiles[0].model, "gpt-5.3-codex")
+        self.assertEqual(profiles[0].parameters["auth_mode"], "chatgpt")
+        self.assertEqual(profiles[0].parameters["codex_cli_timeout_seconds"], 1800)
+        self.assertEqual(created.default_model_profile_id, profiles[0].id)
 
     async def test_ensure_startup_ready_non_interactive_bootstrap_requires_model_name(self) -> None:
         with patch.dict(

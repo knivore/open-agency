@@ -18,10 +18,12 @@ from app.services.agent_tools import (
     SYSTEM_EXECUTION_ARTIFACTS_TOOL_ID,
     SYSTEM_EXECUTION_EVENTS_TOOL_ID,
     SYSTEM_EXECUTION_GET_TOOL_ID,
+    SYSTEM_EXECUTION_LIST_TOOL_ID,
+    SYSTEM_GRAPH_CONTEXT_TOOL_ID,
     SYSTEM_WORKFLOW_GET_TOOL_ID,
     SYSTEM_WORKFLOW_LIST_TOOL_ID,
 )
-from app.services.main_agent_setup import MainAgentSetupConfig, MainAgentSetupService
+from app.services.main_agent_setup.service import MainAgentSetupConfig, MainAgentSetupService
 from scripts.setup import READ_ONLY_TOOL_IDS, setup_evaluation_agent
 
 
@@ -98,13 +100,21 @@ class EvaluationAgentSetupTests(unittest.TestCase):
         self.assertEqual(result.agent.name, "Evaluation")
         self.assertEqual(result.agent.model_profile_id, "profile-evaluation")
         self.assertEqual(result.model_profile.id, "profile-evaluation")
-        self.assertEqual(set(result.agent.tool_ids), set(READ_ONLY_TOOL_IDS))
+        expected_tool_ids = {*READ_ONLY_TOOL_IDS, SYSTEM_GRAPH_CONTEXT_TOOL_ID}
+        self.assertEqual(set(result.agent.tool_ids), expected_tool_ids)
+        self.assertIn(SYSTEM_EXECUTION_LIST_TOOL_ID, result.agent.tool_ids)
         self.assertIn(SYSTEM_EXECUTION_GET_TOOL_ID, result.agent.tool_ids)
         self.assertIn(SYSTEM_EXECUTION_EVENTS_TOOL_ID, result.agent.tool_ids)
         self.assertIn(SYSTEM_EXECUTION_ARTIFACTS_TOOL_ID, result.agent.tool_ids)
         self.assertIn(SYSTEM_WORKFLOW_GET_TOOL_ID, result.agent.tool_ids)
         self.assertIn(SYSTEM_WORKFLOW_LIST_TOOL_ID, result.agent.tool_ids)
+        self.assertIn(SYSTEM_GRAPH_CONTEXT_TOOL_ID, result.agent.tool_ids)
         self.assertFalse(result.agent.memory.enabled)
+        self.assertTrue(result.agent.graph_context.enabled)
+        self.assertEqual(result.agent.graph_context.default_intent, "audit")
+        self.assertEqual(result.agent.graph_context.default_budget, "brief")
+        self.assertFalse(result.agent.graph_context.include_memories)
+        self.assertFalse(result.agent.graph_context.include_raw_graph)
         self.assertEqual(result.agent.framework_hints.metadata["agent_kind"], "evaluation")
         self.assertEqual(result.agent.framework_hints.metadata["runtime_role"], "eval_judge")
         self.assertNotIn("profile-evaluation", result.reserved_model_profile_ids)
@@ -162,9 +172,17 @@ class EvaluationAgentSetupTests(unittest.TestCase):
             )
         )
 
+        list_tool = self._run(self.context.tool_repo.get(SYSTEM_EXECUTION_LIST_TOOL_ID))
         get_tool = self._run(self.context.tool_repo.get(SYSTEM_EXECUTION_GET_TOOL_ID))
         events_tool = self._run(self.context.tool_repo.get(SYSTEM_EXECUTION_EVENTS_TOOL_ID))
         artifacts_tool = self._run(self.context.tool_repo.get(SYSTEM_EXECUTION_ARTIFACTS_TOOL_ID))
+        list_result = self._run(
+            self.context.tool_service.tool_registry.execute(
+                list_tool,
+                {"workflow_id": execution.workflow_id, "status": ["completed"]},
+                execution_id="judge-execution",
+            )
+        )
         get_result = self._run(
             self.context.tool_service.tool_registry.execute(
                 get_tool,
@@ -187,6 +205,9 @@ class EvaluationAgentSetupTests(unittest.TestCase):
             )
         )
 
+        self.assertEqual(list_result["status"], "ok")
+        self.assertEqual(list_result["count"], 1)
+        self.assertEqual(list_result["items"][0]["id"], execution.id)
         self.assertEqual(get_result["status"], "ok")
         self.assertEqual(get_result["execution"]["id"], execution.id)
         self.assertEqual(events_result["count"], 1)

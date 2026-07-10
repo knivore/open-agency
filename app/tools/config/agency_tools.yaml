@@ -1,371 +1,4021 @@
-agency.human.ask:
-  id: "agency.human.ask"
-  name: "ask_human"
-  display_name: "Ask Human"
-  description: "Ask the human operator a focused question when execution is blocked, approval context is missing, or the agent needs a decision that cannot be inferred safely. Use this for clarification, not for routine status updates. Required input: `query`, the exact question to show. Optional runtime inputs may include `process_id` and `timeout`. Output reports whether a response was received or the request timed out. Side effect: pauses automation while waiting for the human reply."
-  created_by: "agency"
-  owned_by: "agency"
-  parameters:
-    query:
-      mandatory: true
-      type: "string"
-      description: "Exact question to ask the human operator."
-    process_id:
-      mandatory: false
-      type: "string"
-      description: "Optional run or process channel used to route the question and reply."
-    timeout:
-      mandatory: false
-      type: "integer"
-      description: "Maximum number of seconds to wait for the human reply. Defaults to 60."
+app_tools:
+  agency.human.ask:
+    id: "agency.human.ask"
+    name: "ask_human"
+    display_name: "Ask Human"
+    description: "Ask the human operator a focused question when execution is blocked, approval context is missing, or the agent needs a decision that cannot be inferred safely. Use this for clarification, not for routine status updates. Required input: `query`, the exact question to show. Optional runtime inputs may include `process_id` and `timeout`. Output reports whether a response was received or the request timed out. Side effect: pauses automation while waiting for the human reply."
+    created_by: "agency"
+    owned_by: "agency"
+    parameters:
+      query:
+        mandatory: true
+        type: "string"
+        filled_by: "agent"
+        description: "Exact question to ask the human operator."
+      process_id:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        input_type: "hidden"
+        description: "Optional run or process channel used to route the question and reply."
+      timeout_seconds:
+        mandatory: false
+        type: "integer"
+        filled_by: "user_or_agent"
+        description: "Maximum number of seconds to wait for the human reply. Defaults to 60."
 
-agency.audio.transcribe:
-  id: "agency.audio.transcribe"
-  name: "transcribe_audio"
-  display_name: "Transcribe Audio"
-  description: "Transcribe recorded audio into text with OpenAI speech-to-text. Use this when an agent receives an audio file, voice-note chunk, or base64 audio payload and needs text before planning or tool use. Required input: exactly one of `file_path` or `audio_base64`. Optional inputs: `filename`, `model`, `language`, `prompt`, and `response_format`. Defaults to `whisper-1`, or `OPENAI_AUDIO_TRANSCRIPTION_MODEL` when configured. Side effect: sends audio to OpenAI for transcription."
-  created_by: "agency"
-  owned_by: "agency"
-  parameters:
-    file_path:
-      mandatory: false
-      type: "string"
-      description: "Path to a local audio file accessible to the backend."
-    audio_base64:
-      mandatory: false
-      type: "string"
-      description: "Base64 encoded audio bytes. Data URLs are accepted."
-    filename:
-      mandatory: false
-      type: "string"
-      description: "Filename to use when `audio_base64` is provided. Defaults to `audio.webm`."
-    model:
-      mandatory: false
-      type: "string"
-      description: "OpenAI speech-to-text model such as `whisper-1` or `gpt-4o-mini-transcribe`."
-    language:
-      mandatory: false
-      type: "string"
-      description: "Optional ISO-639-1 language hint such as `en`."
-    prompt:
-      mandatory: false
-      type: "string"
-      description: "Optional prompt or keyword list to guide transcription."
-    response_format:
-      mandatory: false
-      type: "string"
-      description: "Response format: `json`, `text`, or `verbose_json`. Defaults to `json`."
+  agency.speech.listen:
+    id: "agency.speech.listen"
+    name: "listen_speech"
+    display_name: "Listen Speech"
+    description: "Listen to recorded audio and transcribe it into text with Agency's shared speech input capability. Use this when an agent receives an audio file, voice-note chunk, or base64 audio payload and needs normalized text before planning or tool use. Required input: exactly one of `file_path` or `audio_base64`. Optional inputs: `filename`, `model`, `language`, `prompt`, and `response_format`. Defaults to `whisper-1`, or `OPENAI_AUDIO_TRANSCRIPTION_MODEL` when configured. Side effect: sends audio to the configured speech-to-text provider."
+    created_by: "agency"
+    owned_by: "agency"
+    tags: [ "catalog", "speech", "agent_assignable", "risk:low" ]
+    parameters:
+      file_path:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Path to a local audio file accessible to the backend."
+      audio_base64:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Base64 encoded audio bytes. Data URLs are accepted."
+      filename:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Filename to use when `audio_base64` is provided. Defaults to `audio.webm`."
+      model:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "OpenAI speech-to-text model such as `whisper-1` or `gpt-4o-mini-transcribe`."
+      language:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Optional ISO-639-1 language hint such as `en`."
+      prompt:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Optional prompt or keyword list to guide transcription."
+      response_format:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Response format: `json`, `text`, or `verbose_json`. Defaults to `json`."
 
-agency.http.request:
-  id: "agency.http.request"
-  name: "send_http_request"
-  display_name: "Send HTTP Request"
-  description: "Send one HTTP request to an explicit URL when an agent needs to call an external API or webhook. Use this only for APIs that are expected by the workflow and whose domain is allowed by the tool security policy. Required inputs: `url` and `method`. Optional inputs: `headers`, `query_params`, `body`, and `verify_ssl`. Output includes the HTTP status code and parsed response body when JSON is returned. Side effect: performs a network call and may mutate external systems depending on the HTTP method."
-  created_by: "agency"
-  owned_by: "agency"
-  parameters:
-    url:
-      mandatory: true
-      type: "string"
-      description: "Absolute API endpoint URL to call."
-    method:
-      mandatory: true
-      type: "string"
-      description: "HTTP method such as GET, POST, PUT, PATCH, or DELETE."
-    headers:
-      mandatory: false
-      type: "object"
-      description: "Optional request headers. Do not embed secrets directly; use configured credentials where available."
-    query_params:
-      mandatory: false
-      type: "object"
-      description: "Optional query-string parameters."
-    body:
-      mandatory: false
-      type: "object"
-      description: "Optional JSON request body."
-    verify_ssl:
-      mandatory: false
-      type: "boolean"
-      description: "Whether TLS certificates should be verified. Defaults to true."
+  agency.speech.speak:
+    id: "agency.speech.speak"
+    name: "speak_speech"
+    display_name: "Speak Speech"
+    description: "Create a generic Agency speech output request that downstream surfaces such as speakers, phones, or ambient devices can deliver. Use this when a workflow needs spoken output without binding itself to one vendor-specific text-to-speech stack. Required input: `text`. Optional inputs: `targetKind`, `targetRef`, `channel`, `ssml`, `voice`, and `metadata`."
+    created_by: "agency"
+    owned_by: "agency"
+    tags: [ "catalog", "speech", "agent_assignable", "risk:low" ]
+    parameters:
+      text:
+        mandatory: true
+        type: "string"
+        filled_by: "agent"
+        description: "Announcement text to deliver."
+      targetKind:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Optional target scope such as `home`, `room`, `speaker`, or `surface`."
+      targetRef:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Optional target entity, room, or surface reference."
+      channel:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Optional delivery channel label such as `voice` or `phone`."
+      ssml:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Optional SSML payload for downstream speech adapters that support it."
+      voice:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Optional voice preset or provider-specific voice id."
+      metadata:
+        mandatory: false
+        type: "object"
+        filled_by: "agent"
+        description: "Optional delivery metadata for downstream adapters and audit context."
 
-agency.document.markdown-to-word:
-  id: "agency.document.markdown-to-word"
-  name: "convert_markdown_to_word"
-  display_name: "Convert Markdown to Word"
-  description: "Convert markdown text into a Word document and upload the generated `.docx` file to configured storage. Use this when the agent has final markdown content that should become a downloadable Word artifact. Required inputs: `markdown_text`, `filename`, and `img_directory`. Output is a storage location or error message. Side effect: writes a temporary document and uploads a file artifact."
-  created_by: "agency"
-  owned_by: "agency"
-  parameters:
-    markdown_text:
-      mandatory: true
-      type: "string"
-      description: "Markdown-formatted document body to convert."
-    filename:
-      mandatory: true
-      type: "string"
-      description: "Output Word filename, including `.docx` when desired."
-    img_directory:
-      mandatory: true
-      type: "string"
-      cloud_directory: true
-      input_type: "hidden"
-      description: "Storage directory or workflow artifact path for the generated document."
+  agency.speech.continue:
+    id: "agency.speech.continue"
+    name: "continue_speech"
+    display_name: "Continue Speech"
+    description: "Continue a generic Agency speech conversation from a follow-up spoken response. Use this when an announcement or prompt expects the user to answer verbally and the workflow should resume through Agency's shared speech surface. Required input: `responseText`. Optional inputs: `surface`, `sessionId`, `priorAnnouncementId`, `channel`, and `metadata`."
+    created_by: "agency"
+    owned_by: "agency"
+    tags: [ "catalog", "speech", "agent_assignable", "risk:medium" ]
+    parameters:
+      responseText:
+        mandatory: true
+        type: "string"
+        filled_by: "agent"
+        description: "The follow-up spoken response to continue from."
+      surface:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Surface where the response was captured, such as `speaker` or `phone`."
+      sessionId:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Optional session identifier for the existing speech conversation."
+      priorAnnouncementId:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Optional announcement id that prompted the response."
+      channel:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Optional channel label such as `voice` or `phone`."
+      metadata:
+        mandatory: false
+        type: "object"
+        filled_by: "agent"
+        description: "Optional continuation metadata forwarded to downstream speech handlers."
 
-agency.file.write-text:
-  id: "agency.file.write-text"
-  name: "write_text_file"
-  display_name: "Write Text File"
-  description: "Write or append text content to a file under an allowed base folder. Use this for workflow artifacts and controlled local text outputs, not for editing source code or credential files. Required inputs: `base_folder`, `content`, and `mode`. Optional input: `filename`; if omitted, the configured default filename is used. Output includes status, message, and full path. Side effect: creates or modifies a file and requires filesystem permission."
-  created_by: "agency"
-  owned_by: "agency"
-  parameters:
-    base_folder:
-      mandatory: true
-      type: "string"
-      description: "Allowed directory where the file will be written."
-    content:
-      mandatory: true
-      type: "string"
-      description: "Text content to write or append."
-    mode:
-      mandatory: true
-      type: "string"
-      description: "Write mode: `write` replaces the file, `append` adds to the end."
-    filename:
-      mandatory: false
-      type: "string"
-      description: "Optional file name under `base_folder`."
+  agency.voice.generate:
+    id: "agency.voice.generate"
+    name: "generate_voice"
+    display_name: "Generate Voice"
+    description: "Generate a local-first spoken audio file from text, publish it into Agency storage, and return a reusable voice artifact with file_path, storage_key, storage_uri, and media_url. provider=system_tts uses the host TTS engine; provider=openvoice_local uses Agency's local OpenVoice checkout and consented reference voice. Required inputs: text and ai_disclosure=true. openvoice_local also requires consent_confirmed=true and reference_voice_path. Delivery is intentionally separate so workflows can route the generated voice to any tied application or downstream tool."
+    created_by: "agency"
+    owned_by: "agency"
+    tags: [ "catalog", "voice", "speech", "media", "storage", "agent_assignable", "risk:medium" ]
+    security:
+      allow_network: false
+      allowlisted_domains: []
+      redaction_enabled: false
+    parameters:
+      text:
+        mandatory: true
+        type: "string"
+        filled_by: "agent"
+        description: "Text to synthesize into spoken audio."
+      provider:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        default: "auto"
+        description: "Voice provider: auto, openvoice_local, or system_tts. auto uses openvoice_local when a consented reference_voice_path is supplied, otherwise system_tts."
+      voice:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Optional local OS voice name or provider-specific voice preset."
+      reference_voice_path:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Reference voice path for Agency's local OpenVoice generation. Required with openvoice_local."
+      output_name:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Optional relative output filename or storage-key suffix."
+      storage_key_prefix:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        default: "voice"
+        description: "Agency storage prefix for generated audio."
+      purpose:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Human-readable purpose for audit and policy review."
+      ai_disclosure:
+        mandatory: true
+        type: "boolean"
+        filled_by: "user_or_agent"
+        description: "Must be true so generated speech can be disclosed as AI-generated when delivered."
+      consent_confirmed:
+        mandatory: false
+        type: "boolean"
+        filled_by: "user_or_agent"
+        default: false
+        description: "Must be true when a reference or cloned voice provider is used."
+      dry_run:
+        mandatory: false
+        type: "boolean"
+        filled_by: "user_or_agent"
+        default: true
+        description: "When true, preview provider, guardrails, and storage target without synthesis."
+      metadata:
+        mandatory: false
+        type: "object"
+        filled_by: "agent"
+        description: "Optional workflow or delivery metadata."
 
-agency.excel.write-image:
-  id: "agency.excel.write-image"
-  name: "excel_write_image"
-  display_name: "Excel Write Image"
-  description: "Embed one screenshot or image into an Excel worksheet for test evidence, visual reports, or audit artifacts. Required inputs: `sheet_name`, `excel_file_path`, `image_path`, and `serial_number`. Optional input: `header_title`. Output reports success or the specific workbook/sheet/file error. Side effect: modifies the target workbook while holding a file lock."
-  created_by: "agency"
-  owned_by: "agency"
-  parameters: {}
+  agency.media.publish:
+    id: "agency.media.publish"
+    name: "publish_media"
+    display_name: "Publish Media"
+    description: "Copy a local image, audio, voice, video, or document file into Agency storage and return a reusable media artifact with storage_uri and media_url. Use this when any producing tool returns a local file path and a workflow needs a shared artifact for later steps, delivery, audit, or reuse. Required input: `file_path`. Optional inputs choose the storage key, filename, MIME type, overwrite behavior, dry-run preview, and workflow metadata. Local development URLs may not be fetchable by external providers unless the Agency API is exposed."
+    created_by: "agency"
+    owned_by: "agency"
+    tags: [ "catalog", "media", "storage", "delivery", "agent_assignable", "risk:medium" ]
+    parameters:
+      file_path:
+        mandatory: true
+        type: "string"
+        filled_by: "agent"
+        description: "Local media file path to copy into Agency storage."
+      storage_key:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Optional exact storage key. When omitted, a unique key is generated under storage_key_prefix."
+      storage_key_prefix:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        default: "media"
+        description: "Storage key prefix used when storage_key is omitted."
+      filename:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Optional filename for generated storage keys."
+      content_type:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Optional MIME type. When omitted, Agency guesses it from the filename."
+      overwrite:
+        mandatory: false
+        type: "boolean"
+        filled_by: "user_or_agent"
+        default: false
+        description: "Whether to replace an existing object at storage_key."
+      dry_run:
+        mandatory: false
+        type: "boolean"
+        filled_by: "user_or_agent"
+        default: true
+        description: "When true, preview the storage key and URL without copying the file."
+      metadata:
+        mandatory: false
+        type: "object"
+        filled_by: "agent"
+        description: "Optional audit or workflow metadata."
 
-agency.excel.write-json:
-  id: "agency.excel.write-json"
-  name: "excel_write_json"
-  display_name: "Excel Write JSON"
-  description: "Read a JSON file and write its keys and values into an Excel worksheet row for structured test or workflow output. Required inputs: `sheet_name`, `excel_file_path`, `json_file_path`, and `serial_number`. Output reports success or the specific JSON/workbook/sheet error. Side effect: modifies the target workbook while holding a file lock."
-  created_by: "agency"
-  owned_by: "agency"
-  parameters: {}
+  agency.media.send:
+    id: "agency.media.send"
+    name: "send_media"
+    display_name: "Send Media"
+    description: "Build or send a provider-specific media message through Agency's shared delivery boundary for any supported tied application. It accepts media produced by voice generation, image/video/document tools, storage, or any workflow step. Required inputs: `provider`, `media_type`, and one of `media_url` or `file_path`. Real delivery requires `dry_run=false`, `credential_id`, `owner_user_id`, and a destination; most providers require a provider-fetchable media_url, while providers with upload adapters may accept file_path directly."
+    created_by: "agency"
+    owned_by: "agency"
+    tags: [ "catalog", "media", "delivery", "agent_assignable", "risk:medium" ]
+    parameters:
+      provider:
+        mandatory: true
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Delivery provider: telegram, discord, slack, microsoft-teams, or whatsapp."
+      media_type:
+        mandatory: true
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Media kind: image, audio, voice, video, or document."
+      media_url:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Provider-fetchable media URL. Required for real delivery."
+      file_path:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Local media file path for preview/provenance. Host it before real provider delivery."
+      text:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Optional message text sent with or near the media."
+      caption:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Optional media caption."
+      filename:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Optional filename for document-style media."
+      mime_type:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Optional MIME type for audit and downstream adapters."
+      destination_id:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Provider destination id such as Telegram chat id, Discord/Slack/Teams channel id, or WhatsApp recipient."
+      team_id:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Microsoft Teams team id when provider is microsoft-teams."
+      credential_id:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Agency credential or connector installation id for real delivery."
+      owner_user_id:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Owner user id used to resolve the credential for real delivery."
+      dry_run:
+        mandatory: false
+        type: "boolean"
+        filled_by: "user_or_agent"
+        default: true
+        description: "When true, build and return the provider payload without sending."
+      metadata:
+        mandatory: false
+        type: "object"
+        filled_by: "agent"
+        description: "Optional audit or workflow metadata."
 
-agency.excel.write-text:
-  id: "agency.excel.write-text"
-  name: "excel_write_text"
-  display_name: "Excel Write Text"
-  description: "Read a text file and insert its content into an Excel worksheet row for test evidence, logs, or generated narrative output. Required inputs: `sheet_name`, `excel_file_path`, `text_file_path`, and `serial_number`. Optional input: `header_title`. Output reports success or the specific text/workbook/sheet error. Side effect: modifies the target workbook while holding a file lock."
-  created_by: "agency"
-  owned_by: "agency"
-  parameters: {}
+  agency.http.request:
+    id: "agency.http.request"
+    name: "send_http_request"
+    display_name: "Send HTTP Request"
+    description: "Send one HTTP request to an explicit URL when an agent needs to call an external API or webhook. Use this only for APIs that are expected by the workflow and whose domain is allowed by the tool security policy. Required inputs: `url` and `method`. Optional inputs: `headers`, `query_params`, `body`, `verify_ssl`, and `credential_mode`. Output includes the HTTP status code and parsed response body when JSON is returned. Side effect: performs a network call and may mutate external systems depending on the HTTP method."
+    created_by: "agency"
+    owned_by: "agency"
+    parameters:
+      url:
+        mandatory: true
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Absolute API endpoint URL to call."
+      method:
+        mandatory: true
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "HTTP method such as GET, POST, PUT, PATCH, or DELETE."
+      headers:
+        mandatory: false
+        type: "object"
+        filled_by: "user_or_agent"
+        description: "Optional request headers. Do not embed secrets directly; use configured credentials where available."
+      query_params:
+        mandatory: false
+        type: "object"
+        filled_by: "user_or_agent"
+        description: "Optional query-string parameters."
+      body:
+        mandatory: false
+        type: "object"
+        filled_by: "user_or_agent"
+        description: "Optional JSON request body."
+      verify_ssl:
+        mandatory: false
+        type: "boolean"
+        filled_by: "user_or_agent"
+        description: "Whether TLS certificates should be verified. Defaults to true."
+      credential_mode:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Credential handling mode. Use `onecli` to route through the OneCLI gateway without exposing raw credentials."
 
-agency.browser.open:
-  id: "agency.browser.open"
-  name: "open_browser"
-  display_name: "Open Browser"
-  description: "Start or reuse a Playwright browser session and navigate to a URL. Use this before screenshot, click, type, select, scroll, extract, or verify browser tools. Optional inputs configure HTTP auth, user agent, browser type, mobile mode, locale, timezone, storage state, video recording, tracing, and extra headers. Output includes navigation status and browser artifacts. Side effect: creates browser session state and may load remote web content."
-  created_by: "agency"
-  owned_by: "agency"
-  parameters:
-    url:
-      mandatory: false
-      type: "string"
-      description: "URL to open. If omitted, the tool may initialize the browser without navigation."
-    http_credentials_username:
-      mandatory: false
-      type: "string"
-      description: "Optional HTTP basic-auth username."
-    http_credentials_password:
-      mandatory: false
-      type: "string"
-      description: "Optional HTTP basic-auth password."
-    user_agent:
-      mandatory: false
-      type: "string"
-      description: "Optional custom browser user agent."
-    browser_type:
-      mandatory: false
-      type: "string"
-      description: "Optional browser family to emulate, such as chrome, firefox, safari, or edge."
-    mobile:
-      mandatory: false
-      type: "boolean"
-      description: "Whether to use mobile viewport and user-agent behavior."
-    locale:
-      mandatory: false
-      type: "string"
-      description: "Optional browser locale, for example en-US."
-    timezone_id:
-      mandatory: false
-      type: "string"
-      description: "Optional browser timezone, for example Asia/Singapore."
-    storage_state_path:
-      mandatory: false
-      type: "string"
-      description: "Optional Playwright storage-state JSON file to preload cookies and local storage."
-    record_video:
-      mandatory: false
-      type: "boolean"
-      description: "Whether to record video artifacts for the session."
-    trace_mode:
-      mandatory: false
-      type: "string"
-      description: "Optional tracing mode such as off, on, or retain-on-failure."
-    extra_http_headers:
-      mandatory: false
-      type: "object"
-      description: "Optional extra HTTP headers sent with browser requests."
-    img_directory:
-      mandatory: true
-      type: "string"
-      cloud_directory: true
-      input_type: "hidden"
-      description: "Artifact directory for screenshots and browser outputs."
+  agency.document.markdown-to-word:
+    id: "agency.document.markdown-to-word"
+    name: "convert_markdown_to_word"
+    display_name: "Convert Markdown to Word"
+    description: "Convert markdown text into a Word document and upload the generated `.docx` file to configured storage. Use this when the agent has final markdown content that should become a downloadable Word artifact. Required inputs: `markdown_text`, `filename`, and `img_directory`. Output is a storage location or error message. Side effect: writes a temporary document and uploads a file artifact."
+    created_by: "agency"
+    owned_by: "agency"
+    parameters:
+      markdown_text:
+        mandatory: true
+        type: "string"
+        filled_by: "agent"
+        description: "Markdown-formatted document body to convert."
+      filename:
+        mandatory: true
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Output Word filename, including `.docx` when desired."
+      img_directory:
+        mandatory: true
+        type: "string"
+        cloud_directory: true
+        input_type: "hidden"
+        filled_by: "agent"
+        description: "Storage directory or workflow artifact path for the generated document."
 
-agency.browser.screenshot:
-  id: "agency.browser.screenshot"
-  name: "take_screenshot"
-  display_name: "Take Screenshot"
-  description: "Capture a screenshot of the current browser page. Use this after opening or interacting with a page when the agent needs visual evidence or a page-state artifact. Optional input: `full_page_screenshot`. Output includes screenshot artifact metadata. Side effect: writes a screenshot artifact."
-  created_by: "agency"
-  owned_by: "agency"
-  parameters:
-    full_page_screenshot:
-      mandatory: false
-      type: "boolean"
-      description: "Whether to capture the full scrollable page instead of only the viewport."
-    img_directory:
-      mandatory: true
-      type: "string"
-      cloud_directory: true
-      input_type: "hidden"
-      description: "Artifact directory for the screenshot."
+  agency.file.write-text:
+    id: "agency.file.write-text"
+    name: "write_text_file"
+    display_name: "Write Text File"
+    description: "Write or append text content to a file under an allowed base folder. Use this for workflow artifacts and controlled local text outputs, not for editing source code or credential files. Required inputs: `base_folder`, `content`, and `mode`. Optional input: `filename`; if omitted, the configured default filename is used. Output includes status, message, and full path. Side effect: creates or modifies a file and requires filesystem permission."
+    created_by: "agency"
+    owned_by: "agency"
+    parameters:
+      base_folder:
+        mandatory: true
+        type: "string"
+        filled_by: "user"
+        description: "Allowed directory where the file will be written."
+      content:
+        mandatory: true
+        type: "string"
+        filled_by: "agent"
+        description: "Text content to write or append."
+      mode:
+        mandatory: true
+        type: "string"
+        filled_by: "agent"
+        description: "Write mode: `write` replaces the file, `append` adds to the end."
+      filename:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Optional file name under `base_folder`."
 
-agency.browser.analyze-screenshot:
-  id: "agency.browser.analyze-screenshot"
-  name: "analyze_screenshot"
-  display_name: "Analyze Screenshot"
-  description: "Capture the current page screenshot and ask the configured vision model to analyze whether the user's instruction or question can be resolved from the visual state. Required input: `text`, the instruction or question to analyze against the screenshot. Optional input: `full_page_screenshot`. Output includes model analysis and screenshot artifact metadata. Side effect: captures an image and may call a vision model."
-  created_by: "agency"
-  owned_by: "agency"
-  parameters:
-    text:
-      mandatory: true
-      type: "string"
-      description: "Instruction or question to answer from the current screenshot."
-    full_page_screenshot:
-      mandatory: false
-      type: "boolean"
-      description: "Whether to capture the full scrollable page."
-    img_directory:
-      mandatory: true
-      type: "string"
-      cloud_directory: true
-      input_type: "hidden"
-      description: "Artifact directory for the screenshot."
+  agency.repo.inspect:
+    id: "agency.repo.inspect"
+    name: "inspect_repo"
+    display_name: "Inspect Repo"
+    description: "Inspect an allowlisted git repository without using the approval-gated shell tool. Use this for recurring learning, architecture review, TODO discovery, docs inspection, and read-only product or engineering coaching. Required input: `repo`, using a repo alias like `agency` or `agency-fe`, or an allowlisted absolute path. Optional inputs narrow the scan with `query`, `focus_paths`, `include_patterns`, `exclude_patterns`, `max_files`, `max_hits`, and `excerpt_line_limit`. Output includes branch, status, recent commits, TODO hits, query hits, scanned files, and concise file excerpts. Side effect: reads files and git metadata from an allowlisted local repository."
+    created_by: "agency"
+    owned_by: "agency"
+    parameters:
+      repo:
+        mandatory: true
+        type: "string"
+        filled_by: "user"
+        description: "Repository alias or allowlisted absolute path."
+      query:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Optional case-insensitive text to search for in files."
+      focus_paths:
+        mandatory: false
+        type: "array"
+        filled_by: "agent"
+        description: "Optional repo-relative files or glob patterns to prioritize."
+      include_patterns:
+        mandatory: false
+        type: "array"
+        filled_by: "agent"
+        description: "Optional repo-relative glob patterns to include."
+      exclude_patterns:
+        mandatory: false
+        type: "array"
+        filled_by: "agent"
+        description: "Optional repo-relative glob patterns to exclude."
+      max_files:
+        mandatory: false
+        type: "integer"
+        filled_by: "user_or_agent"
+        description: "Maximum number of files to scan."
+      max_hits:
+        mandatory: false
+        type: "integer"
+        filled_by: "user_or_agent"
+        description: "Maximum number of TODO or query hits to return."
+      excerpt_line_limit:
+        mandatory: false
+        type: "integer"
+        filled_by: "user_or_agent"
+        description: "Maximum number of lines to include per file excerpt."
 
-agency.browser.extract-screenshot:
-  id: "agency.browser.extract-screenshot"
-  name: "extract_screenshot"
-  display_name: "Extract Screenshot"
-  description: "Capture the current page screenshot and ask the configured vision model to extract content requested by the agent. Required input: `text`, the extraction instruction. Optional input: `full_page_screenshot`. Output includes extracted content and screenshot artifact metadata. Side effect: captures an image and may call a vision model."
-  created_by: "agency"
-  owned_by: "agency"
-  parameters:
-    text:
-      mandatory: true
-      type: "string"
-      description: "Extraction instruction for the current screenshot."
-    full_page_screenshot:
-      mandatory: false
-      type: "boolean"
-      description: "Whether to capture the full scrollable page."
-    img_directory:
-      mandatory: true
-      type: "string"
-      cloud_directory: true
-      input_type: "hidden"
-      description: "Artifact directory for the screenshot."
+  agency.excel.write-image:
+    id: "agency.excel.write-image"
+    name: "excel_write_image"
+    display_name: "Excel Write Image"
+    description: "Embed one screenshot or image into an Excel worksheet for test evidence, visual reports, or audit artifacts. Required inputs: `sheet_name`, `excel_file_path`, `image_path`, and `serial_number`. Optional input: `header_title`. Output reports success or the specific workbook/sheet/file error. Side effect: modifies the target workbook while holding a file lock."
+    created_by: "agency"
+    owned_by: "agency"
+    parameters:
+      sheet_name:
+        mandatory: true
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Worksheet name to update."
+      excel_file_path:
+        mandatory: true
+        type: "string"
+        filled_by: "user"
+        description: "Allowlisted workbook path to modify."
+      image_path:
+        mandatory: true
+        type: "string"
+        filled_by: "agent"
+        description: "Runtime-generated image path to embed."
+      serial_number:
+        mandatory: true
+        type: "integer"
+        filled_by: "agent"
+        description: "Row offset or test-case serial number for placement."
+      header_title:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Optional column header title."
 
-agency.browser.scroll:
-  id: "agency.browser.scroll"
-  name: "scroll_browser"
-  display_name: "Scroll Browser"
-  description: "Scroll the current browser page up or down. Use this when visible content is incomplete or the target element is likely off-screen. Required input: `scroll_direction`, such as `scroll down 2 times`. Optional input: `instruction` to describe the target area. Output reports the updated browser state. Side effect: changes page scroll position."
-  created_by: "agency"
-  owned_by: "agency"
-  parameters: {}
+  agency.excel.write-json:
+    id: "agency.excel.write-json"
+    name: "excel_write_json"
+    display_name: "Excel Write JSON"
+    description: "Read a JSON file and write its keys and values into an Excel worksheet row for structured test or workflow output. Required inputs: `sheet_name`, `excel_file_path`, `json_file_path`, and `serial_number`. Output reports success or the specific JSON/workbook/sheet error. Side effect: modifies the target workbook while holding a file lock."
+    created_by: "agency"
+    owned_by: "agency"
+    parameters:
+      sheet_name:
+        mandatory: true
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Worksheet name to update."
+      excel_file_path:
+        mandatory: true
+        type: "string"
+        filled_by: "user"
+        description: "Allowlisted workbook path to modify."
+      json_file_path:
+        mandatory: true
+        type: "string"
+        filled_by: "agent"
+        description: "Runtime-generated JSON file path to read."
+      serial_number:
+        mandatory: true
+        type: "integer"
+        filled_by: "agent"
+        description: "Row offset or test-case serial number for placement."
 
-agency.browser.click:
-  id: "agency.browser.click"
-  name: "click_browser"
-  display_name: "Click Browser"
-  description: "Click an element on the current page using a natural-language element description or sequence number. Use this for intentional browser interactions after opening the page and inspecting the current state. Required input: `instruction`. Optional input: `sequence_number`. Output reports the click result and updated state. Side effect: mutates browser/page state and may trigger navigation or external actions."
-  created_by: "agency"
-  owned_by: "agency"
-  parameters:
-    img_directory:
-      mandatory: true
-      type: "string"
-      cloud_directory: true
-      input_type: "hidden"
-      description: "Artifact directory for interaction screenshots."
+  agency.excel.write-text:
+    id: "agency.excel.write-text"
+    name: "excel_write_text"
+    display_name: "Excel Write Text"
+    description: "Read a text file and insert its content into an Excel worksheet row for test evidence, logs, or generated narrative output. Required inputs: `sheet_name`, `excel_file_path`, `text_file_path`, and `serial_number`. Optional input: `header_title`. Output reports success or the specific text/workbook/sheet error. Side effect: modifies the target workbook while holding a file lock."
+    created_by: "agency"
+    owned_by: "agency"
+    parameters:
+      sheet_name:
+        mandatory: true
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Worksheet name to update."
+      excel_file_path:
+        mandatory: true
+        type: "string"
+        filled_by: "user"
+        description: "Allowlisted workbook path to modify."
+      text_file_path:
+        mandatory: true
+        type: "string"
+        filled_by: "agent"
+        description: "Runtime-generated text file path to read."
+      serial_number:
+        mandatory: true
+        type: "integer"
+        filled_by: "agent"
+        description: "Row offset or test-case serial number for placement."
+      header_title:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Optional column header title."
 
-agency.browser.select-option:
-  id: "agency.browser.select-option"
-  name: "select_browser_option"
-  display_name: "Select Browser Option"
-  description: "Select an option from a dropdown on the current page using a natural-language dropdown and option description or sequence number. Required input: `instruction`. Optional input: `sequence_number`. Output reports the selection result. Side effect: mutates browser/page state and may trigger form changes."
-  created_by: "agency"
-  owned_by: "agency"
-  parameters:
-    img_directory:
-      mandatory: true
-      type: "string"
-      cloud_directory: true
-      input_type: "hidden"
-      description: "Artifact directory for interaction screenshots."
+  agency.browser.open:
+    id: "agency.browser.open"
+    name: "open_browser"
+    display_name: "Open Browser"
+    description: "Start or reuse a Playwright browser session and navigate to a URL. Use this before screenshot, click, type, select, scroll, extract, or verify browser tools. Optional inputs configure HTTP auth, user agent, browser type, mobile mode, locale, timezone, storage state, video recording, tracing, and extra headers. Output includes navigation status and browser artifacts. Side effect: creates browser session state and may load remote web content."
+    created_by: "agency"
+    owned_by: "agency"
+    parameters:
+      url:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "URL to open. If omitted, the tool may initialize the browser without navigation."
+      http_credentials_username:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Optional HTTP basic-auth username."
+      http_credentials_password:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Optional HTTP basic-auth password."
+      user_agent:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Optional custom browser user agent."
+      browser_type:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Optional browser family to emulate, such as chrome, firefox, safari, or edge."
+      mobile:
+        mandatory: false
+        type: "boolean"
+        filled_by: "user_or_agent"
+        description: "Whether to use mobile viewport and user-agent behavior."
+      locale:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Optional browser locale, for example en-US."
+      timezone_id:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Optional browser timezone, for example Asia/Singapore."
+      storage_state_path:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        input_type: "hidden"
+        description: "Optional Playwright storage-state JSON file to preload cookies and local storage."
+      record_video:
+        mandatory: false
+        type: "boolean"
+        filled_by: "user_or_agent"
+        description: "Whether to record video artifacts for the session."
+      trace_mode:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Optional tracing mode such as off, on, or retain-on-failure."
+      extra_http_headers:
+        mandatory: false
+        type: "object"
+        filled_by: "user_or_agent"
+        description: "Optional extra HTTP headers sent with browser requests."
+      img_directory:
+        mandatory: true
+        type: "string"
+        cloud_directory: true
+        input_type: "hidden"
+        filled_by: "agent"
+        description: "Artifact directory for screenshots and browser outputs."
 
-agency.browser.type-text:
-  id: "agency.browser.type-text"
-  name: "type_in_browser"
-  display_name: "Type in Browser"
-  description: "Type text into an input field or textarea on the current page using a natural-language field description and quoted text. Required input: `instruction`. Optional input: `sequence_number`. Output reports the typing result. Side effect: mutates browser/page state and may enter sensitive data if the instruction includes it."
-  created_by: "agency"
-  owned_by: "agency"
-  parameters:
-    img_directory:
-      mandatory: true
-      type: "string"
-      cloud_directory: true
-      input_type: "hidden"
-      description: "Artifact directory for interaction screenshots."
+  agency.browser.screenshot:
+    id: "agency.browser.screenshot"
+    name: "take_screenshot"
+    display_name: "Take Screenshot"
+    description: "Capture a screenshot of the current browser page. Use this after opening or interacting with a page when the agent needs visual evidence or a page-state artifact. Optional input: `full_page_screenshot`. Output includes screenshot artifact metadata. Side effect: writes a screenshot artifact."
+    created_by: "agency"
+    owned_by: "agency"
+    parameters:
+      full_page_screenshot:
+        mandatory: false
+        type: "boolean"
+        filled_by: "user_or_agent"
+        description: "Whether to capture the full scrollable page instead of only the viewport."
+      img_directory:
+        mandatory: true
+        type: "string"
+        cloud_directory: true
+        input_type: "hidden"
+        filled_by: "agent"
+        description: "Artifact directory for the screenshot."
 
-agency.browser.verify-content:
-  id: "agency.browser.verify-content"
-  name: "verify_browser_content"
-  display_name: "Verify Browser Content"
-  description: "Compare expected text or requirements against the current page content and return a score with reasoning. Use this after navigation or interactions to verify task completion. Required input: `text`, the expected content or verification instruction. Output includes score and reasoning. Side effect: read-only page inspection."
-  created_by: "agency"
-  owned_by: "agency"
-  parameters:
-    img_directory:
-      mandatory: true
-      type: "string"
-      cloud_directory: true
-      input_type: "hidden"
-      description: "Artifact directory for verification screenshots."
+  agency.browser.analyze-screenshot:
+    id: "agency.browser.analyze-screenshot"
+    name: "analyze_screenshot"
+    display_name: "Analyze Screenshot"
+    description: "Capture the current page screenshot and ask the configured vision model to analyze whether the user's instruction or question can be resolved from the visual state. Required input: `text`, the instruction or question to analyze against the screenshot. Optional input: `full_page_screenshot`. Output includes model analysis and screenshot artifact metadata. Side effect: captures an image and may call a vision model."
+    created_by: "agency"
+    owned_by: "agency"
+    parameters:
+      text:
+        mandatory: true
+        type: "string"
+        filled_by: "agent"
+        description: "Instruction or question to answer from the current screenshot."
+      full_page_screenshot:
+        mandatory: false
+        type: "boolean"
+        filled_by: "user_or_agent"
+        description: "Whether to capture the full scrollable page."
+      img_directory:
+        mandatory: true
+        type: "string"
+        cloud_directory: true
+        input_type: "hidden"
+        filled_by: "agent"
+        description: "Artifact directory for the screenshot."
 
-agency.browser.close:
-  id: "agency.browser.close"
-  name: "close_browser"
-  display_name: "Close Browser"
-  description: "Terminate the current headless browser session and release browser resources. Use this when browser work is complete or a workflow needs to reset browser state. Input schema is empty. Output reports termination status. Side effect: closes browser state and invalidates the current page session."
-  created_by: "agency"
-  owned_by: "agency"
-  parameters: {}
+  agency.browser.extract-screenshot:
+    id: "agency.browser.extract-screenshot"
+    name: "extract_screenshot"
+    display_name: "Extract Screenshot"
+    description: "Capture the current page screenshot and ask the configured vision model to extract content requested by the agent. Required input: `text`, the extraction instruction. Optional input: `full_page_screenshot`. Output includes extracted content and screenshot artifact metadata. Side effect: captures an image and may call a vision model."
+    created_by: "agency"
+    owned_by: "agency"
+    parameters:
+      text:
+        mandatory: true
+        type: "string"
+        filled_by: "agent"
+        description: "Extraction instruction for the current screenshot."
+      full_page_screenshot:
+        mandatory: false
+        type: "boolean"
+        filled_by: "user_or_agent"
+        description: "Whether to capture the full scrollable page."
+      img_directory:
+        mandatory: true
+        type: "string"
+        cloud_directory: true
+        input_type: "hidden"
+        filled_by: "agent"
+        description: "Artifact directory for the screenshot."
+
+  agency.browser.scroll:
+    id: "agency.browser.scroll"
+    name: "scroll_browser"
+    display_name: "Scroll Browser"
+    description: "Scroll the current browser page up or down. Use this when visible content is incomplete or the target element is likely off-screen. Required input: `scroll_direction`, such as `scroll down 2 times`. Optional input: `instruction` to describe the target area. Output reports the updated browser state. Side effect: changes page scroll position."
+    created_by: "agency"
+    owned_by: "agency"
+    parameters:
+      instruction:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Optional instruction describing the target area to reveal while scrolling."
+      scroll_direction:
+        mandatory: true
+        type: "string"
+        filled_by: "agent"
+        description: "Scroll instruction such as up, down, or scroll down 2 times."
+
+  agency.browser.click:
+    id: "agency.browser.click"
+    name: "click_browser"
+    display_name: "Click Browser"
+    description: "Click an element on the current page using a natural-language element description or sequence number. Use this for intentional browser interactions after opening the page and inspecting the current state. Required input: `instruction`. Optional input: `sequence_number`. Output reports the click result and updated state. Side effect: mutates browser/page state and may trigger navigation or external actions."
+    created_by: "agency"
+    owned_by: "agency"
+    parameters:
+      instruction:
+        mandatory: true
+        type: "string"
+        filled_by: "agent"
+        description: "Natural-language description of what to click."
+      sequence_number:
+        mandatory: false
+        type: "integer"
+        filled_by: "agent"
+        description: "Optional screenshot sequence number to disambiguate a target."
+      img_directory:
+        mandatory: true
+        type: "string"
+        cloud_directory: true
+        input_type: "hidden"
+        filled_by: "agent"
+        description: "Artifact directory for interaction screenshots."
+
+  agency.browser.select-option:
+    id: "agency.browser.select-option"
+    name: "select_browser_option"
+    display_name: "Select Browser Option"
+    description: "Select an option from a dropdown on the current page using a natural-language dropdown and option description or sequence number. Required input: `instruction`. Optional input: `sequence_number`. Output reports the selection result. Side effect: mutates browser/page state and may trigger form changes."
+    created_by: "agency"
+    owned_by: "agency"
+    parameters:
+      instruction:
+        mandatory: true
+        type: "string"
+        filled_by: "agent"
+        description: "Natural-language description of the dropdown and option to select."
+      sequence_number:
+        mandatory: false
+        type: "integer"
+        filled_by: "agent"
+        description: "Optional screenshot sequence number to disambiguate a target."
+      img_directory:
+        mandatory: true
+        type: "string"
+        cloud_directory: true
+        input_type: "hidden"
+        filled_by: "agent"
+        description: "Artifact directory for interaction screenshots."
+
+  agency.browser.type-text:
+    id: "agency.browser.type-text"
+    name: "type_in_browser"
+    display_name: "Type in Browser"
+    description: "Type text into an input field or textarea on the current page using a natural-language field description and quoted text. Required input: `instruction`. Optional input: `sequence_number`. Output reports the typing result. Side effect: mutates browser/page state and may enter sensitive data if the instruction includes it."
+    created_by: "agency"
+    owned_by: "agency"
+    parameters:
+      instruction:
+        mandatory: true
+        type: "string"
+        filled_by: "agent"
+        description: "Natural-language description of the input field and text to enter."
+      sequence_number:
+        mandatory: false
+        type: "integer"
+        filled_by: "agent"
+        description: "Optional screenshot sequence number to disambiguate a target."
+      img_directory:
+        mandatory: true
+        type: "string"
+        cloud_directory: true
+        input_type: "hidden"
+        filled_by: "agent"
+        description: "Artifact directory for interaction screenshots."
+
+  agency.browser.verify-content:
+    id: "agency.browser.verify-content"
+    name: "verify_browser_content"
+    display_name: "Verify Browser Content"
+    description: "Compare expected text or requirements against the current page content and return a score with reasoning. Use this after navigation or interactions to verify task completion. Required input: `text`, the expected content or verification instruction. Output includes score and reasoning. Side effect: read-only page inspection."
+    created_by: "agency"
+    owned_by: "agency"
+    parameters:
+      text:
+        mandatory: true
+        type: "string"
+        filled_by: "agent"
+        description: "Expected content or verification instruction for the current page."
+      img_directory:
+        mandatory: true
+        type: "string"
+        cloud_directory: true
+        input_type: "hidden"
+        filled_by: "agent"
+        description: "Artifact directory for verification screenshots."
+
+  agency.browser.close:
+    id: "agency.browser.close"
+    name: "close_browser"
+    display_name: "Close Browser"
+    description: "Terminate the current headless browser session and release browser resources. Use this when browser work is complete or a workflow needs to reset browser state. Input schema is empty. Output reports termination status. Side effect: closes browser state and invalidates the current page session."
+    created_by: "agency"
+    owned_by: "agency"
+    parameters: { }
+
+system_tools:
+  workflow:
+    - id: agency.workflow.list
+      name: list_workflows
+      display_name: List Workflows
+      description: List workflows assigned to the deployment that are visible to this agent. Use this before choosing a workflow unless the user gave an exact workflow id. Output includes workflow ids, names, descriptions, runtime adapters, and metadata needed to choose safely.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties: { }
+        additionalProperties: false
+      output_schema_name: ITEMS_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: list_workflows
+      security:
+        read_only: true
+      tags:
+        - system
+        - workflow
+        - agent_assignable
+        - read_only
+    - id: agency.workflow.get
+      name: get_workflow
+      display_name: Get Workflow
+      description: Get a visible workflow definition by `workflow_id` before planning a run or update. Output includes agents, tasks, tool definitions, graph structure, runtime settings, and metadata.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: ID of a visible workflow.
+        required:
+          - workflow_id
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: get_workflow
+      security:
+        read_only: true
+      tags:
+        - system
+        - workflow
+        - agent_assignable
+        - read_only
+    - id: agency.workflow.run
+      name: run_workflow
+      display_name: Run Workflow
+      description: Run a visible workflow by workflow_id. Call Get Workflow first when inputs are unclear. Protected workflows request human approval before every execution attempt. Output returns execution status, id, and runtime payload for follow-up inspection.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: ID of a visible workflow.
+          input_payload:
+            type: object
+            description: Workflow input payload keyed by the workflow's input_keys or task input_schema properties.
+            examples:
+              - topic: quarterly launch plan
+                audience: internal operators
+            additionalProperties: true
+          runtime_adapter_id:
+            type:
+              - string
+              - "null"
+            description: Optional runtime adapter override.
+          goal_id:
+            type:
+              - string
+              - "null"
+            description: Optional durable goal id to associate with the created workflow execution.
+          conversation_id:
+            type:
+              - string
+              - "null"
+            description: Optional conversation id for protected workflow approval requests.
+          origin_message_id:
+            type:
+              - string
+              - "null"
+            description: Optional existing origin message id for protected workflow approval requests.
+        required:
+          - workflow_id
+        additionalProperties: false
+      output_schema_name: WORKFLOW_RUN_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: run_workflow
+      security:
+        read_only: false
+      tags:
+        - system
+        - workflow
+        - agent_assignable
+    - id: agency.workflow.propose-create
+      name: propose_workflow_create
+      display_name: Propose New Workflow
+      description: Propose creating a workflow. Provide either a complete workflow payload or a natural-language goal. Prefer goal for smaller context windows; the backend workflow builder can draft and repair the payload. This always creates a human approval request before the workflow is persisted.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          summary:
+            type: string
+            description: Human-readable summary of the workflow proposal.
+          diff_summary:
+            type:
+              - string
+              - "null"
+            description: Optional concise explanation of the proposed workflow contents.
+          goal:
+            type: string
+            description: Natural-language workflow goal to draft using the existing workflow builder. Use this instead of a full workflow when the required JSON is too large or uncertain.
+            examples:
+              - Create a workflow that researches a prospect, drafts an outreach email, and asks for approval before sending.
+          conversation_history:
+            type:
+              - string
+              - "null"
+            description: Optional context for the workflow builder.
+          model_profile_id:
+            type:
+              - string
+              - "null"
+            description: Optional model profile for workflow builder structured generation.
+          restart_active_executions:
+            type: boolean
+            description: Whether approving this workflow revision should create replacement executions for active runs of the same workflow and cancel/remove their existing containers. Use true only when the update makes active runs stale or unsafe to continue; default false.
+          workflow:
+            type: object
+            description: Complete WorkflowDefinition payload. If validation fails, retry with a smaller goal-based request or include only the corrected sections.
+            additionalProperties: true
+        additionalProperties: false
+      output_schema_name: PROPOSAL_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: propose_workflow_create
+      security:
+        requires_approval: false
+      tags:
+        - system
+        - workflow
+        - agent_assignable
+        - mutation
+    - id: agency.workflow.propose-update
+      name: propose_workflow_update
+      display_name: Propose Workflow Update
+      description: Propose updating a visible, mutable workflow. Provide either a complete updated workflow payload or a natural-language goal. Prefer goal for smaller context windows. This always creates a human approval request before changes are applied.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: ID of the workflow to update.
+          summary:
+            type: string
+            description: Human-readable summary of the proposed update.
+          diff_summary:
+            type:
+              - string
+              - "null"
+            description: Optional concise explanation of the changed workflow fields.
+          goal:
+            type: string
+            description: Natural-language edit request to apply to the current workflow. Use this when patching a large workflow or when validation repair is likely.
+            examples:
+              - Add a human approval task before any external email tool is called, and keep the existing agents.
+          conversation_history:
+            type:
+              - string
+              - "null"
+            description: Optional context for the workflow builder.
+          model_profile_id:
+            type:
+              - string
+              - "null"
+            description: Optional model profile for workflow builder structured generation.
+          workflow:
+            type: object
+            description: Complete updated WorkflowDefinition payload. If omitted, goal is required. If validation fails, repair only the fields called out by validation rather than regenerating unrelated sections.
+            additionalProperties: true
+        required:
+          - workflow_id
+        additionalProperties: false
+      output_schema_name: PROPOSAL_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: propose_workflow_update
+      security:
+        requires_approval: false
+      tags:
+        - system
+        - workflow
+        - agent_assignable
+        - mutation
+    - id: agency.schedule.list
+      name: list_schedules
+      display_name: List Schedules
+      description: List workflow schedules before creating, editing, disabling, or manually triggering one. Output includes schedule ids, workflow bindings, trigger configuration, and enabled state so the main agent can reason about orchestration safely.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: [ string, "null" ]
+            description: Optional workflow id to filter schedules.
+          enabled:
+            type: [ boolean, "null" ]
+            description: Optional enabled-state filter.
+          limit:
+            type: integer
+            minimum: 1
+            maximum: 200
+            description: Maximum number of schedules to return.
+        additionalProperties: false
+      output_schema_name: ITEMS_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: list_schedules
+      security:
+        read_only: true
+      tags: [ system, workflow, schedule, agent_assignable, read_only ]
+    - id: agency.schedule.get
+      name: get_schedule
+      display_name: Get Schedule
+      description: Get one workflow schedule by `schedule_id` before patching or triggering it. Output includes the normalized schedule definition and current scheduler metadata.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          schedule_id:
+            type: string
+            description: ID of the schedule to inspect.
+        required: [ schedule_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: get_schedule
+      security:
+        read_only: true
+      tags: [ system, workflow, schedule, agent_assignable, read_only ]
+    - id: agency.schedule.create
+      name: create_schedule
+      display_name: Create Schedule
+      description: Create a workflow schedule when the user asks the main agent to automate or periodically trigger an existing workflow. Provide a complete schedule payload with workflow_id, trigger settings, and optional input template.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          schedule:
+            type: object
+            description: Complete ScheduleDefinition payload to create.
+            additionalProperties: true
+        required: [ schedule ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: create_schedule
+      security:
+        read_only: false
+      tags: [ system, workflow, schedule, agent_assignable, mutation ]
+    - id: agency.schedule.update
+      name: update_schedule
+      display_name: Update Schedule
+      description: Patch an existing schedule by `schedule_id` after inspecting it. Use this to change trigger rules, enablement, input templates, or adapter overrides without recreating the schedule from scratch.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          schedule_id:
+            type: string
+            description: ID of the schedule to patch.
+          patch:
+            type: object
+            description: Partial schedule fields to update.
+            additionalProperties: true
+        required: [ schedule_id, patch ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: update_schedule
+      security:
+        read_only: false
+      tags: [ system, workflow, schedule, agent_assignable, mutation ]
+    - id: agency.schedule.delete
+      name: delete_schedule
+      display_name: Delete Schedule
+      description: Soft-delete a schedule after the user explicitly asks to remove an automation. Use Get Schedule first when there is any ambiguity about the selected schedule id.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          schedule_id:
+            type: string
+            description: ID of the schedule to delete.
+        required: [ schedule_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: delete_schedule
+      security:
+        read_only: false
+      tags: [ system, workflow, schedule, agent_assignable, mutation ]
+    - id: agency.schedule.trigger-now
+      name: trigger_schedule_now
+      display_name: Trigger Schedule Now
+      description: Manually trigger a workflow schedule immediately when the user wants to fire the configured automation outside its normal cadence. Output includes the created execution id and trigger timestamp.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          schedule_id:
+            type: string
+            description: ID of the schedule to trigger immediately.
+        required: [ schedule_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: trigger_schedule_now
+      security:
+        read_only: false
+      tags: [ system, workflow, schedule, agent_assignable, mutation ]
+    - id: agency.workflow.runtime-governance.get
+      name: get_workflow_runtime_governance
+      display_name: Get Workflow Runtime Governance
+      description: Read workflow runtime-governance controls before adjusting token budgets, context compaction, or monitor policy. Output normalizes defaults and shows operator actions for follow-up updates.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: ID of the workflow to inspect.
+        required: [ workflow_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: get_workflow_runtime_governance
+      security:
+        read_only: true
+      tags: [ system, workflow, governance, agent_assignable, read_only ]
+    - id: agency.workflow.runtime-governance.update
+      name: update_workflow_runtime_governance
+      display_name: Update Workflow Runtime Governance
+      description: Update one workflow's runtime-governance controls after the user asks to change token budgets or context compaction behavior. Provide only the fields that should change inside `patch`.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: ID of the workflow to update.
+          patch:
+            type: object
+            description: Partial runtime-governance patch with token_budget and context_compaction fields.
+            additionalProperties: true
+        required: [ workflow_id, patch ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: update_workflow_runtime_governance
+      security:
+        read_only: false
+      tags: [ system, workflow, governance, agent_assignable, mutation ]
+    - id: agency.main-agent.monitor.get
+      name: get_main_agent_monitor_command_center
+      display_name: Get Main Agent Monitor Command Center
+      description: Read the main-agent monitoring command center before routing alerts, reviewing findings, or understanding which workflows are monitored, exempt, strict, or waiting on approval.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties: { }
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: get_main_agent_monitor_command_center
+      security:
+        read_only: true
+      tags: [ system, workflow, governance, monitor, agent_assignable, read_only ]
+    - id: agency.main-agent.monitor.update-routes
+      name: update_main_agent_monitor_routes
+      display_name: Update Main Agent Monitor Routes
+      description: Update approval conversation routing, delivery options, or monitor-notification settings after the user changes where main-agent monitor findings and proposals should go.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          patch:
+            type: object
+            description: Partial monitor routing patch matching the main-agent monitor route settings payload.
+            additionalProperties: true
+        required: [ patch ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: update_main_agent_monitor_routes
+      security:
+        read_only: false
+      tags: [ system, workflow, governance, monitor, agent_assignable, mutation ]
+    - id: agency.workflow.monitoring.events
+      name: get_workflow_monitoring_events
+      display_name: Get Workflow Monitoring Events
+      description: Review monitor findings, improvement proposals, evaluation reviews, steering requests, and approval controls for one workflow. Use this as the main-agent review surface before deciding on governance or repair actions.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: ID of the workflow whose monitor history should be reviewed.
+        required: [ workflow_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: get_workflow_monitoring_events
+      security:
+        read_only: true
+      tags: [ system, workflow, governance, monitor, review, agent_assignable, read_only ]
+    - id: agency.workflow.monitor-proposal.dispatch
+      name: dispatch_workflow_monitor_proposal
+      display_name: Dispatch Workflow Monitor Proposal
+      description: Send one monitor improvement proposal into the main-agent approval conversation so the main agent can review or act on it in context. Use this only after inspecting workflow monitoring events.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: Workflow that owns the proposal event.
+          proposal_event_id:
+            type: string
+            description: Monitor proposal event id to dispatch.
+          operator_note:
+            type: [ string, "null" ]
+            description: Optional operator note appended to the dispatched message.
+        required: [ workflow_id, proposal_event_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: dispatch_workflow_monitor_proposal
+      security:
+        read_only: false
+      tags: [ system, workflow, governance, proposal, agent_assignable, mutation ]
+    - id: agency.workflow.improvement-proposals
+      name: list_workflow_improvement_proposals
+      display_name: List Workflow Improvement Proposals
+      description: Review operator-created and monitor-created improvement proposals for one workflow, optionally filtered by proposal id or status. Use this before deciding whether to revise, dispatch, or apply a workflow improvement idea.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: ID of the workflow whose proposal history should be reviewed.
+          proposal_id:
+            type: [ string, "null" ]
+            description: Optional proposal id to isolate one proposal record.
+          status:
+            type: [ string, "null" ]
+            description: Optional status filter such as draft, proposed, approved, rejected, or archived.
+          limit:
+            type: [ integer, "null" ]
+            description: Optional maximum number of proposals to return. Defaults to 20 and caps at 100.
+        required: [ workflow_id ]
+        additionalProperties: false
+      output_schema_name: ITEMS_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: list_workflow_improvement_proposals
+      security:
+        read_only: true
+      tags: [ system, workflow, governance, proposal, review, agent_assignable, read_only ]
+    - id: agency.workflow.improvement-proposal.create
+      name: create_workflow_improvement_proposal
+      display_name: Create Workflow Improvement Proposal
+      description: Create an operator-managed improvement proposal record for one workflow. Use this when the main agent wants to preserve a workflow change recommendation, expected benefit, validation plan, and rollback plan before approval or implementation work begins.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: ID of the workflow that owns this proposal.
+          title:
+            type: string
+            description: Short title for the proposal.
+          summary:
+            type: string
+            description: Brief operator-facing summary of the proposed improvement.
+          status:
+            type: [ string, "null" ]
+            description: Optional initial status. Defaults to draft.
+          priority:
+            type: [ string, "null" ]
+            description: Optional priority label such as low, medium, or high.
+          proposal_kind:
+            type: [ string, "null" ]
+            description: Optional proposal type label such as operator_change, monitor_change, or prompt_tuning.
+          created_by:
+            type: [ string, "null" ]
+            description: Optional actor label stored on the proposal.
+          execution_id:
+            type: [ string, "null" ]
+            description: Optional execution id tied to the proposal.
+          finding_event_id:
+            type: [ string, "null" ]
+            description: Optional monitor finding event id linked to this proposal.
+          proposal_event_id:
+            type: [ string, "null" ]
+            description: Optional monitor proposal event id linked to this proposal.
+          approval_request_id:
+            type: [ string, "null" ]
+            description: Optional approval request id linked to this proposal.
+          diagnosis:
+            type: [ object, "null" ]
+            description: Optional structured diagnosis payload.
+            additionalProperties: true
+          proposed_change:
+            type: [ object, "null" ]
+            description: Structured workflow change payload or recommendation summary.
+            additionalProperties: true
+          expected_benefit:
+            type: [ string, "null" ]
+            description: Optional expected benefit statement.
+          risk:
+            type: [ string, "null" ]
+            description: Optional risk statement.
+          validation_plan:
+            type: [ string, "null" ]
+            description: Optional validation plan.
+          rollback_plan:
+            type: [ string, "null" ]
+            description: Optional rollback plan.
+          tags:
+            type: [ array, "null" ]
+            items:
+              type: string
+            description: Optional proposal tags.
+          metadata:
+            type: [ object, "null" ]
+            description: Optional extra metadata.
+            additionalProperties: true
+        required: [ workflow_id, title, summary ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: create_workflow_improvement_proposal
+      security:
+        read_only: false
+      tags: [ system, workflow, governance, proposal, agent_assignable, mutation ]
+    - id: agency.workflow.improvement-proposal.update
+      name: update_workflow_improvement_proposal
+      display_name: Update Workflow Improvement Proposal
+      description: Update one stored workflow improvement proposal after review, approval routing, or implementation planning changes the recommended action, status, or supporting evidence.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: ID of the workflow that owns the proposal.
+          proposal_id:
+            type: string
+            description: Proposal id returned by the proposal list or create tool.
+          patch:
+            type: object
+            description: Partial proposal patch with supported fields such as status, title, summary, proposed_change, validation_plan, or approval_request_id.
+            additionalProperties: true
+        required: [ workflow_id, proposal_id, patch ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: update_workflow_improvement_proposal
+      security:
+        read_only: false
+      tags: [ system, workflow, governance, proposal, agent_assignable, mutation ]
+    - id: agency.workflow.improvement-proposal.request-approval
+      name: request_workflow_improvement_proposal_approval
+      display_name: Request Workflow Improvement Proposal Approval
+      description: Turn one stored workflow improvement proposal into a real approval request in the workflow review conversation and sync the resulting approval_request_id back into proposal metadata.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id: { type: string, description: ID of the workflow that owns the proposal. }
+          proposal_id: { type: string, description: Proposal id returned by the improvement proposal list or create tool. }
+        required: [ workflow_id, proposal_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: request_workflow_improvement_proposal_approval
+      security: { read_only: false }
+      tags: [ system, workflow, governance, proposal, approval, agent_assignable, mutation ]
+    - id: agency.workflow.steering-approvals
+      name: list_workflow_steering_approvals
+      display_name: List Workflow Steering Approvals
+      description: Review workflow steering approval records, including monitor-created and operator-created approval packets, before escalating, approving, or revising supervisor steering actions.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: ID of the workflow whose steering approval history should be reviewed.
+          approval_id:
+            type: [ string, "null" ]
+            description: Optional approval id to isolate one steering approval record.
+          status:
+            type: [ string, "null" ]
+            description: Optional status filter such as pending, requested, approved, rejected, or applied.
+          limit:
+            type: [ integer, "null" ]
+            description: Optional maximum number of records to return. Defaults to 20 and caps at 100.
+        required: [ workflow_id ]
+        additionalProperties: false
+      output_schema_name: ITEMS_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: list_workflow_steering_approvals
+      security:
+        read_only: true
+      tags: [ system, workflow, governance, steering, review, agent_assignable, read_only ]
+    - id: agency.workflow.steering-approval.create
+      name: create_workflow_steering_approval
+      display_name: Create Workflow Steering Approval
+      description: Create a workflow steering approval packet that captures the recommended action, reason, execution linkage, operator parameters, and approval context before a steering change is acted on.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: ID of the workflow that owns this steering approval.
+          title:
+            type: [ string, "null" ]
+            description: Optional title for the approval record.
+          status:
+            type: [ string, "null" ]
+            description: Optional initial status. Defaults to pending.
+          recommended_action:
+            type: string
+            description: Steering action being requested, such as request_replan or redirect_subagent.
+          reason:
+            type: string
+            description: Why this steering change is needed.
+          created_by:
+            type: [ string, "null" ]
+            description: Optional actor label stored on the record.
+          execution_id:
+            type: [ string, "null" ]
+            description: Optional execution id tied to this steering approval.
+          finding_event_id:
+            type: [ string, "null" ]
+            description: Optional monitor finding event id tied to this steering approval.
+          steering_request_event_id:
+            type: [ string, "null" ]
+            description: Optional steering request event id linked to this record.
+          approval_request_id:
+            type: [ string, "null" ]
+            description: Optional conversation approval request id linked to this record.
+          target_task_id:
+            type: [ string, "null" ]
+            description: Optional target task id for task-level steering.
+          target_agent_id:
+            type: [ string, "null" ]
+            description: Optional target agent id for agent-level steering.
+          operator_parameters:
+            type: [ object, "null" ]
+            description: Optional structured parameters for the steering action.
+            additionalProperties: true
+          evidence:
+            type: [ object, "null" ]
+            description: Optional evidence payload supporting the steering action.
+            additionalProperties: true
+          policy:
+            type: [ object, "null" ]
+            description: Optional policy payload for this steering decision.
+            additionalProperties: true
+          metadata:
+            type: [ object, "null" ]
+            description: Optional extra metadata.
+            additionalProperties: true
+        required: [ workflow_id, recommended_action, reason ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: create_workflow_steering_approval
+      security:
+        read_only: false
+      tags: [ system, workflow, governance, steering, agent_assignable, mutation ]
+    - id: agency.workflow.steering-approval.update
+      name: update_workflow_steering_approval
+      display_name: Update Workflow Steering Approval
+      description: Update one steering approval record after review or approval changes its status, target, linked approval request, or operator parameters.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: ID of the workflow that owns the steering approval.
+          approval_id:
+            type: string
+            description: Steering approval id returned by the steering approval list or create tool.
+          patch:
+            type: object
+            description: Partial steering approval patch with supported fields such as status, reason, operator_parameters, or approval_request_id.
+            additionalProperties: true
+        required: [ workflow_id, approval_id, patch ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: update_workflow_steering_approval
+      security:
+        read_only: false
+      tags: [ system, workflow, governance, steering, agent_assignable, mutation ]
+    - id: agency.workflow.steering-approval.request-approval
+      name: request_workflow_steering_approval
+      display_name: Request Workflow Steering Approval
+      description: Turn one stored steering approval record into a real approval request in the workflow review conversation and sync the resulting approval_request_id back into the steering record.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id: { type: string, description: ID of the workflow that owns the steering approval record. }
+          approval_id: { type: string, description: Steering approval id returned by the steering approval list or create tool. }
+        required: [ workflow_id, approval_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: request_workflow_steering_approval
+      security: { read_only: false }
+      tags: [ system, workflow, governance, steering, approval, agent_assignable, mutation ]
+    - id: agency.workflow.governance.audit
+      name: get_workflow_governance_audit
+      display_name: Get Workflow Governance Audit
+      description: Audit workflow governance state by comparing stored improvement proposals and steering approvals against actual approval requests. Use this to detect mismatches, missing approval links, and orphaned approvals before repair.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id: { type: string, description: ID of the workflow whose governance records should be audited. }
+        required: [ workflow_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: get_workflow_governance_audit
+      security: { read_only: true }
+      tags: [ system, workflow, governance, audit, agent_assignable, read_only ]
+    - id: agency.workflow.governance.repair
+      name: repair_workflow_governance_record
+      display_name: Repair Workflow Governance Record
+      description: Repair one workflow governance record after audit detects drift. Use this to link or relink an approval request, clear a stale approval link, or sync record status from the linked approval request.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: ID of the workflow whose governance record should be repaired.
+          record_kind:
+            type: string
+            enum: [ improvement_proposal, steering_approval ]
+            description: Governance record family that owns the target record.
+          record_id:
+            type: string
+            description: Governance record id returned by the proposal or steering approval tools.
+          action:
+            type: string
+            enum: [ link_approval_request, unlink_approval_request, sync_status_from_approval ]
+            description: Repair action to apply. Link attaches an approval request and updates approval metadata, unlink clears the stored approval_request_id, and sync_status_from_approval refreshes record status from its linked approval.
+          approval_request_id:
+            type: [ string, "null" ]
+            description: Approval request id to attach when action is link_approval_request.
+        required: [ workflow_id, record_kind, record_id, action ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: repair_workflow_governance_record
+      security: { read_only: false }
+      tags: [ system, workflow, governance, repair, approval, agent_assignable, mutation ]
+    - id: agency.workflow.governance.remediate
+      name: remediate_workflow_governance
+      display_name: Remediate Workflow Governance
+      description: Apply conservative workflow-wide governance repairs using the current audit state. This only auto-fixes deterministic cases such as status mismatches, stale approval references, and orphaned approvals whose metadata already identifies one workflow governance record.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: ID of the workflow whose governance records should be remediated.
+          dry_run:
+            type: [ boolean, "null" ]
+            description: When true, preview the remediation plan without mutating workflow or approval state.
+          sync_status_mismatches:
+            type: [ boolean, "null" ]
+            description: When true, refresh governance record status from linked approval requests when audit detects a status mismatch. Defaults to true.
+          clear_orphaned_references:
+            type: [ boolean, "null" ]
+            description: When true, clear governance approval_request_id values that point at missing approvals. Defaults to true.
+          adopt_orphaned_approvals:
+            type: [ boolean, "null" ]
+            description: When true, relink orphaned approval requests whose metadata already names one matching workflow proposal or steering record. Defaults to true.
+        required: [ workflow_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: remediate_workflow_governance
+      security: { read_only: false }
+      tags: [ system, workflow, governance, remediation, approval, agent_assignable, mutation ]
+    - id: agency.workflow.governance.review-queue
+      name: get_workflow_governance_review_queue
+      display_name: Get Workflow Governance Review Queue
+      description: Aggregate workflow governance work into one review queue for the main agent, including pending proposals, steering approvals, evidence coverage, audit drift, orphaned approvals, and dry-run remediation suggestions.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: ID of the workflow whose governance review queue should be generated.
+          limit:
+            type: [ integer, "null" ]
+            description: Optional maximum number of queue items to return per section. Defaults to 20 and caps at 100.
+        required: [ workflow_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: get_workflow_governance_review_queue
+      security: { read_only: true }
+      tags: [ system, workflow, governance, review, queue, agent_assignable, read_only ]
+    - id: agency.workflow.governance.act
+      name: execute_workflow_governance_action
+      display_name: Execute Workflow Governance Action
+      description: Execute one recommended governance queue action for a workflow. Use this to request approval for a proposal or steering record, attach one uploaded document as evidence, manually resolve or dismiss a record, reopen a manually closed record, or apply deterministic governance remediation.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: ID of the workflow whose governance action should be executed.
+          action:
+            type: string
+            enum: [ request_approval, attach_evidence, resolve, dismiss, reopen, apply_remediation ]
+            description: Governance action to execute.
+          record_kind:
+            type: [ string, "null" ]
+            enum: [ improvement_proposal, steering_approval, null ]
+            description: Required for request_approval, attach_evidence, resolve, dismiss, and reopen. Identifies which governance record owns the action.
+          record_id:
+            type: [ string, "null" ]
+            description: Required for request_approval, attach_evidence, resolve, dismiss, and reopen. Governance record id returned by the proposal or steering tools.
+          document_id:
+            type: [ string, "null" ]
+            description: Required for attach_evidence. Uploaded document id to link into the governance record.
+          label:
+            type: [ string, "null" ]
+            description: Optional evidence label stored on the workflow document link.
+          summary:
+            type: [ string, "null" ]
+            description: Optional evidence summary stored on the workflow document link.
+          linked_by:
+            type: [ string, "null" ]
+            description: Optional actor label stored on the workflow document link.
+          metadata:
+            type: [ object, "null" ]
+            description: Optional extra metadata for attach_evidence.
+            additionalProperties: true
+          sync_status_mismatches:
+            type: [ boolean, "null" ]
+            description: Optional remediation flag used when action is apply_remediation. Defaults to true.
+          clear_orphaned_references:
+            type: [ boolean, "null" ]
+            description: Optional remediation flag used when action is apply_remediation. Defaults to true.
+          adopt_orphaned_approvals:
+            type: [ boolean, "null" ]
+            description: Optional remediation flag used when action is apply_remediation. Defaults to true.
+        required: [ workflow_id, action ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: execute_workflow_governance_action
+      security: { read_only: false }
+      tags: [ system, workflow, governance, action, approval, evidence, remediation, agent_assignable, mutation ]
+    - id: agency.workflow.governance.document-suggest
+      name: suggest_workflow_governance_documents
+      display_name: Suggest Workflow Governance Documents
+      description: Suggest uploaded workflow documents that may serve as evidence for one improvement proposal or steering approval. Use this before attaching evidence when the main agent needs candidate document ids and relevance reasons.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: ID of the workflow that owns the governance record and candidate documents.
+          record_kind:
+            type: string
+            enum: [ improvement_proposal, steering_approval ]
+            description: Governance record family that needs supporting evidence.
+          record_id:
+            type: string
+            description: Governance record id returned by the proposal or steering tools.
+          limit:
+            type: [ integer, "null" ]
+            description: Optional maximum number of suggested documents to return. Defaults to 5 and caps at 20.
+        required: [ workflow_id, record_kind, record_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: suggest_workflow_governance_documents
+      security: { read_only: true }
+      tags: [ system, workflow, governance, documents, evidence, suggestions, agent_assignable, read_only ]
+    - id: agency.workflow.governance.bundle
+      name: execute_workflow_governance_bundle
+      display_name: Execute Workflow Governance Bundle
+      description: Execute one guarded governance workflow for a single proposal or steering record by suggesting evidence, optionally attaching the top document match, and optionally requesting approval. Use dry_run first when the main agent needs to preview whether attachable evidence is available.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: ID of the workflow that owns the governance record.
+          record_kind:
+            type: string
+            enum: [ improvement_proposal, steering_approval ]
+            description: Governance record family that should receive the bundled action.
+          record_id:
+            type: string
+            description: Governance record id returned by the proposal or steering tools.
+          attach_top_suggestion:
+            type: [ boolean, "null" ]
+            description: When true, attach the highest ranked suggested document before any approval request. Defaults to true.
+          request_approval:
+            type: [ boolean, "null" ]
+            description: When true, request approval after any optional evidence attachment. Defaults to true.
+          document_limit:
+            type: [ integer, "null" ]
+            description: Optional maximum number of candidate documents to inspect when ranking suggestions. Defaults to 5 and caps at 20.
+          evidence_label:
+            type: [ string, "null" ]
+            description: Optional label stored on the attached workflow document link when attach_top_suggestion is enabled.
+          evidence_summary:
+            type: [ string, "null" ]
+            description: Optional summary stored on the attached workflow document link when attach_top_suggestion is enabled.
+          metadata:
+            type: [ object, "null" ]
+            description: Optional metadata stored on the attached workflow document link when attach_top_suggestion is enabled.
+            additionalProperties: true
+          dry_run:
+            type: [ boolean, "null" ]
+            description: When true, preview the bundle plan without mutating workflow state.
+        required: [ workflow_id, record_kind, record_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: execute_workflow_governance_bundle
+      security: { read_only: false }
+      tags: [ system, workflow, governance, bundle, evidence, approval, agent_assignable, mutation ]
+    - id: agency.workflow.document-links
+      name: list_workflow_document_links
+      display_name: List Workflow Document Links
+      description: Review document evidence links attached to a workflow, improvement proposal, or steering approval. Use this to see which uploaded documents are already linked into governance review history.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: ID of the workflow whose document links should be reviewed.
+          link_id:
+            type: [ string, "null" ]
+            description: Optional document link id to isolate one evidence link.
+          target_type:
+            type: [ string, "null" ]
+            description: Optional target type filter. Supported values are workflow, improvement_proposal, and steering_approval.
+          target_id:
+            type: [ string, "null" ]
+            description: Optional proposal or steering approval id filter when target_type is not workflow.
+          document_id:
+            type: [ string, "null" ]
+            description: Optional uploaded document id filter.
+          limit:
+            type: [ integer, "null" ]
+            description: Optional maximum number of links to return. Defaults to 20 and caps at 100.
+        required: [ workflow_id ]
+        additionalProperties: false
+      output_schema_name: ITEMS_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: list_workflow_document_links
+      security:
+        read_only: true
+      tags: [ system, workflow, documents, governance, review, agent_assignable, read_only ]
+    - id: agency.workflow.document-link.add
+      name: add_workflow_document_link
+      display_name: Add Workflow Document Link
+      description: Link one uploaded document as evidence for a workflow, workflow improvement proposal, or steering approval. Use this when a governance record should reference an uploaded file directly.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: ID of the workflow that owns the evidence link.
+          document_id:
+            type: string
+            description: Uploaded document id to link.
+          target_type:
+            type: [ string, "null" ]
+            description: Optional target type. Supported values are workflow, improvement_proposal, and steering_approval. Defaults to workflow.
+          target_id:
+            type: [ string, "null" ]
+            description: Required proposal or steering approval id when target_type is not workflow.
+          label:
+            type: [ string, "null" ]
+            description: Optional operator-facing label for the evidence link.
+          summary:
+            type: [ string, "null" ]
+            description: Optional short note describing why the document is linked.
+          linked_by:
+            type: [ string, "null" ]
+            description: Optional actor label stored on the link.
+          metadata:
+            type: [ object, "null" ]
+            description: Optional extra metadata for the evidence link.
+            additionalProperties: true
+        required: [ workflow_id, document_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: add_workflow_document_link
+      security:
+        read_only: false
+      tags: [ system, workflow, documents, governance, agent_assignable, mutation ]
+    - id: agency.workflow.document-link.delete
+      name: delete_workflow_document_link
+      display_name: Delete Workflow Document Link
+      description: Remove one workflow document evidence link without deleting the underlying uploaded document.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: ID of the workflow that owns the evidence link.
+          link_id:
+            type: string
+            description: Workflow document link id returned by the document link list or add tool.
+        required: [ workflow_id, link_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: delete_workflow_document_link
+      security:
+        read_only: false
+      tags: [ system, workflow, documents, governance, agent_assignable, mutation ]
+    - id: agency.workflow.document-summary.get
+      name: get_workflow_document_summary
+      display_name: Get Workflow Document Summary
+      description: Read a deterministic summary of one uploaded workflow document using stored upload-intelligence metadata and extracted text preview. Use this before linking a document into a proposal or steering approval.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: ID of the workflow reviewing the document.
+          document_id:
+            type: string
+            description: Uploaded document id to summarize.
+        required: [ workflow_id, document_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: get_workflow_document_summary
+      security:
+        read_only: true
+      tags: [ system, workflow, documents, governance, agent_assignable, read_only ]
+    - id: agency.workflow.shared-memory.namespaces
+      name: list_workflow_shared_memory_namespaces
+      display_name: List Workflow Shared Memory Namespaces
+      description: Review the shared-memory namespaces configured for one workflow. Use this before attaching reusable memories or deciding which namespace should hold a shared context set.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id: { type: string, description: ID of the workflow whose shared-memory namespaces should be reviewed. }
+          namespace_id: { type: [ string, "null" ], description: Optional namespace id to isolate one namespace. }
+          limit: { type: [ integer, "null" ], description: Optional maximum number of namespaces to return. Defaults to 20 and caps at 100. }
+        required: [ workflow_id ]
+        additionalProperties: false
+      output_schema_name: ITEMS_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: list_workflow_shared_memory_namespaces
+      security: { read_only: true }
+      tags: [ system, workflow, shared_memory, governance, agent_assignable, read_only ]
+    - id: agency.workflow.shared-memory.namespace.create
+      name: create_workflow_shared_memory_namespace
+      display_name: Create Workflow Shared Memory Namespace
+      description: Create a workflow-owned shared-memory namespace that groups reusable memories under one governed name.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id: { type: string, description: ID of the workflow that owns the namespace. }
+          name: { type: string, description: Human-facing namespace name. }
+          description: { type: [ string, "null" ], description: Optional namespace description. }
+          status: { type: [ string, "null" ], description: Optional namespace status. Defaults to active. }
+          target_type: { type: [ string, "null" ], description: Optional target type such as workflow, agent, or task for operator semantics. }
+          target_id: { type: [ string, "null" ], description: Optional target id related to target_type. }
+          memory_scope: { type: [ string, "null" ], description: Optional default scope label for memories expected in this namespace. }
+          tags:
+            type: [ array, "null" ]
+            items: { type: string }
+            description: Optional namespace tags.
+          memory_ids:
+            type: [ array, "null" ]
+            items: { type: string }
+            description: Optional initial memory ids.
+          created_by: { type: [ string, "null" ], description: Optional actor label stored on the namespace. }
+          metadata:
+            type: [ object, "null" ]
+            description: Optional extra namespace metadata.
+            additionalProperties: true
+        required: [ workflow_id, name ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: create_workflow_shared_memory_namespace
+      security: { read_only: false }
+      tags: [ system, workflow, shared_memory, governance, agent_assignable, mutation ]
+    - id: agency.workflow.shared-memory.namespace.update
+      name: update_workflow_shared_memory_namespace
+      display_name: Update Workflow Shared Memory Namespace
+      description: Update one shared-memory namespace after governance review changes its description, target, tags, or status.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id: { type: string, description: ID of the workflow that owns the namespace. }
+          namespace_id: { type: string, description: Namespace id returned by the namespace list or create tool. }
+          patch:
+            type: object
+            description: Partial namespace patch with supported fields such as name, description, status, target_type, memory_scope, tags, or metadata.
+            additionalProperties: true
+        required: [ workflow_id, namespace_id, patch ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: update_workflow_shared_memory_namespace
+      security: { read_only: false }
+      tags: [ system, workflow, shared_memory, governance, agent_assignable, mutation ]
+    - id: agency.workflow.shared-memory.namespace.delete
+      name: delete_workflow_shared_memory_namespace
+      display_name: Delete Workflow Shared Memory Namespace
+      description: Delete one shared-memory namespace record from a workflow. This does not delete the underlying memories.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id: { type: string, description: ID of the workflow that owns the namespace. }
+          namespace_id: { type: string, description: Namespace id to remove. }
+        required: [ workflow_id, namespace_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: delete_workflow_shared_memory_namespace
+      security: { read_only: false }
+      tags: [ system, workflow, shared_memory, governance, agent_assignable, mutation ]
+    - id: agency.workflow.shared-memory.namespace.memories
+      name: list_workflow_shared_memory_namespace_memories
+      display_name: List Workflow Shared Memory Namespace Memories
+      description: Read the durable memories currently attached to one shared-memory namespace so agents can inspect what shared recall is already linked.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id: { type: string, description: ID of the workflow that owns the namespace. }
+          namespace_id: { type: string, description: Namespace id whose memories should be listed. }
+          limit: { type: [ integer, "null" ], description: Optional maximum number of memories to return. Defaults to 50 and caps at 200. }
+        required: [ workflow_id, namespace_id ]
+        additionalProperties: false
+      output_schema_name: ITEMS_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: list_workflow_shared_memory_namespace_memories
+      security: { read_only: true }
+      tags: [ system, workflow, shared_memory, agent_assignable, read_only ]
+    - id: agency.workflow.shared-memory.namespace.memory.add
+      name: add_workflow_shared_memory_namespace_memory
+      display_name: Add Workflow Shared Memory Namespace Memory
+      description: Add one durable memory to a shared-memory namespace and mark the memory metadata with that namespace id.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id: { type: string, description: ID of the workflow that owns the namespace. }
+          namespace_id: { type: string, description: Namespace id that should receive the memory. }
+          memory_id: { type: string, description: Durable memory id to add to the namespace. }
+        required: [ workflow_id, namespace_id, memory_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: add_workflow_shared_memory_namespace_memory
+      security: { read_only: false }
+      tags: [ system, workflow, shared_memory, agent_assignable, mutation ]
+    - id: agency.workflow.shared-memory.namespace.memory.remove
+      name: remove_workflow_shared_memory_namespace_memory
+      display_name: Remove Workflow Shared Memory Namespace Memory
+      description: Remove one durable memory from a shared-memory namespace without deleting the underlying memory record.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id: { type: string, description: ID of the workflow that owns the namespace. }
+          namespace_id: { type: string, description: Namespace id that currently owns the memory link. }
+          memory_id: { type: string, description: Durable memory id to remove from the namespace. }
+        required: [ workflow_id, namespace_id, memory_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: remove_workflow_shared_memory_namespace_memory
+      security: { read_only: false }
+      tags: [ system, workflow, shared_memory, agent_assignable, mutation ]
+    - id: agency.observability.workflow.metrics
+      name: get_workflow_observability_metrics
+      display_name: Get Workflow Observability Metrics
+      description: Read workflow observability metrics before diagnosing reliability, latency, throughput, or governance drift. Output summarizes execution history and health signals for a single workflow.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type: string
+            description: ID of the workflow whose metrics should be returned.
+        required: [ workflow_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: get_workflow_observability_metrics
+      security:
+        read_only: true
+      tags: [ system, workflow, observability, agent_assignable, read_only ]
+    - id: agency.observability.execution.timeline
+      name: get_execution_observability_timeline
+      display_name: Get Execution Observability Timeline
+      description: Read the execution timeline for one run before root-cause analysis, monitor review, or postmortem work. Output includes normalized events and derived execution context.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          execution_id:
+            type: string
+            description: ID of the execution whose timeline should be returned.
+        required: [ execution_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: get_execution_observability_timeline
+      security:
+        read_only: true
+      tags: [ system, workflow, observability, execution, agent_assignable, read_only ]
+    - id: agency.documents.list
+      name: list_uploaded_documents
+      display_name: List Uploaded Documents
+      description: List uploaded documents visible to the current user, optionally filtered by workflow, conversation, agent, scope, or upload mode. Use this to review workflow documents and attached memory sources before retrieval or deletion.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          conversation_id:
+            type: [ string, "null" ]
+            description: Optional conversation filter.
+          workflow_id:
+            type: [ string, "null" ]
+            description: Optional workflow filter.
+          agent_id:
+            type: [ string, "null" ]
+            description: Optional agent filter.
+          scope:
+            type: [ string, "null" ]
+            description: Optional document scope filter.
+          upload_mode:
+            type: [ string, "null" ]
+            description: Optional document upload mode filter.
+          limit:
+            type: integer
+            minimum: 1
+            maximum: 100
+            description: Maximum number of documents to return.
+        additionalProperties: false
+      output_schema_name: ITEMS_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: list_uploaded_documents
+      security:
+        read_only: true
+      tags: [ system, workflow, documents, memory, agent_assignable, read_only ]
+    - id: agency.documents.get
+      name: get_uploaded_document
+      display_name: Get Uploaded Document
+      description: Get uploaded-document metadata and extracted-text bookkeeping by `document_id` before deciding whether to reuse or delete the source material.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          document_id:
+            type: string
+            description: ID of the uploaded document to inspect.
+        required: [ document_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: get_uploaded_document
+      security:
+        read_only: true
+      tags: [ system, workflow, documents, memory, agent_assignable, read_only ]
+    - id: agency.documents.delete
+      name: delete_uploaded_document
+      display_name: Delete Uploaded Document
+      description: Delete one uploaded document and its linked archive memories after the user explicitly asks to remove the source material. Use Get Uploaded Document first when there is any ambiguity.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          document_id:
+            type: string
+            description: ID of the uploaded document to delete.
+        required: [ document_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.workflow
+        callable_name: delete_uploaded_document
+      security:
+        read_only: false
+      tags: [ system, workflow, documents, memory, agent_assignable, mutation ]
+  goal:
+    - id: agency.goal.list
+      name: list_goals
+      display_name: List Goals
+      description: List durable Agency goals for long-running autonomous work, with optional filters for status, parent goal, and active-only state. Use this before choosing a goal to inspect, update, supervise, or link to workflow execution.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          status:
+            type: [ string, "null" ]
+            description: Optional goal status filter such as active, paused, completed, failed, or cancelled.
+          parent_goal_id:
+            type: [ string, "null" ]
+            description: Optional parent goal id used to list only subgoals under one durable goal.
+          active_only:
+            type: boolean
+            default: false
+            description: Whether to restrict results to goals that are not terminal.
+        additionalProperties: false
+      output_schema_name: ITEMS_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.goal
+        callable_name: list_goals
+      security:
+        read_only: true
+      tags: [ system, goal, agent_assignable, read_only ]
+    - id: agency.goal.get
+      name: get_goal
+      display_name: Get Goal
+      description: Get a durable goal by goal_id before planning, steering, evaluating completion, or launching linked workflow work. Output includes objective, status, constraints, success criteria, evidence, evaluation, and linked executions.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          goal_id:
+            type: string
+            description: ID of the durable goal to inspect.
+        required: [ goal_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.goal
+        callable_name: get_goal
+      security:
+        read_only: true
+      tags: [ system, goal, agent_assignable, read_only ]
+    - id: agency.goal.create
+      name: create_goal
+      display_name: Create Goal
+      description: Create a durable goal that can outlive a single workflow execution. Use this when the user asks Agency to work toward an objective over time, coordinate subagents, or preserve success criteria and constraints.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          objective:
+            type: string
+            description: Plain-language objective the durable goal should work toward.
+          priority:
+            type: string
+            default: normal
+            description: Goal priority label such as low, normal, high, or urgent.
+          parent_goal_id:
+            type: [ string, "null" ]
+            description: Optional parent goal id when creating a subgoal.
+          success_criteria:
+            type: array
+            items:
+              type: object
+              additionalProperties: true
+            description: Structured criteria that should be true before the goal can be completed.
+          constraints:
+            type: object
+            description: Structured constraints such as autonomy posture, allowed tools, blocked tools, risk level, budget, or deadline policy.
+            additionalProperties: true
+          metadata:
+            type: object
+            description: Additional operator or agent metadata to keep with the goal.
+            additionalProperties: true
+        required: [ objective ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.goal
+        callable_name: create_goal
+      security:
+        read_only: false
+        requires_approval: true
+      tags: [ system, goal, agent_assignable, mutation, approval ]
+    - id: agency.goal.update
+      name: update_goal
+      display_name: Update Goal
+      description: Update a durable goal's objective, status, priority, success criteria, constraints, evidence, evaluation, deadline, or metadata. Use this to refine goal state after new information or supervisor review.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          goal_id:
+            type: string
+            description: ID of the durable goal to update.
+          patch:
+            type: object
+            description: Goal fields to update using the backend goal API shape.
+            additionalProperties: true
+        required: [ goal_id, patch ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.goal
+        callable_name: update_goal
+      security:
+        read_only: false
+        requires_approval: true
+      tags: [ system, goal, agent_assignable, mutation, approval ]
+    - id: agency.goal.plan
+      name: plan_goal
+      display_name: Plan Goal
+      description: Create or replace the initial active plan for a durable goal. Use this to turn a goal into structured executable, inspection, input, approval, memory, or evaluation steps before autonomous supervision continues.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          goal_id:
+            type: string
+            description: ID of the durable goal to plan.
+          plan:
+            type: [ object, "null" ]
+            description: Optional structured plan. If omitted, Agency creates a conservative default plan from goal constraints and success criteria.
+            additionalProperties: true
+          reason:
+            type: string
+            default: initial_plan
+            description: Reason this plan is being created.
+        required: [ goal_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.goal
+        callable_name: plan_goal
+      security:
+        read_only: false
+        requires_approval: true
+      tags: [ system, goal, agent_assignable, mutation, approval ]
+    - id: agency.goal.replan
+      name: replan_goal
+      display_name: Replan Goal
+      description: Version a durable goal's active plan after failure, stale work, missing evidence, or operator steering. Use this when the main agent needs to change next actions while preserving the previous plan history.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          goal_id:
+            type: string
+            description: ID of the durable goal to replan.
+          plan:
+            type: [ object, "null" ]
+            description: Optional replacement structured plan. If omitted, Agency creates a conservative default plan from the current goal.
+            additionalProperties: true
+          reason:
+            type: string
+            description: Required explanation for why the active goal plan is being replaced.
+        required: [ goal_id, reason ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.goal
+        callable_name: replan_goal
+      security:
+        read_only: false
+        requires_approval: true
+      tags: [ system, goal, agent_assignable, mutation, approval ]
+    - id: agency.goal.pause
+      name: pause_goal
+      display_name: Pause Goal
+      description: Pause a non-terminal durable goal so autonomous supervision and follow-up work should stop until the goal is resumed. Use this when work is temporarily blocked or no longer safe to continue automatically.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          goal_id:
+            type: string
+            description: ID of the durable goal to pause.
+        required: [ goal_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.goal
+        callable_name: pause_goal
+      security:
+        read_only: false
+        requires_approval: true
+      tags: [ system, goal, agent_assignable, mutation, approval ]
+    - id: agency.goal.resume
+      name: resume_goal
+      display_name: Resume Goal
+      description: Resume a paused durable goal and mark it active again so autonomous planning, execution, and supervision may continue under the goal's constraints and approval policy.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          goal_id:
+            type: string
+            description: ID of the paused durable goal to resume.
+        required: [ goal_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.goal
+        callable_name: resume_goal
+      security:
+        read_only: false
+        requires_approval: true
+      tags: [ system, goal, agent_assignable, mutation, approval ]
+    - id: agency.goal.cancel
+      name: cancel_goal
+      display_name: Cancel Goal
+      description: Cancel a non-terminal durable goal and record an optional reason. Use this when the objective should no longer be pursued and future supervisor actions should stop for this goal.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          goal_id:
+            type: string
+            description: ID of the durable goal to cancel.
+          reason:
+            type: [ string, "null" ]
+            description: Optional cancellation reason stored in goal metadata.
+        required: [ goal_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.goal
+        callable_name: cancel_goal
+      security:
+        read_only: false
+        requires_approval: true
+      tags: [ system, goal, agent_assignable, mutation, approval ]
+    - id: agency.goal.evidence.attach
+      name: attach_goal_evidence
+      display_name: Attach Goal Evidence
+      description: Attach structured evidence records to a durable goal before evaluation or completion. Use this when workflow executions, artifacts, approvals, or operator notes prove progress against goal success criteria.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          goal_id:
+            type: string
+            description: ID of the durable goal receiving evidence.
+          evidence:
+            type: array
+            items:
+              type: object
+              additionalProperties: true
+            description: Evidence records to append, ideally including id, type or kind, and criterion references when available.
+        required: [ goal_id, evidence ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.goal
+        callable_name: attach_goal_evidence
+      security:
+        read_only: false
+        requires_approval: true
+      tags: [ system, goal, agent_assignable, mutation, approval ]
+    - id: agency.goal.evaluate
+      name: evaluate_goal
+      display_name: Evaluate Goal
+      description: Evaluate a durable goal's success criteria against recorded and optional new evidence. Output includes sufficiency, confidence, rationale, satisfied criteria, and missing evidence.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          goal_id:
+            type: string
+            description: ID of the durable goal to evaluate.
+          evidence:
+            type: array
+            items:
+              type: object
+              additionalProperties: true
+            description: Optional additional evidence records to evaluate without first attaching them.
+          persist:
+            type: boolean
+            default: true
+            description: Whether to persist the evaluation result on the goal. Defaults to true.
+        required: [ goal_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.goal
+        callable_name: evaluate_goal
+      security:
+        read_only: false
+        requires_approval: true
+      tags: [ system, goal, agent_assignable, mutation, approval ]
+    - id: agency.goal.supervisor-findings
+      name: list_goal_supervisor_findings
+      display_name: List Goal Supervisor Findings
+      description: List durable main-agent supervisor findings, decisions, and recorded actions for a goal. Use this before explaining why a goal is blocked, what the supervisor observed, or what remains pending.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          goal_id:
+            type: string
+            description: ID of the durable goal whose supervisor records should be inspected.
+        required: [ goal_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.goal
+        callable_name: list_goal_supervisor_findings
+      security:
+        read_only: true
+      tags: [ system, goal, supervisor, agent_assignable, read_only ]
+    - id: agency.goal.supervisor-decision.record
+      name: record_goal_supervisor_decision
+      display_name: Record Goal Supervisor Decision
+      description: Record a durable supervisor decision for a goal, including rationale, risk, policy, recommended action, approval request id, or finding reference. Use this to make main-agent steering auditable.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          goal_id:
+            type: string
+            description: ID of the durable goal receiving the supervisor decision.
+          decision:
+            type: object
+            description: Structured supervisor decision with action, rationale, risk, policy, finding reference, and approval metadata.
+            additionalProperties: true
+        required: [ goal_id, decision ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.goal
+        callable_name: record_goal_supervisor_decision
+      security:
+        read_only: false
+        requires_approval: true
+      tags: [ system, goal, supervisor, agent_assignable, mutation, approval ]
+    - id: agency.goal.complete
+      name: complete_goal
+      display_name: Complete Goal
+      description: Mark a durable goal completed with supporting evidence and optional evaluation metadata. Use this only when success criteria have enough recorded evidence for the operator or evaluator to inspect.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          goal_id:
+            type: string
+            description: ID of the durable goal to complete.
+          evidence:
+            type: array
+            items:
+              type: object
+              additionalProperties: true
+            description: Evidence records proving the goal success criteria have been satisfied.
+          evaluation:
+            type: [ object, "null" ]
+            description: Optional evaluation result, rationale, confidence, or missing-evidence analysis.
+            additionalProperties: true
+        required: [ goal_id ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.goal
+        callable_name: complete_goal
+      security:
+        read_only: false
+        requires_approval: true
+      tags: [ system, goal, agent_assignable, mutation, approval ]
+  connector:
+    - id: agency.connector.capabilities
+      name: list_connector_capabilities
+      display_name: List Connector Capabilities
+      description: List supported integration connector providers and their setup, auth, metadata, and health-check capabilities. Use this on integrations pages before reasoning about provider setup or connector status.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties: { }
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.connector
+        callable_name: list_connector_capabilities
+      security:
+        read_only: true
+      tags:
+        - system
+        - connector
+        - integration
+        - agent_assignable
+        - read_only
+    - id: agency.connector.credentials
+      name: list_connector_credentials
+      display_name: List Connector Credentials
+      description: List the current conversation owner's connector credentials, optionally filtered by provider. Secret references are redacted; this tool returns only ids, names, provider, status, metadata, rotation timestamps, and whether a secret reference exists.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          provider:
+            type:
+              - string
+              - "null"
+            description: Optional provider key or alias, for example telegram, telegram-bot, discord.
+          status:
+            type:
+              - string
+              - "null"
+            description: Optional credential status filter, for example active or revoked.
+        additionalProperties: false
+      output_schema_name: ITEMS_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.connector
+        callable_name: list_connector_credentials
+      security:
+        read_only: true
+        redaction_enabled: true
+      tags:
+        - system
+        - connector
+        - credential
+        - integration
+        - agent_assignable
+        - read_only
+    - id: agency.connector.resolve
+      name: resolve_connector_credential
+      display_name: Resolve Connector Credential
+      description: Resolve the correct connector credential for a provider using instance identity filters such as workspace_id, channel_id, owner, repo, bucket, folder_id, mailbox, bot_user_id, or sender number. Returns matched, ambiguous, or not_found so the agent does not guess between repeated installations.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          provider:
+            type: string
+            description: Provider key or alias, for example github, slack, discord, s3, whatsapp.
+          filters:
+            type: object
+            description: Metadata filters that identify the intended connector instance.
+            additionalProperties: true
+          status:
+            type:
+              - string
+              - "null"
+            default: active
+            description: Optional credential status filter. Defaults to active.
+        required:
+          - provider
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.connector
+        callable_name: resolve_connector_credential
+      security:
+        read_only: true
+        redaction_enabled: true
+      tags:
+        - system
+        - connector
+        - credential
+        - resolver
+        - integration
+        - agent_assignable
+        - read_only
+    - id: agency.connector.history
+      name: list_connector_health_history
+      display_name: List Connector Health History
+      description: List connector health-test history for the current conversation owner. Use credential_id for one credential, or provider/status filters for broader integration diagnostics.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          credential_id:
+            type:
+              - string
+              - "null"
+            description: Optional credential id to inspect.
+          provider:
+            type:
+              - string
+              - "null"
+            description: Optional provider key filter when credential_id is omitted.
+          status:
+            type:
+              - string
+              - "null"
+            description: Optional execution status filter, for example completed or failed.
+          limit:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+            description: Maximum history rows to return.
+          offset:
+            type: integer
+            minimum: 0
+            default: 0
+            description: Pagination offset.
+          started_after:
+            type:
+              - string
+              - "null"
+            description: Optional ISO-8601 lower bound for started_at.
+          started_before:
+            type:
+              - string
+              - "null"
+            description: Optional ISO-8601 upper bound for started_at.
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.connector
+        callable_name: list_connector_health_history
+      security:
+        read_only: true
+      tags:
+        - system
+        - connector
+        - health
+        - history
+        - integration
+        - agent_assignable
+        - read_only
+    - id: agency.connector.test
+      name: test_connector_credential
+      display_name: Test Connector Credential
+      description: Run a live connector health check for one credential owned by the current conversation owner. Use list_connector_credentials first when the credential id is unclear. Results redact raw secrets.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          credential_id:
+            type: string
+            description: Credential id to health-check.
+        required:
+          - credential_id
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.connector
+        callable_name: test_connector_credential
+      security:
+        allow_network: true
+        sandbox_required: true
+        redaction_enabled: true
+      tags:
+        - system
+        - connector
+        - health
+        - integration
+        - network
+        - agent_assignable
+  tool_management:
+    - id: agency.tool.list
+      name: list_tools
+      display_name: List Tools
+      description: List tool definitions available in the deployment. Use this before choosing, assigning, or proposing tool changes when the exact tool id is unknown. Output includes tool ids, names, descriptions, schemas, security settings, tags, and implementation references. This is read-only and does not execute tools.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties: { }
+        additionalProperties: false
+      output_schema_name: ITEMS_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.tool
+        callable_name: list_tools
+      security:
+        read_only: true
+      tags:
+        - system
+        - tool_management
+        - agent_assignable
+        - read_only
+    - id: agency.tool.get
+      name: get_tool
+      display_name: Get Tool
+      description: Get one tool definition by `tool_id`. Use this before planning an update, assigning the tool to an agent, or explaining a tool's inputs. Output returns the full ToolDefinition including input schema, output schema, implementation target, security settings, MCP exposure, and tags.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          tool_id:
+            type: string
+            description: ID of the tool to inspect.
+        required:
+          - tool_id
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.tool
+        callable_name: get_tool
+      security:
+        read_only: true
+      tags:
+        - system
+        - tool_management
+        - agent_assignable
+        - read_only
+    - id: agency.tool.propose-create
+      name: propose_tool_create
+      display_name: Propose New Tool
+      description: Propose creating a new tool definition. Use this only when the user asks for a new capability and you can provide a complete ToolDefinition payload. The backend validates the payload and creates a human approval request before persistence. The payload must include the full implementation object and keep security fields nested under security.* (for example security.read_only). Do not use this to execute a tool.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          summary:
+            type: string
+            description: Human-readable summary of the proposed tool.
+          diff_summary:
+            type:
+              - string
+              - "null"
+            description: Optional concise explanation of what will be added.
+          tool:
+            type: object
+            description: Complete ToolDefinition payload, including implementation.target and implementation.implementation_type.
+            additionalProperties: true
+        required:
+          - tool
+        additionalProperties: false
+      output_schema_name: PROPOSAL_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.tool
+        callable_name: propose_tool_create
+      security:
+        requires_approval: false
+      tags:
+        - system
+        - tool_management
+        - agent_assignable
+        - mutation
+    - id: agency.tool.propose-update
+      name: propose_tool_update
+      display_name: Propose Tool Update
+      description: Propose updating an existing tool definition. Use Get Tool first when the current definition is not already in context. If page context identifies the selected tool, tool_id may be omitted. Provide either a complete updated ToolDefinition, a partial patch, or a supported plain-language goal such as renaming the tool or changing its description. The backend validates the proposed ToolDefinition and creates a human approval request before any change is applied. Keep security fields nested under security.* and include a complete implementation object when sending a full ToolDefinition. Do not use this for runtime execution.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          tool_id:
+            type:
+              - string
+              - "null"
+            description: ID of the existing tool to update. Optional when page context selects a tool.
+          summary:
+            type: string
+            description: Human-readable summary of the proposed update.
+          diff_summary:
+            type:
+              - string
+              - "null"
+            description: Optional concise explanation of the changed fields.
+          goal:
+            type:
+              - string
+              - "null"
+            description: Plain-language update goal, such as renaming the selected tool or changing its description.
+          patch:
+            type:
+              - object
+              - "null"
+            description: Partial ToolDefinition patch. Supported keys include name, display_name, description, schemas, security, MCP exposure, tags, and framework_hints.
+            additionalProperties: true
+          tool:
+            type:
+              - object
+              - "null"
+            description: Complete updated ToolDefinition payload.
+            additionalProperties: true
+        required: [ ]
+        additionalProperties: false
+      output_schema_name: PROPOSAL_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.tool
+        callable_name: propose_tool_update
+      security:
+        requires_approval: false
+      tags:
+        - system
+        - tool_management
+        - agent_assignable
+        - mutation
+    - id: agency.tool.workspace.list
+      name: list_generated_tool_packages
+      display_name: List Generated Tool Packages
+      description: List coder-agent-generated tool workspace packages under the dedicated generated-tools root, including any published ToolDefinitions already registered against each package.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          package_id:
+            type:
+              - string
+              - "null"
+            description: Optional generated package id to filter the workspace listing.
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.tool
+        callable_name: list_generated_tool_packages
+      security:
+        read_only: true
+      tags: [ system, tool_management, generated_tools, agent_assignable, read_only ]
+    - id: agency.tool.workspace.scaffold
+      name: scaffold_generated_tool_package
+      display_name: Scaffold Generated Tool Package
+      description: Create or refresh a coder-agent-owned generated tool package scaffold under the dedicated workspace root. This creates the package folder, manifest, requirements file, and starter tools module but does not publish a ToolDefinition yet.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          package_id:
+            type: string
+            description: Stable generated package id or slug.
+          name:
+            type: string
+            description: Human-readable package name.
+          description:
+            type:
+              - string
+              - "null"
+            description: Optional package description used in the scaffold.
+          function_name:
+            type:
+              - string
+              - "null"
+            description: Optional starter callable name written into tools.py.
+          overwrite:
+            type: boolean
+            description: Whether existing scaffold files may be replaced.
+        required: [ package_id, name ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.tool
+        callable_name: scaffold_generated_tool_package
+      security:
+        read_only: false
+      tags: [ system, tool_management, generated_tools, agent_assignable, mutation ]
+    - id: agency.tool.workspace.publish
+      name: publish_generated_tool_definition
+      display_name: Publish Generated Tool Definition
+      description: Register or update one ToolDefinition backed by a callable inside a generated tool package. Use this after the coder agent implements the package code and wants other agents or personas to grant and use the tool.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          package_id:
+            type: string
+            description: Generated package id or slug.
+          tool_id:
+            type: string
+            description: Canonical ToolDefinition id to create or update.
+          name:
+            type: string
+            description: Safe callable-style tool name, for example generated_portal_audit.
+          display_name:
+            type:
+              - string
+              - "null"
+            description: Optional human-facing display name.
+          description:
+            type: string
+            description: Tool description shown to agents and operators.
+          callable_name:
+            type: string
+            description: Python callable to expose from the generated package module.
+          input_schema:
+            type: object
+            description: JSON schema for tool inputs.
+            additionalProperties: true
+          output_schema:
+            type: object
+            description: JSON schema for tool outputs.
+            additionalProperties: true
+          tags:
+            type:
+              - array
+              - "null"
+            items:
+              type: string
+            description: Optional extra tool tags.
+          security:
+            type:
+              - object
+              - "null"
+            description: Optional security overrides merged onto safe generated-tool defaults.
+            additionalProperties: true
+        required: [ package_id, tool_id, name, description, callable_name, input_schema, output_schema ]
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.tool
+        callable_name: publish_generated_tool_definition
+      security:
+        read_only: false
+      tags: [ system, tool_management, generated_tools, agent_assignable, mutation ]
+  agent_management:
+    - id: agency.agent.list
+      name: list_agents
+      display_name: List Agents
+      description: List canonical agent definitions. Use this before choosing an agent to inspect or update unless the current page context or user message already provides an exact agent id.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties: { }
+        additionalProperties: false
+      output_schema_name: ITEMS_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.agent
+        callable_name: list_agents
+      security:
+        read_only: true
+      tags:
+        - system
+        - agent_management
+        - agent_assignable
+        - read_only
+    - id: agency.agent.get
+      name: get_agent
+      display_name: Get Agent
+      description: Get one canonical AgentDefinition by `agent_id`. Use this before proposing updates so unchanged fields can be preserved.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          agent_id:
+            type: string
+            description: ID of the agent to inspect.
+        required:
+          - agent_id
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.agent
+        callable_name: get_agent
+      security:
+        read_only: true
+      tags:
+        - system
+        - agent_management
+        - agent_assignable
+        - read_only
+    - id: agency.agent.propose-update
+      name: propose_agent_update
+      display_name: Propose Agent Update
+      description: Propose updating an existing AgentDefinition. Provide either a complete updated agent payload, a partial patch, or a supported plain-language goal such as renaming the agent or changing its description, role, instructions, model profile, assigned tools, handoffs, memory, or metadata. This always creates a human approval request before changes are applied.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          agent_id:
+            type:
+              - string
+              - "null"
+            description: ID of the agent to update. May be omitted only when page context identifies the current agent.
+          summary:
+            type: string
+            description: Human-readable summary of the proposed update.
+          diff_summary:
+            type:
+              - string
+              - "null"
+            description: Optional concise explanation of the changed fields.
+          goal:
+            type: string
+            description: Natural-language edit request for supported simple agent changes.
+            examples:
+              - Rename this agent to Support Triage.
+          patch:
+            type: object
+            description: Partial AgentDefinition patch. Unsupported fields are ignored.
+            additionalProperties: true
+          agent:
+            type: object
+            description: Complete updated AgentDefinition payload.
+            additionalProperties: true
+        additionalProperties: false
+      output_schema_name: PROPOSAL_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.agent
+        callable_name: propose_agent_update
+      security:
+        requires_approval: false
+      tags:
+        - system
+        - agent_management
+        - agent_assignable
+        - mutation
+  command:
+    - id: agency.command.run
+      name: run_command
+      display_name: Run Command
+      description: "Run one approved shell command workflow. Prefer Unix-style composition when it is concise: pipes, &&, ||, and ; are supported by the shell. Use command --help for discovery. Modes: auto, bash, sh, zsh, powershell, pwsh, cmd. Results include stdout, stderr, exit_code, duration_ms, and output_text with an [exit:N | duration] footer. Large output is truncated with an overflow file path for follow-up grep/head/tail exploration."
+      tool_type: SHELL_COMMAND
+      input_schema:
+        type: object
+        properties:
+          command:
+            type: string
+            description: Shell command or shell chain to run after approval.
+          mode:
+            type:
+              - string
+              - "null"
+            enum:
+              - auto
+              - bash
+              - sh
+              - zsh
+              - powershell
+              - pwsh
+              - cmd
+              - null
+            description: Shell mode. Use auto unless the user or target platform requires a specific shell.
+          cwd:
+            type:
+              - string
+              - "null"
+            description: Optional working directory for the command.
+          timeout_seconds:
+            type:
+              - integer
+              - "null"
+            minimum: 1
+            maximum: 7200
+            description: Optional timeout override. Use longer values for Codex jobs, builds, and test suites.
+        required:
+          - command
+        additionalProperties: false
+      output_schema_name: COMMAND_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: shell_command
+        target: agency.system.command
+        callable_name: run_command
+        config:
+          timeout: 30
+          max_timeout: 7200
+      security:
+        requires_approval: true
+        sandbox: true
+        allow_shell: true
+        allow_filesystem: true
+        allow_network: false
+        read_only: false
+        dangerous: true
+      tags:
+        - system
+        - command
+        - cli
+        - shell
+        - agent_assignable
+        - mutation
+  execution:
+    - id: agency.execution.list
+      name: list_executions
+      display_name: List Executions
+      description: Read recent Agency executions and filter by workflow_id, agent_id, status, or active_only. Use this to find the latest runs before inspecting one execution in detail. This tool is read-only and never starts, mutates, cancels, or retries executions.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          workflow_id:
+            type:
+              - string
+              - "null"
+            description: Optional workflow id filter.
+          agent_id:
+            type:
+              - string
+              - "null"
+            description: Optional agent id filter.
+          status:
+            type:
+              - array
+              - "null"
+            items:
+              type: string
+            description: Optional execution status filter, for example completed or failed.
+          active_only:
+            type: boolean
+            default: false
+            description: Whether to restrict results to active runs only.
+          limit:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 20
+            description: Maximum number of matching runs to return, newest first.
+        additionalProperties: false
+      output_schema_name: ITEMS_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.execution
+        callable_name: list_executions
+      security:
+        read_only: true
+      tags:
+        - system
+        - execution
+        - evaluation
+        - agent_assignable
+        - read_only
+    - id: agency.execution.get
+      name: get_execution
+      display_name: Get Execution
+      description: Read one Agency execution by execution_id. Use this when evaluating a run's status, input, output, error, runtime metadata, or workflow id. This tool is read-only and never starts, mutates, cancels, or retries executions.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          execution_id:
+            type: string
+            description: ID of the execution to inspect.
+        required:
+          - execution_id
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.execution
+        callable_name: get_execution
+      security:
+        read_only: true
+      tags:
+        - system
+        - execution
+        - evaluation
+        - agent_assignable
+        - read_only
+    - id: agency.execution.events
+      name: list_execution_events
+      display_name: List Execution Events
+      description: Read canonical execution events by execution_id. Use this to evaluate tool choice, event ordering, model calls, approvals, failures, and task progress. Supports optional event_type, agent_id, task_id, sequence, and limit filters. This tool is read-only.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          execution_id:
+            type: string
+            description: ID of the execution whose events should be inspected.
+          after_sequence:
+            type: integer
+            minimum: 0
+            default: 0
+            description: Only return events after this sequence number.
+          event_types:
+            type:
+              - array
+              - "null"
+            items:
+              type: string
+            description: Optional event type filter, for example execution.completed or tool.call.completed.
+          agent_id:
+            type:
+              - string
+              - "null"
+            description: Optional agent id filter.
+          task_id:
+            type:
+              - string
+              - "null"
+            description: Optional task id filter.
+          limit:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 200
+            description: Maximum number of matching events to return.
+        required:
+          - execution_id
+        additionalProperties: false
+      output_schema_name: ITEMS_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.execution
+        callable_name: list_execution_events
+      security:
+        read_only: true
+      tags:
+        - system
+        - execution
+        - events
+        - evaluation
+        - agent_assignable
+        - read_only
+    - id: agency.execution.artifacts
+      name: list_execution_artifacts
+      display_name: List Execution Artifacts
+      description: Read execution artifacts by execution_id. Use this when the run produced files, JSON payloads, screenshots, or text artifacts needed for evaluation. Content is returned only when include_content is true and large text is truncated. This tool is read-only.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          execution_id:
+            type: string
+            description: ID of the execution whose artifacts should be inspected.
+          include_content:
+            type: boolean
+            default: true
+            description: Whether to include artifact content_json and content_text fields.
+          max_content_chars:
+            type: integer
+            minimum: 0
+            maximum: 20000
+            default: 4000
+            description: Maximum characters of content_text to return for each artifact.
+        required:
+          - execution_id
+        additionalProperties: false
+      output_schema_name: ITEMS_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.execution
+        callable_name: list_execution_artifacts
+      security:
+        read_only: true
+      tags:
+        - system
+        - execution
+        - artifacts
+        - evaluation
+        - agent_assignable
+        - read_only
+    - id: agency.execution.pause
+      name: pause_execution
+      display_name: Pause Execution
+      description: Pause a running execution by execution_id. Use get_execution first when the selected run is unclear.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          execution_id:
+            type: string
+            description: ID of the execution to pause.
+        required:
+          - execution_id
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.execution
+        callable_name: pause_execution
+      security:
+        read_only: false
+      tags:
+        - system
+        - execution
+        - control
+        - agent_assignable
+        - mutation
+    - id: agency.execution.resume
+      name: resume_execution
+      display_name: Resume Execution
+      description: Resume a paused execution by execution_id. Use get_execution first when the selected run is unclear.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          execution_id:
+            type: string
+            description: ID of the execution to resume.
+        required:
+          - execution_id
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.execution
+        callable_name: resume_execution
+      security:
+        read_only: false
+      tags:
+        - system
+        - execution
+        - control
+        - agent_assignable
+        - mutation
+    - id: agency.execution.cancel
+      name: cancel_execution
+      display_name: Cancel Execution
+      description: Cancel an execution by execution_id. Use only when the user asks to stop or cancel the selected run.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          execution_id:
+            type: string
+            description: ID of the execution to cancel.
+        required:
+          - execution_id
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.execution
+        callable_name: cancel_execution
+      security:
+        read_only: false
+      tags:
+        - system
+        - execution
+        - control
+        - agent_assignable
+        - mutation
+    - id: agency.execution.approvals
+      name: list_execution_approvals
+      display_name: List Execution Approvals
+      description: List pending approval requests for an execution before approving or rejecting a run tool call.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          execution_id:
+            type: string
+            description: ID of the execution.
+        required:
+          - execution_id
+        additionalProperties: false
+      output_schema_name: ITEMS_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.execution
+        callable_name: list_execution_approvals
+      security:
+        read_only: true
+      tags:
+        - system
+        - execution
+        - approval
+        - agent_assignable
+        - read_only
+    - id: agency.execution.approve
+      name: approve_execution_tool_call
+      display_name: Approve Execution Tool Call
+      description: Approve one pending execution tool call by execution_id and tool_id after the user asks to approve it.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          execution_id:
+            type: string
+            description: ID of the execution.
+          tool_id:
+            type: string
+            description: Pending tool id to approve.
+          reason:
+            type:
+              - string
+              - "null"
+            description: Optional approval reason.
+        required:
+          - execution_id
+          - tool_id
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.execution
+        callable_name: approve_execution_tool_call
+      security:
+        read_only: false
+      tags:
+        - system
+        - execution
+        - approval
+        - agent_assignable
+        - mutation
+    - id: agency.execution.reject
+      name: reject_execution_tool_call
+      display_name: Reject Execution Tool Call
+      description: Reject one pending execution tool call by execution_id and tool_id after the user asks to reject it.
+      tool_type: WORKFLOW_TOOL
+      input_schema:
+        type: object
+        properties:
+          execution_id:
+            type: string
+            description: ID of the execution.
+          tool_id:
+            type: string
+            description: Pending tool id to reject.
+          reason:
+            type:
+              - string
+              - "null"
+            description: Optional rejection reason.
+        required:
+          - execution_id
+          - tool_id
+        additionalProperties: false
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.execution
+        callable_name: reject_execution_tool_call
+      security:
+        read_only: false
+      tags:
+        - system
+        - execution
+        - approval
+        - agent_assignable
+        - mutation
+
+system_runtime_tools:
+  memory:
+    - id: agency.memory.list
+      name: list_memories
+      display_name: List Memories
+      description: List durable memories visible to this conversation. Use this when the user asks what is remembered or before updating or deleting a memory.
+      tool_type: WORKFLOW_TOOL
+      input_schema_ref: memory_list_input_schema
+      output_schema_name: ITEMS_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.memory
+        callable_name: list_memories
+      security:
+        read_only: true
+      tags: [ system, memory, agent_assignable, read_only ]
+    - id: agency.memory.catalog
+      name: catalog_memories
+      display_name: Catalog Memories
+      description: List linkable memory resources grouped by type for workflow graph assignment. Use this before linking memories to a workflow, agent, or task, or before deciding whether a memory is excluded.
+      tool_type: WORKFLOW_TOOL
+      input_schema_ref: memory_catalog_input_schema
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.memory
+        callable_name: catalog_memories
+      security:
+        read_only: true
+      tags: [ system, memory, agent_assignable, read_only ]
+    - id: agency.memory.remember
+      name: remember_memory
+      display_name: Remember Memory
+      description: Store a durable memory only when the user explicitly asks you to remember something or confirms it. Sensitive content requires confirmed=true.
+      tool_type: WORKFLOW_TOOL
+      input_schema_ref: memory_remember_input_schema
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.memory
+        callable_name: remember_memory
+      security:
+        read_only: false
+      tags: [ system, memory, agent_assignable, mutation ]
+    - id: agency.memory.update
+      name: update_memory
+      display_name: Update Memory
+      description: Update a durable memory after the user asks to correct, refine, or change something that was remembered. Use List Memories first if the memory id is unknown. Sensitive updates require confirmed=true.
+      tool_type: WORKFLOW_TOOL
+      input_schema_ref: memory_update_input_schema
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.memory
+        callable_name: update_memory
+      security:
+        read_only: false
+      tags: [ system, memory, agent_assignable, mutation ]
+    - id: agency.memory.delete
+      name: delete_memory
+      display_name: Delete Memory
+      description: Delete a durable memory after the user explicitly asks Agency to forget it. Use List Memories first if the memory id is unknown.
+      tool_type: WORKFLOW_TOOL
+      input_schema_ref: memory_delete_input_schema
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.memory
+        callable_name: delete_memory
+      security:
+        read_only: false
+      tags: [ system, memory, agent_assignable, mutation ]
+    - id: agency.memory.exclusions.list
+      name: list_memory_exclusions
+      display_name: List Memory Exclusions
+      description: List memory exclusions globally or for a specific memory and target before linking or retrieving durable memory.
+      tool_type: WORKFLOW_TOOL
+      input_schema_ref: memory_exclusions_list_input_schema
+      output_schema_name: ITEMS_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.memory
+        callable_name: list_memory_exclusions
+      security:
+        read_only: true
+      tags: [ system, memory, agent_assignable, read_only ]
+    - id: agency.memory.exclusions.add
+      name: add_memory_exclusion
+      display_name: Add Memory Exclusion
+      description: Exclude a durable memory from workflow, agent, task, conversation, or global retrieval when a user or operator confirms that the memory should not influence that target.
+      tool_type: WORKFLOW_TOOL
+      input_schema_ref: memory_exclusions_add_input_schema
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.memory
+        callable_name: add_memory_exclusion
+      security:
+        read_only: false
+      tags: [ system, memory, agent_assignable, mutation ]
+    - id: agency.memory.exclusions.delete
+      name: delete_memory_exclusion
+      display_name: Delete Memory Exclusion
+      description: Remove a durable memory exclusion from a target after the user or operator confirms that the memory should be eligible for retrieval again.
+      tool_type: WORKFLOW_TOOL
+      input_schema_ref: memory_exclusions_delete_input_schema
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.memory
+        callable_name: delete_memory_exclusion
+      security:
+        read_only: false
+      tags: [ system, memory, agent_assignable, mutation ]
+    - id: agency.workflow.memory-links.list
+      name: list_workflow_memory_links
+      display_name: List Workflow Memory Links
+      description: List durable memories and document memory collections currently linked to a workflow graph, graph agent, or graph task before changing runtime memory access.
+      tool_type: WORKFLOW_TOOL
+      input_schema_ref: workflow_memory_links_list_input_schema
+      output_schema_name: ITEMS_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.memory
+        callable_name: list_workflow_memory_links
+      security:
+        read_only: true
+      tags: [ system, memory, workflow, agent_assignable, read_only ]
+    - id: agency.workflow.memory-links.add
+      name: add_workflow_memory_link
+      display_name: Add Workflow Memory Link
+      description: Link a durable memory or document memory collection to a workflow, graph agent, or graph task so future runs can retrieve the approved context at the right scope.
+      tool_type: WORKFLOW_TOOL
+      input_schema_ref: workflow_memory_links_add_input_schema
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.memory
+        callable_name: add_workflow_memory_link
+      security:
+        read_only: false
+      tags: [ system, memory, workflow, agent_assignable, mutation ]
+    - id: agency.workflow.memory-links.delete
+      name: delete_workflow_memory_link
+      display_name: Delete Workflow Memory Link
+      description: Remove a durable memory link from a workflow after confirming that future runs should no longer retrieve that memory or collection through the workflow graph.
+      tool_type: WORKFLOW_TOOL
+      input_schema_ref: workflow_memory_links_delete_input_schema
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.memory
+        callable_name: delete_workflow_memory_link
+      security:
+        read_only: false
+      tags: [ system, memory, workflow, agent_assignable, mutation ]
+  graph:
+    - id: agency.graph.context
+      name: get_agency_graph_context
+      display_name: Get Agency Graph Context
+      description: Return bounded, read-only context from the Agency Graph for resuming work, debugging failed runs, planning next steps, handoffs, audits, or root-cause analysis.
+      tool_type: WORKFLOW_TOOL
+      input_schema_ref: graph_context_input_schema
+      output_schema_name: GRAPH_CONTEXT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.graph
+        callable_name: get_agency_graph_context
+      security:
+        read_only: true
+      tags: [ system, graph, agency_graph, agent_assignable, read_only ]
+    - id: agency.graph.search
+      name: search_agency_graph
+      display_name: Search Agency Graph
+      description: Search read-only Agency Graph nodes by text and canonical filters. Use this to find candidate anchors before requesting context or path expansion.
+      tool_type: WORKFLOW_TOOL
+      input_schema_ref: graph_search_input_schema
+      output_schema_name: GRAPH_DOCUMENT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.graph
+        callable_name: search_agency_graph
+      security:
+        read_only: true
+      tags: [ system, graph, agency_graph, agent_assignable, read_only, search ]
+    - id: agency.graph.expand
+      name: expand_agency_graph_node
+      display_name: Expand Agency Graph Node
+      description: Expand a bounded read-only neighborhood around a graph node using explicit labels and relationship types, a canonical preset, or a graph mode.
+      tool_type: WORKFLOW_TOOL
+      input_schema_ref: graph_expand_input_schema
+      output_schema_name: GRAPH_DOCUMENT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.graph
+        callable_name: expand_agency_graph_node
+      security:
+        read_only: true
+      tags: [ system, graph, agency_graph, agent_assignable, read_only, expand ]
+    - id: agency.graph.neighbors
+      name: list_agency_graph_neighbors
+      display_name: List Agency Graph Neighbors
+      description: List one-hop read-only neighbors around a graph node grouped by relationship type, direction, and neighbor node type.
+      tool_type: WORKFLOW_TOOL
+      input_schema_ref: graph_neighbors_input_schema
+      output_schema_name: GRAPH_NEIGHBORS_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.graph
+        callable_name: list_agency_graph_neighbors
+      security:
+        read_only: true
+      tags: [ system, graph, agency_graph, agent_assignable, read_only, neighbors ]
+    - id: agency.graph.path
+      name: find_agency_graph_path
+      display_name: Find Agency Graph Path
+      description: Find a bounded read-only graph path through approved path templates. Use this to explain provenance, lineage, failed-run root cause signals, or how two known graph nodes relate.
+      tool_type: WORKFLOW_TOOL
+      input_schema_ref: graph_path_input_schema
+      output_schema_name: GRAPH_DOCUMENT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.graph
+        callable_name: find_agency_graph_path
+      security:
+        read_only: true
+      tags: [ system, graph, agency_graph, agent_assignable, read_only, path ]
+    - id: agency.graph.summarize-subgraph
+      name: summarize_agency_graph_subgraph
+      display_name: Summarize Agency Graph Subgraph
+      description: Compact selected normalized Agency Graph nodes and edges into deterministic agent context after search, expand, neighbors, or path calls.
+      tool_type: WORKFLOW_TOOL
+      input_schema_ref: graph_summarize_subgraph_input_schema
+      output_schema_name: GRAPH_CONTEXT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.graph
+        callable_name: summarize_agency_graph_subgraph
+      security:
+        read_only: true
+      tags: [ system, graph, agency_graph, agent_assignable, read_only, summarize ]
+    - id: agency.graph.working-set.create
+      name: create_agency_graph_working_set
+      display_name: Create Agency Graph Working Set
+      description: Create an ephemeral runtime graph working set for an execution. Use this before a deeper graph investigation when the agent needs a bounded place to store anchors, visited nodes, selected nodes, and notes.
+      tool_type: WORKFLOW_TOOL
+      input_schema_ref: graph_working_set_create_input_schema
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.graph
+        callable_name: create_agency_graph_working_set
+      security:
+        read_only: false
+      tags: [ system, graph, agency_graph, agent_assignable, ephemeral, working_set ]
+    - id: agency.graph.working-set.add
+      name: add_to_agency_graph_working_set
+      display_name: Add To Agency Graph Working Set
+      description: Add anchors, visited nodes, selected nodes, or notes to an ephemeral graph working set so the active graph investigation can stay bounded and easier to summarize.
+      tool_type: WORKFLOW_TOOL
+      input_schema_ref: graph_working_set_add_input_schema
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.graph
+        callable_name: add_to_agency_graph_working_set
+      security:
+        read_only: false
+      tags: [ system, graph, agency_graph, agent_assignable, ephemeral, working_set ]
+    - id: agency.graph.working-set.remove
+      name: remove_from_agency_graph_working_set
+      display_name: Remove From Agency Graph Working Set
+      description: Remove anchors, visited nodes, selected nodes, or notes from an ephemeral graph working set when the agent needs to prune irrelevant evidence from the active investigation.
+      tool_type: WORKFLOW_TOOL
+      input_schema_ref: graph_working_set_remove_input_schema
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.graph
+        callable_name: remove_from_agency_graph_working_set
+      security:
+        read_only: false
+      tags: [ system, graph, agency_graph, agent_assignable, ephemeral, working_set ]
+    - id: agency.graph.working-set.summarize
+      name: summarize_agency_graph_working_set
+      display_name: Summarize Agency Graph Working Set
+      description: Return a compact summary of an ephemeral graph working set without persisting it, preserving the useful anchors, selected nodes, notes, and provenance for the current reasoning step.
+      tool_type: WORKFLOW_TOOL
+      input_schema_ref: graph_working_set_reference_input_schema
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.graph
+        callable_name: summarize_agency_graph_working_set
+      security:
+        read_only: true
+      tags: [ system, graph, agency_graph, agent_assignable, read_only, ephemeral, working_set ]
+    - id: agency.graph.working-set.clear
+      name: clear_agency_graph_working_set
+      display_name: Clear Agency Graph Working Set
+      description: Clear an ephemeral graph working set from runtime state after the graph investigation is complete or when the agent needs to restart with a clean set of graph anchors.
+      tool_type: WORKFLOW_TOOL
+      input_schema_ref: graph_working_set_reference_input_schema
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.graph
+        callable_name: clear_agency_graph_working_set
+      security:
+        read_only: false
+      tags: [ system, graph, agency_graph, agent_assignable, ephemeral, working_set ]
+    - id: agency.graph.working-set.persist-context-pack
+      name: persist_agency_graph_working_set_context_pack
+      display_name: Persist Agency Graph Working Set Context Pack
+      description: Explicitly persist an ephemeral graph working set as durable memory_type=context_pack with graph provenance so future runs can reuse the curated context and understand where it came from.
+      tool_type: WORKFLOW_TOOL
+      input_schema_ref: graph_working_set_persist_context_pack_input_schema
+      output_schema_name: RESULT_OUTPUT_SCHEMA
+      implementation:
+        implementation_type: workflow_tool
+        target: agency.system.graph
+        callable_name: persist_agency_graph_working_set_context_pack
+      security:
+        read_only: false
+      tags: [ system, graph, agency_graph, agent_assignable, memory, context_pack, working_set ]
+
+system_families:
+  - key: workflow
+    policy_flag: can_trigger_workflows
+    default_enabled: true
+    include_in_builtin_registry: true
+
+  - key: goal
+    policy_flag: can_manage_goals
+    default_enabled: true
+    include_in_builtin_registry: true
+
+  - key: tool_management
+    policy_flag: can_manage_tools
+    default_enabled: true
+    include_in_builtin_registry: true
+
+  - key: agent_management
+    policy_flag: can_manage_agents
+    default_enabled: true
+    include_in_builtin_registry: true
+
+  - key: connector
+    policy_flag: can_manage_integrations
+    default_enabled: true
+    include_in_builtin_registry: false
+
+  - key: memory
+    policy_flag: can_manage_memory
+    default_enabled: true
+    include_in_builtin_registry: true
+
+  - key: graph
+    policy_flag: can_read_graph_context
+    default_enabled_setting: agency_graph_context_tools_enabled
+    include_in_builtin_registry: true
+
+  - key: execution
+    policy_flag: can_inspect_executions
+    default_enabled: true
+    include_in_builtin_registry: true
+
+  - key: command
+    policy_flag: can_run_commands
+    default_enabled: true
+    include_in_builtin_registry: true

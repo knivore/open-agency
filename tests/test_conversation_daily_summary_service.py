@@ -14,7 +14,7 @@ from app.domain import (
     ConversationRole,
     MainAgentProfile,
 )
-from app.services import ConversationDailySummaryService
+from app.services.conversation_daily_summary import ConversationDailySummaryService
 
 
 class ConversationDailySummaryServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -102,13 +102,13 @@ class ConversationDailySummaryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["processed"], 1)
         self.assertEqual(result["created"], 1)
         summaries = await self.context.memory_repo.query(
-            memory_kinds=["daily_summary"],
+            memory_types=["daily_summary"],
             source_conversation_id=conversation.id,
             summary_date_from=target_date,
             summary_date_to=target_date,
         )
         self.assertEqual(len(summaries), 1)
-        self.assertEqual(summaries[0].memory_kind.value, "daily_summary")
+        self.assertEqual(summaries[0].memory_type.value, "daily_summary")
         self.assertEqual(summaries[0].metadata["summary_version"], "v1")
 
     async def test_summarize_day_skips_duplicate_summary(self) -> None:
@@ -157,7 +157,7 @@ class ConversationDailySummaryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["created"], 0)
         self.assertEqual(result["eligible_conversation_ids"], [conversation.id])
         summaries = await self.context.memory_repo.query(
-            memory_kinds=["daily_summary"],
+            memory_types=["daily_summary"],
             source_conversation_id=conversation.id,
             summary_date_from=target_date,
             summary_date_to=target_date,

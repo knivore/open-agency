@@ -1,3 +1,5 @@
+"""Read-only integration and connector capability registry routes."""
+
 from __future__ import annotations
 
 from fastapi import APIRouter
@@ -5,7 +7,7 @@ from typing import Optional
 
 from app.api.context import ApiContext, get_default_api_context
 from app.domain import ConnectorCapabilitiesPayload, IntegrationRegistryPayload
-from app.services import IntegrationsRegistryService
+from app.services.integrations_registry import IntegrationsRegistryService
 
 
 def create_integrations_registry_router(context: Optional[ApiContext] = None) -> APIRouter:

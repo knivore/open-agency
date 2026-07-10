@@ -1,3 +1,5 @@
+"""Model provider/profile catalog routes and OAuth helpers."""
+
 from __future__ import annotations
 
 import time
@@ -8,7 +10,7 @@ from typing import Optional
 from app.api.context import ApiContext, get_default_api_context
 from app.api.identity import resolve_current_user_if_present
 from app.domain import ModelProfileDefinition, ModelProviderDefinition, ModelProviderType
-from app.services import ModelCatalogService
+from app.services.models import ModelCatalogService
 from app.utils.oauth_pkce import OPENAI_CODEX_CLIENT_ID, OPENAI_CODEX_REDIRECT_URI, OAuthPKCEHandler
 from ._crud import build_crud_router
 
@@ -60,13 +62,13 @@ def _store_oauth_profile(
 
     if auth_profile_id == default_profile_id:
         for key in (
-            "access_token",
-            "refresh_token",
-            "expires_at",
-            "auth_mode",
-            "client_id",
-            "redirect_uri",
-            "account_id",
+                "access_token",
+                "refresh_token",
+                "expires_at",
+                "auth_mode",
+                "client_id",
+                "redirect_uri",
+                "account_id",
         ):
             if key in current:
                 new_config[key] = current[key]
@@ -178,14 +180,14 @@ def create_models_router(context: Optional[ApiContext] = None) -> APIRouter:
         profile_config = _oauth_profile(config, profile_id)
 
         redirect_uri = (
-            config.get("redirect_uri")
-            or config.get("redirectUri")
-            or profile_config.get("redirect_uri")
-            or (
-                OPENAI_CODEX_REDIRECT_URI
-                if provider.provider_type == ModelProviderType.OPENAI_CODEX
-                else "http://127.0.0.1:1455/auth/callback"
-            )
+                config.get("redirect_uri")
+                or config.get("redirectUri")
+                or profile_config.get("redirect_uri")
+                or (
+                    OPENAI_CODEX_REDIRECT_URI
+                    if provider.provider_type == ModelProviderType.OPENAI_CODEX
+                    else "http://127.0.0.1:1455/auth/callback"
+                )
         )
         tenant_id = config.get("tenant_id") or config.get("tenantId")
 
@@ -267,14 +269,14 @@ def create_models_router(context: Optional[ApiContext] = None) -> APIRouter:
             client_id = None
 
         redirect_uri = (
-            config.get("redirect_uri")
-            or config.get("redirectUri")
-            or profile_config.get("redirect_uri")
-            or (
-                OPENAI_CODEX_REDIRECT_URI
-                if provider.provider_type == ModelProviderType.OPENAI_CODEX
-                else "http://127.0.0.1:1455/auth/callback"
-            )
+                config.get("redirect_uri")
+                or config.get("redirectUri")
+                or profile_config.get("redirect_uri")
+                or (
+                    OPENAI_CODEX_REDIRECT_URI
+                    if provider.provider_type == ModelProviderType.OPENAI_CODEX
+                    else "http://127.0.0.1:1455/auth/callback"
+                )
         )
         tenant_id = config.get("tenant_id") or config.get("tenantId")
         expected_state = profile_config.get("pending_state")
@@ -349,9 +351,9 @@ def create_models_router(context: Optional[ApiContext] = None) -> APIRouter:
             provider.provider_type.value,
             client_id=client_id
         )
-        
+
         device_data = await handler.initiate_device_auth()
-        
+
         return {
             "device_code": device_data["device_code"],
             "user_code": device_data["user_code"],
@@ -385,7 +387,7 @@ def create_models_router(context: Optional[ApiContext] = None) -> APIRouter:
             provider.provider_type.value,
             client_id=client_id
         )
-        
+
         tokens = await handler.poll_device_token(device_code)
         account_id = OAuthPKCEHandler.extract_account_id(tokens.get("access_token"))
 

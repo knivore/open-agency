@@ -1,32 +1,54 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import unittest
 from unittest.mock import AsyncMock, patch
 
 from app.api.context import create_test_api_context
 from app.core.config import reset_settings_cache
+from app.graph.neo4j_read import GraphReadDocument, GraphReadEdge, GraphReadNode
 from app.domain import (
+    AgentDefinition,
     ChannelIdentityMapping,
+    ConversationMessage,
+    ConversationMessageType,
+    ConversationRole,
+    CredentialDefinition,
+    Execution,
     MCPExposureSettings,
     ExecutionStatus,
     MemoryRecord,
     ModelProfileDefinition,
+    PersonaStatus,
     SecuritySettings,
     ToolDefinition,
     ToolImplementationReference,
     ToolType,
+    UserDefinition,
     WorkflowDefinition,
 )
 from app.llm.base import ModelResponse, ModelToolCall
 from app.llm.registry import LLMEnvironmentConfig
-from app.services.conversations import ConversationService
-from app.services.main_agent_setup import (
+from app.services.conversations.core import ConversationService
+from app.services.agent_tools import (
+    DEFAULT_MAIN_AGENT_SPEECH_TOOL_IDS,
+    command_system_tool_ids,
+    agent_management_system_tool_ids,
+    connector_system_tool_ids,
+    execution_system_tool_ids,
+    graph_system_tool_ids,
+    memory_system_tool_ids,
+    tool_management_system_tool_ids,
+    workflow_system_tool_ids,
+)
+from app.services.main_agent_setup.service import (
     MainAgentSetupConfig,
     MainAgentSetupRequiredError,
     MainAgentSetupService,
 )
+from app.services.persona_factory import PersonaFactoryService
 from app.services.workflow_builder import WorkflowBuilderService
 
 
@@ -35,6 +57,7 @@ class _FakeModelClient:
     last_system_message: str | None = None
     responses: list[ModelResponse] = []
     seen_messages: list[list[tuple[str, object, str | None]]] = []
+    seen_message_tool_calls: list[list[list[tuple[str | None, str]]]] = []
     seen_tools: list[list[dict] | None] = []
 
     def __init__(self, profile: ModelProfileDefinition, env: LLMEnvironmentConfig):
@@ -43,6 +66,9 @@ class _FakeModelClient:
 
     def generate_text(self, messages, *, temperature=None, max_tokens=None, **kwargs):
         _FakeModelClient.seen_messages.append([(item.role, item.content, item.name) for item in messages])
+        _FakeModelClient.seen_message_tool_calls.append(
+            [[(tool_call.id, tool_call.name) for tool_call in item.tool_calls] for item in messages]
+        )
         _FakeModelClient.seen_tools.append(kwargs.get("tools"))
         _FakeModelClient.last_system_message = next((item.content for item in messages if item.role == "system"), None)
         if _FakeModelClient.responses:
@@ -52,6 +78,62 @@ class _FakeModelClient:
 
     def generate_structured(self, messages, *, schema, temperature=None, max_tokens=None, **kwargs):
         schema_name = kwargs.get("schema_name")
+        if schema_name == "source_intelligence_classification":
+            return ModelResponse(
+                content={
+                    "label": "decision",
+                    "confidence": 0.9,
+                    "signals": ["conversation_test_source"],
+                    "document_kind": "workpaper",
+                    "content_roles": ["decision", "domain_knowledge"],
+                    "extraction_targets": ["decision_pattern", "domain_knowledge"],
+                    "memory_layers": ["procedural", "semantic"],
+                    "vector_tags": ["persona", "evidence"],
+                    "graph_entities": [],
+                    "graph_relationships": [],
+                    "should_include": True,
+                    "rationale": "The source describes a persona decision rule.",
+                },
+                provider="fake",
+                model=self.profile.model,
+            )
+        if schema_name == "persona_llm_distillation_candidates":
+            prompt = next((item.content for item in reversed(messages) if item.role == "user"), "{}")
+            try:
+                prompt_payload = json.loads(prompt) if isinstance(prompt, str) else {}
+            except json.JSONDecodeError:
+                prompt_payload = {}
+            memory_payload = prompt_payload.get("memory") if isinstance(prompt_payload, dict) else {}
+            source_title = (
+                str(memory_payload.get("summary") or "Grade observations by evidence quality")
+                if isinstance(memory_payload, dict)
+                else "Grade observations by evidence quality"
+            )
+            source_content = (
+                str(memory_payload.get("content") or "Grade observations by risk and evidence quality before escalating.")
+                if isinstance(memory_payload, dict)
+                else "Grade observations by risk and evidence quality before escalating."
+            )
+            return ModelResponse(
+                content={
+                    "candidates": [
+                        {
+                            "item_type": "decision_pattern",
+                            "memory_layer": "procedural",
+                            "title": source_title[:120],
+                            "content": source_content[:1200],
+                            "confidence": 0.86,
+                            "source_evidence": "grades observations by risk and evidence quality",
+                            "source_span": {"start": 0, "end": 52},
+                            "review_reasons": ["source_backed"],
+                            "structured_payload": {"rule": "Grade observations by risk and evidence quality."},
+                            "inference_type": "extractive",
+                        }
+                    ]
+                },
+                provider="fake",
+                model=self.profile.model,
+            )
         if schema_name == "workflow_builder_task_list":
             return ModelResponse(
                 content={
@@ -249,6 +331,54 @@ class _CodexAuthRequiredModelClient:
         }
 
 
+class _FakePersonaGraphReadService:
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    async def get_graph_preset(self, preset: str, **kwargs):
+        self.calls.append({"preset": preset, **kwargs})
+        return GraphReadDocument(
+            nodes=[
+                GraphReadNode(
+                    id=kwargs.get("persona_id") or "persona-1",
+                    type="Persona",
+                    labels=["Persona"],
+                    properties={"name": "Audit Manager Persona"},
+                ),
+                GraphReadNode(
+                    id="source-intelligence:workflow:audit-review",
+                    type="Workflow",
+                    labels=["Entity", "Workflow"],
+                    properties={
+                        "name": "Audit Review Workflow",
+                        "evidence": "Reviewed graph hint from approved source intelligence.",
+                    },
+                ),
+                GraphReadNode(
+                    id="source-intelligence:artifact:mlp-observation",
+                    type="Artifact",
+                    labels=["Entity", "Artifact"],
+                    properties={"name": "MLP Observation"},
+                ),
+            ],
+            edges=[
+                GraphReadEdge(
+                    id="edge-persona-workflow",
+                    source=kwargs.get("persona_id") or "persona-1",
+                    target="source-intelligence:workflow:audit-review",
+                    type="MENTIONS",
+                ),
+                GraphReadEdge(
+                    id="edge-workflow-artifact",
+                    source="source-intelligence:workflow:audit-review",
+                    target="source-intelligence:artifact:mlp-observation",
+                    type="PRODUCES",
+                ),
+            ],
+            meta={"source": "fake-persona-graph"},
+        )
+
+
 class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.context = create_test_api_context()
@@ -265,11 +395,66 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
         _FakeModelClient.last_system_message = None
         _FakeModelClient.responses = []
         _FakeModelClient.seen_messages = []
+        _FakeModelClient.seen_message_tool_calls = []
         _FakeModelClient.seen_tools = []
         _CodexAuthRequiredModelClient.generate_calls = 0
 
     async def asyncTearDown(self) -> None:
         reset_settings_cache()
+
+    async def test_channel_context_prompt_and_approval_metadata_cover_chat_channels(self) -> None:
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Answer briefly.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+            )
+        )
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-channel-context",
+                "created_by_user_id": "user-1",
+                "channel_type": "discord",
+                "channel_thread_id": "discord-thread-1",
+                "channel_user_id": "discord-user-1",
+            }
+        )
+        origin_message = await self.context.conversation_message_repo.create(
+            ConversationMessage(
+                id="message-channel-context",
+                conversation_id=conversation.id,
+                role=ConversationRole.USER,
+                message_type=ConversationMessageType.USER_TEXT,
+                plain_text="What can you do here?",
+                content={"text": "What can you do here?"},
+                metadata={
+                    "channel_context": {
+                        "channel_type": "discord",
+                        "thread_id": "discord-thread-1",
+                        "user_id": "discord-user-1",
+                        "display_name": "Discord User",
+                        "guild_id": "guild-1",
+                    }
+                },
+            )
+        )
+
+        prompt = self.service._channel_context_prompt(origin_message)
+        self.assertIsNotNone(prompt)
+        self.assertIn("Current Chat Channel Context:", prompt)
+        self.assertIn('"channel_type":"discord"', prompt)
+        self.assertIn('"thread_id":"discord-thread-1"', prompt)
+        self.assertIn('"user_id":"discord-user-1"', prompt)
+        self.assertIn("this workflow", prompt)
+        self.assertIn("workflow_id", prompt)
+        self.assertIn("ask for the missing identifier first", prompt)
+
+        approval_metadata = await self.service._approval_origin_metadata(origin_message.id)
+        self.assertEqual(approval_metadata["source"], "chat_channel")
+        self.assertEqual(approval_metadata["source_channel_type"], "discord")
+        self.assertEqual(approval_metadata["source_channel_context"]["thread_id"], "discord-thread-1")
 
     async def _create_computer_use_tool(self, tool_id: str, canonical_name: str) -> None:
         await self.context.tool_repo.create(
@@ -307,6 +492,41 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
             if tool_id not in updated:
                 updated.append(tool_id)
         await self.context.agent_repo.update(agent.id, {"tool_ids": updated})
+
+    async def _publish_minimal_persona(
+            self,
+            *,
+            user_id: str,
+            persona_name: str,
+            memory_id: str,
+    ) -> dict:
+        user = await self.context.user_repo.create(
+            UserDefinition(id=user_id, email=f"{user_id}@example.com", display_name=user_id)
+        )
+        await self.context.memory_repo.create(
+            MemoryRecord(
+                id=memory_id,
+                scope="user",
+                created_by_user_id=user.id,
+                content=f"{persona_name} grades observations by risk and evidence quality.",
+                summary=f"{persona_name} grading rule",
+                memory_type="decision",
+                tags=["persona-source"],
+            )
+        )
+        distill = await PersonaFactoryService(self.context).distill_from_memories(
+            persona_id=None,
+            name=persona_name,
+            description="Reviews observations.",
+            source_memory_ids=[memory_id],
+            model_profile_id=None,
+            current_user=user,
+        )
+        item_id = distill["items"][0]["id"]
+        await PersonaFactoryService(self.context).approve_item(item_id)
+        await PersonaFactoryService(self.context).synthesize_package_from_items(distill["run"]["id"])
+        await PersonaFactoryService(self.context).approve_run(distill["run"]["id"], current_user=user)
+        return await PersonaFactoryService(self.context).publish_run(distill["run"]["id"], current_user=user)
 
     def _workflow_payload(self, *, workflow_id: str, name: str, description: str = "Workflow description") -> dict:
         return {
@@ -472,8 +692,703 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
         messages = await self.service.list_messages(conversation.id)
         self.assertEqual([item["role"] for item in messages["items"]], ["user", "assistant"])
         self.assertIsNotNone(_FakeModelClient.last_system_message)
-        self.assertIn("Computer Use Contract:", _FakeModelClient.last_system_message)
-        self.assertIn("click, snapshot", _FakeModelClient.last_system_message)
+
+    async def test_post_message_invokes_published_persona_by_mention(self) -> None:
+        user = await self.context.user_repo.create(
+            UserDefinition(id="persona-user", email="persona@example.com", display_name="Persona User")
+        )
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Answer briefly.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+            )
+        )
+        await self.context.memory_repo.create(
+            MemoryRecord(
+                id="persona-source-memory",
+                scope="user",
+                created_by_user_id=user.id,
+                content="Audit Manager Persona grades observations by risk, evidence quality, and management impact.",
+                summary="Audit observation grading rule",
+                memory_type="decision",
+                tags=["persona-source"],
+            )
+        )
+        await self.context.memory_repo.create(
+            MemoryRecord(
+                id="persona-rejected-memory",
+                scope="user",
+                created_by_user_id=user.id,
+                content="Audit review workflow starts with planning, testing, and issue validation.",
+                summary="Rejected audit workflow note",
+                memory_type="fact",
+                tags=["persona-source"],
+            )
+        )
+        distill = await PersonaFactoryService(self.context).distill_from_memories(
+            persona_id=None,
+            name="Audit Manager Persona",
+            description="Reviews audit observations.",
+            source_memory_ids=["persona-source-memory", "persona-rejected-memory"],
+            model_profile_id=None,
+            current_user=user,
+        )
+        run_id = distill["run"]["id"]
+        decision_item = next(item for item in distill["items"] if item["source_memory_id"] == "persona-source-memory")
+        rejected_item = next(item for item in distill["items"] if item["source_memory_id"] == "persona-rejected-memory")
+        await PersonaFactoryService(self.context).approve_item(decision_item["id"])
+        await PersonaFactoryService(self.context).reject_item(rejected_item["id"], reason="Not enough source support.")
+        await PersonaFactoryService(self.context).synthesize_package_from_items(run_id)
+        await PersonaFactoryService(self.context).approve_run(run_id, current_user=user)
+        await PersonaFactoryService(self.context).publish_run(run_id, current_user=user)
+
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-persona",
+                "created_by_user_id": user.id,
+                "channel_type": "api",
+            }
+        )
+        result = await self.service.post_message(
+            conversation.id,
+            {
+                "message": {
+                    "id": "message-persona",
+                    "role": "user",
+                    "message_type": "user_text",
+                    "plain_text": "@audit-manager-persona review this observation",
+                    "content": {"text": "@audit-manager-persona review this observation"},
+                },
+                "response_mode": "sync",
+            },
+        )
+
+        self.assertEqual(result["persona"]["slug"], "audit-manager-persona")
+        self.assertEqual(result["assistant_message"]["metadata"]["delivery"], "persona")
+        self.assertEqual(result["assistant_message"]["metadata"]["persona_slug"], "audit-manager-persona")
+        provenance = result["assistant_message"]["metadata"]["persona_provenance"]
+        self.assertEqual(provenance["package_strategy"], "item-synthesis-v1")
+        self.assertIn("persona-source-memory", provenance["source_memory_ids"])
+        self.assertTrue(provenance["distillation_item_ids"])
+        self.assertTrue(provenance["source_refs"])
+        runtime_context = provenance["runtime_context"]
+        self.assertTrue(runtime_context["used_vector_memory"])
+        self.assertFalse(runtime_context["used_graph_context"])
+        self.assertEqual(runtime_context["vector_memory"]["source"], "approved_persona_memory")
+        self.assertTrue(runtime_context["vector_memory"]["approved_persona_memory_used"])
+        self.assertFalse(runtime_context["vector_memory"]["raw_source_fallback_used"])
+        self.assertIn("@audit-manager-persona", _FakeModelClient.last_system_message or "")
+        self.assertIn("Audit observation grading rule", _FakeModelClient.last_system_message or "")
+        self.assertNotIn("Rejected audit workflow note", _FakeModelClient.last_system_message or "")
+        projection_events = await self.context.graph_projection_event_repo.list_events(limit=200)
+        self.assertTrue(
+            any(
+                event.event_type == "persona.runtime.invoked"
+                and event.aggregate_type == "persona"
+                and event.aggregate_id == result["persona"]["id"]
+                for event in projection_events
+            )
+        )
+
+    async def test_post_message_includes_persona_graph_context_when_enabled(self) -> None:
+        with patch.dict(os.environ, {"GRAPH_CONTEXT_AUTO_RETRIEVAL_ENABLED": "true"}, clear=False):
+            reset_settings_cache()
+            self.context.graph_read_service = _FakePersonaGraphReadService()
+            await self.setup_service.create_main_agent(
+                MainAgentSetupConfig(
+                    agent_name="Main Agent",
+                    agent_description="Configured for tests.",
+                    agent_instructions="Answer briefly.",
+                    model_profile_id="profile-fake",
+                    profile_id="main-agent-profile",
+                )
+            )
+            published = await self._publish_minimal_persona(
+                user_id="persona-graph-user",
+                persona_name="Graph Persona",
+                memory_id="persona-graph-source-memory",
+            )
+            conversation = await self.service.create_conversation(
+                {
+                    "id": "conversation-persona-graph",
+                    "created_by_user_id": "persona-graph-user",
+                    "channel_type": "api",
+                }
+            )
+
+            result = await self.service.post_message(
+                conversation.id,
+                {
+                    "message": {
+                        "id": "message-persona-graph",
+                        "role": "user",
+                        "message_type": "user_text",
+                        "plain_text": "@graph-persona use graph context",
+                        "content": {"text": "@graph-persona use graph context"},
+                    },
+                    "response_mode": "sync",
+                },
+            )
+
+        self.assertEqual(result["persona"]["id"], published["persona"]["id"])
+        runtime_context = result["assistant_message"]["metadata"]["persona_provenance"]["runtime_context"]
+        self.assertTrue(runtime_context["used_graph_context"])
+        self.assertEqual(runtime_context["graph_context"]["status"], "used")
+        self.assertEqual(runtime_context["graph_context"]["node_count"], 3)
+        self.assertEqual(runtime_context["graph_context"]["edge_count"], 2)
+        self.assertEqual(runtime_context["graph_context"]["policy"]["invocation_type"], "persona_runtime")
+        self.assertEqual(runtime_context["graph_context"]["policy"]["preset"], "persona_lineage")
+        self.assertEqual(runtime_context["graph_context"]["policy"]["fallback"], "skip_graph_context_without_failing_invocation")
+        self.assertIn("# Persona Graph Context", _FakeModelClient.last_system_message or "")
+        self.assertIn("Policy: preset=persona_lineage", _FakeModelClient.last_system_message or "")
+        self.assertIn("Audit Review Workflow", _FakeModelClient.last_system_message or "")
+        self.assertIn("PRODUCES", _FakeModelClient.last_system_message or "")
+        self.assertEqual(self.context.graph_read_service.calls[0]["preset"], "persona_lineage")
+        self.assertEqual(self.context.graph_read_service.calls[0]["persona_id"], published["persona"]["id"])
+
+    async def test_post_message_invokes_explicit_published_persona_version(self) -> None:
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Answer briefly.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+            )
+        )
+        published_v1 = await self._publish_minimal_persona(
+            user_id="persona-version-user",
+            persona_name="Versioned Persona",
+            memory_id="persona-version-source-memory",
+        )
+        user = await self.context.user_repo.get("persona-version-user")
+        self.assertIsNotNone(user)
+        factory = PersonaFactoryService(self.context)
+        feedback = await factory.capture_feedback(
+            persona_id=published_v1["persona"]["id"],
+            title="Updated grading rule",
+            content="Versioned Persona now also considers management response urgency.",
+            item_type="decision_pattern",
+            memory_layer="procedural",
+            feedback_type="accepted_edit",
+            confidence=0.8,
+            source_memory_id=None,
+            accepted_edit_of_item_id=None,
+            source_conversation_id=None,
+            source_message_id=None,
+            source_run_id=None,
+            metadata={},
+            current_user=user,
+        )
+        await factory.approve_item(feedback["items"][0]["id"])
+        await factory.synthesize_package_from_items(feedback["run"]["id"])
+        approved_v2 = await factory.approve_run(feedback["run"]["id"], current_user=user)
+        self.assertEqual(approved_v2["persona_version"]["version"], "1.0.1")
+        await factory.publish_run(feedback["run"]["id"], current_user=user)
+
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-persona-version",
+                "created_by_user_id": user.id,
+                "channel_type": "api",
+            }
+        )
+        result = await self.service.post_message(
+            conversation.id,
+            {
+                "message": {
+                    "id": "message-persona-version",
+                    "role": "user",
+                    "message_type": "user_text",
+                    "plain_text": "@versioned-persona:1.0.0 review this observation",
+                    "content": {"text": "@versioned-persona:1.0.0 review this observation"},
+                },
+                "response_mode": "sync",
+            },
+        )
+
+        self.assertEqual(result["persona"]["slug"], "versioned-persona")
+        self.assertEqual(result["persona_version"]["id"], published_v1["persona_version"]["id"])
+        self.assertEqual(result["persona_version"]["version"], "1.0.0")
+        self.assertEqual(result["assistant_message"]["metadata"]["persona_version_target"], "1.0.0")
+        self.assertIn("Persona package version: 1.0.0", _FakeModelClient.last_system_message or "")
+
+    async def test_post_message_excludes_sensitive_persona_memory(self) -> None:
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Answer briefly.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+            )
+        )
+        published = await self._publish_minimal_persona(
+            user_id="persona-sensitive-user",
+            persona_name="Sensitive Memory Persona",
+            memory_id="sensitive-persona-source-memory",
+        )
+        persona = published["persona"]
+        persona_version = published["persona_version"]
+        await self.context.memory_repo.create(
+            MemoryRecord(
+                id="persona-sensitive-published-memory",
+                scope="user",
+                created_by_user_id="persona-sensitive-user",
+                source="persona_factory",
+                content="Sensitive private family detail that must not enter the persona prompt.",
+                summary="Sensitive private family detail",
+                memory_type="fact",
+                tags=[f"persona:{persona['slug']}"],
+                sensitive=True,
+                metadata={
+                    "persona_id": persona["id"],
+                    "persona_version_id": persona_version["id"],
+                    "distillation_item_id": "approved-sensitive-item",
+                    "review_status": "approved",
+                    "needs_review": False,
+                    "memory_layer": "semantic",
+                    "item_type": "domain_knowledge",
+                },
+            )
+        )
+
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-persona-sensitive",
+                "created_by_user_id": "persona-sensitive-user",
+                "channel_type": "api",
+            }
+        )
+        result = await self.service.post_message(
+            conversation.id,
+            {
+                "message": {
+                    "id": "message-persona-sensitive",
+                    "role": "user",
+                    "message_type": "user_text",
+                    "plain_text": "@sensitive-memory-persona review this observation",
+                    "content": {"text": "@sensitive-memory-persona review this observation"},
+                },
+                "response_mode": "sync",
+            },
+        )
+
+        self.assertEqual(result["persona"]["slug"], "sensitive-memory-persona")
+        self.assertIn("Sensitive Memory Persona grading rule", _FakeModelClient.last_system_message or "")
+        self.assertNotIn("Sensitive private family detail", _FakeModelClient.last_system_message or "")
+
+    async def test_post_message_renders_persona_document_memory_with_source_context(self) -> None:
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Answer briefly.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+            )
+        )
+        published = await self._publish_minimal_persona(
+            user_id="persona-document-user",
+            persona_name="Document Memory Persona",
+            memory_id="document-persona-source-memory",
+        )
+        persona = published["persona"]
+        persona_version = published["persona_version"]
+        await self.context.memory_repo.create(
+            MemoryRecord(
+                id="persona-document-published-memory",
+                scope="user",
+                created_by_user_id="persona-document-user",
+                source="persona_factory",
+                content="Document chunk evidence " + ("detail " * 260),
+                summary="Document evidence chunk summary",
+                memory_type="fact",
+                tags=[f"persona:{persona['slug']}"],
+                metadata={
+                    "persona_id": persona["id"],
+                    "persona_version_id": persona_version["id"],
+                    "distillation_item_id": "approved-document-item",
+                    "review_status": "approved",
+                    "needs_review": False,
+                    "memory_layer": "semantic",
+                    "item_type": "domain_knowledge",
+                    "filename": "audit-evidence.md",
+                    "chunk_index": 2,
+                    "chunk_count": 5,
+                },
+            )
+        )
+
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-persona-document",
+                "created_by_user_id": "persona-document-user",
+                "channel_type": "api",
+            }
+        )
+        await self.service.post_message(
+            conversation.id,
+            {
+                "message": {
+                    "id": "message-persona-document",
+                    "role": "user",
+                    "message_type": "user_text",
+                    "plain_text": "@document-memory-persona use the evidence",
+                    "content": {"text": "@document-memory-persona use the evidence"},
+                },
+                "response_mode": "sync",
+            },
+        )
+
+        system_message = _FakeModelClient.last_system_message or ""
+        self.assertIn("audit-evidence.md", system_message)
+        self.assertIn("chunk 3/5", system_message)
+        self.assertIn("Document chunk evidence", system_message)
+        self.assertIn("[truncated]", system_message)
+
+    async def test_post_message_applies_persona_memory_layer_filter(self) -> None:
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Answer briefly.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+            )
+        )
+        published = await self._publish_minimal_persona(
+            user_id="persona-layer-user",
+            persona_name="Layer Filter Persona",
+            memory_id="layer-persona-source-memory",
+        )
+        persona = published["persona"]
+        persona_version = published["persona_version"]
+        version = await self.context.persona_version_repo.get(persona_version["id"])
+        assert version is not None
+        package = dict(version.package)
+        package.setdefault("runtime", {})["memory_layer_filter"] = ["tool"]
+        await self.context.persona_version_repo.save(version.model_copy(update={"package": package}))
+        for memory_id, layer, content in (
+            ("persona-layer-semantic-memory", "semantic", "Semantic-only persona memory should be filtered out."),
+            ("persona-layer-tool-memory", "tool", "Tool-layer persona memory should be injected."),
+        ):
+            await self.context.memory_repo.create(
+                MemoryRecord(
+                    id=memory_id,
+                    scope="user",
+                    created_by_user_id="persona-layer-user",
+                    source="persona_factory",
+                    content=content,
+                    summary=content,
+                    memory_type="fact",
+                    tags=[f"persona:{persona['slug']}"],
+                    metadata={
+                        "persona_id": persona["id"],
+                        "persona_version_id": persona_version["id"],
+                        "distillation_item_id": memory_id,
+                        "review_status": "approved",
+                        "needs_review": False,
+                        "memory_layer": layer,
+                        "item_type": "domain_knowledge",
+                    },
+                )
+            )
+
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-persona-layer-filter",
+                "created_by_user_id": "persona-layer-user",
+                "channel_type": "api",
+            }
+        )
+        await self.service.post_message(
+            conversation.id,
+            {
+                "message": {
+                    "id": "message-persona-layer-filter",
+                    "role": "user",
+                    "message_type": "user_text",
+                    "plain_text": "@layer-filter-persona use tool memory",
+                    "content": {"text": "@layer-filter-persona use tool memory"},
+                },
+                "response_mode": "sync",
+            },
+        )
+
+        system_message = _FakeModelClient.last_system_message or ""
+        self.assertIn("Tool-layer persona memory should be injected.", system_message)
+        self.assertNotIn("Semantic-only persona memory should be filtered out.", system_message)
+
+    async def test_post_message_uses_raw_source_memory_as_fallback_evidence(self) -> None:
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Answer briefly.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+            )
+        )
+        published = await self._publish_minimal_persona(
+            user_id="persona-fallback-user",
+            persona_name="Fallback Evidence Persona",
+            memory_id="fallback-persona-source-memory",
+        )
+        for memory_id in published["memory_ids"]:
+            self.context.memory_repo._items.pop(memory_id, None)
+
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-persona-fallback",
+                "created_by_user_id": "persona-fallback-user",
+                "channel_type": "api",
+            }
+        )
+        result = await self.service.post_message(
+            conversation.id,
+            {
+                "message": {
+                    "id": "message-persona-fallback",
+                    "role": "user",
+                    "message_type": "user_text",
+                    "plain_text": "@fallback-evidence-persona use fallback evidence",
+                    "content": {"text": "@fallback-evidence-persona use fallback evidence"},
+                },
+                "response_mode": "sync",
+            },
+        )
+
+        system_message = _FakeModelClient.last_system_message or ""
+        self.assertIn("Fallback Evidence Persona grading rule", system_message)
+        self.assertIn("Fallback Evidence Persona grades observations by risk", system_message)
+        runtime_context = result["assistant_message"]["metadata"]["persona_provenance"]["runtime_context"]
+        self.assertTrue(runtime_context["used_vector_memory"])
+        self.assertEqual(runtime_context["vector_memory"]["source"], "raw_source_memory_fallback")
+        self.assertFalse(runtime_context["vector_memory"]["approved_persona_memory_used"])
+        self.assertTrue(runtime_context["vector_memory"]["raw_source_fallback_used"])
+        self.assertIn("fallback-persona-source-memory", runtime_context["vector_memory"]["memory_ids"])
+
+    async def test_post_message_reports_unknown_persona_mention(self) -> None:
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Answer briefly.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+            )
+        )
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-unknown-persona",
+                "created_by_user_id": "persona-user",
+                "channel_type": "api",
+            }
+        )
+
+        result = await self.service.post_message(
+            conversation.id,
+            {
+                "message": {
+                    "id": "message-unknown-persona",
+                    "role": "user",
+                    "message_type": "user_text",
+                    "plain_text": "@missing-persona help",
+                    "content": {"text": "@missing-persona help"},
+                },
+                "response_mode": "sync",
+            },
+        )
+
+        self.assertEqual(result["assistant_message"]["metadata"]["delivery"], "persona")
+        self.assertEqual(result["assistant_message"]["metadata"]["persona_error"], "not_found")
+        self.assertIn("could not find", result["assistant_message"]["plain_text"])
+        self.assertIsNone(_FakeModelClient.last_system_message)
+
+    async def test_post_message_reports_unpublished_persona_mention(self) -> None:
+        user = await self.context.user_repo.create(
+            UserDefinition(id="draft-persona-user", email="draft@example.com", display_name="Draft User")
+        )
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Answer briefly.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+            )
+        )
+        await self.context.memory_repo.create(
+            MemoryRecord(
+                id="draft-persona-source-memory",
+                scope="user",
+                created_by_user_id=user.id,
+                content="Draft persona uses concise responses.",
+                summary="Draft persona response style",
+                memory_type="preference",
+                tags=["persona-source"],
+            )
+        )
+        await PersonaFactoryService(self.context).distill_from_memories(
+            persona_id=None,
+            name="Draft Persona",
+            description="Not published yet.",
+            source_memory_ids=["draft-persona-source-memory"],
+            model_profile_id=None,
+            current_user=user,
+        )
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-draft-persona",
+                "created_by_user_id": user.id,
+                "channel_type": "api",
+            }
+        )
+
+        result = await self.service.post_message(
+            conversation.id,
+            {
+                "message": {
+                    "id": "message-draft-persona",
+                    "role": "user",
+                    "message_type": "user_text",
+                    "plain_text": "@draft-persona help",
+                    "content": {"text": "@draft-persona help"},
+                },
+                "response_mode": "sync",
+            },
+        )
+
+        self.assertEqual(result["assistant_message"]["metadata"]["delivery"], "persona")
+        self.assertEqual(result["assistant_message"]["metadata"]["persona_error"], "not_published")
+        self.assertIn("not published", result["assistant_message"]["plain_text"])
+        self.assertIsNone(_FakeModelClient.last_system_message)
+
+    async def test_post_message_reports_archived_persona_mention(self) -> None:
+        user = await self.context.user_repo.create(
+            UserDefinition(id="archived-persona-user", email="archived@example.com", display_name="Archived User")
+        )
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Answer briefly.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+            )
+        )
+        await self.context.memory_repo.create(
+            MemoryRecord(
+                id="archived-persona-source-memory",
+                scope="user",
+                created_by_user_id=user.id,
+                content="Archived persona uses concise responses.",
+                summary="Archived persona response style",
+                memory_type="preference",
+                tags=["persona-source"],
+            )
+        )
+        distill = await PersonaFactoryService(self.context).distill_from_memories(
+            persona_id=None,
+            name="Archived Persona",
+            description="Archived before publishing.",
+            source_memory_ids=["archived-persona-source-memory"],
+            model_profile_id=None,
+            current_user=user,
+        )
+        await self.context.persona_repo.update(distill["persona"]["id"], {"status": PersonaStatus.ARCHIVED.value})
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-archived-persona",
+                "created_by_user_id": user.id,
+                "channel_type": "api",
+            }
+        )
+
+        result = await self.service.post_message(
+            conversation.id,
+            {
+                "message": {
+                    "id": "message-archived-persona",
+                    "role": "user",
+                    "message_type": "user_text",
+                    "plain_text": "@archived-persona help",
+                    "content": {"text": "@archived-persona help"},
+                },
+                "response_mode": "sync",
+            },
+        )
+
+        self.assertEqual(result["assistant_message"]["metadata"]["delivery"], "persona")
+        self.assertEqual(result["assistant_message"]["metadata"]["persona_error"], "not_published")
+        self.assertIn("not published", result["assistant_message"]["plain_text"])
+        self.assertIsNone(_FakeModelClient.last_system_message)
+
+    async def test_post_message_async_persona_invocation_returns_stream_and_completes_later(self) -> None:
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Answer briefly.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+            )
+        )
+        published = await self._publish_minimal_persona(
+            user_id="async-persona-user",
+            persona_name="Async Persona",
+            memory_id="async-persona-source-memory",
+        )
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-async-persona",
+                "created_by_user_id": "async-persona-user",
+                "channel_type": "api",
+            }
+        )
+
+        result = await self.service.post_message(
+            conversation.id,
+            {
+                "message": {
+                    "id": "message-async-persona",
+                    "role": "user",
+                    "message_type": "user_text",
+                    "plain_text": "@async-persona review this",
+                    "content": {"text": "@async-persona review this"},
+                },
+                "response_mode": "async",
+            },
+        )
+
+        self.assertEqual(result["message"]["id"], "message-async-persona")
+        self.assertNotIn("assistant_message", result)
+        self.assertEqual(
+            result["stream_url"],
+            "/conversations/conversation-async-persona/stream?after=message-async-persona",
+        )
+
+        async def _assistant_messages():
+            messages = await self.service.list_messages(conversation.id)
+            return [item for item in messages["items"] if item["role"] == "assistant"]
+
+        assistant_messages = []
+        for _ in range(20):
+            assistant_messages = await _assistant_messages()
+            if assistant_messages:
+                break
+            await asyncio.sleep(0.01)
+        self.assertTrue(assistant_messages)
+        self.assertEqual(assistant_messages[-1]["metadata"]["delivery"], "persona")
+        self.assertEqual(assistant_messages[-1]["metadata"]["persona_id"], published["persona"]["id"])
+        self.assertEqual(
+            assistant_messages[-1]["metadata"]["persona_provenance"]["package_strategy"],
+            "item-synthesis-v1",
+        )
 
     async def test_post_message_async_returns_before_main_agent_reply(self) -> None:
         await self.setup_service.create_main_agent(
@@ -585,6 +1500,9 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
 
         assert _FakeModelClient.last_system_message is not None
         self.assertNotIn("Main Agent Capability Catalog:", _FakeModelClient.last_system_message)
+        self.assertIn("create the UI approval request", _FakeModelClient.last_system_message)
+        self.assertIn("backend apply/persist step", _FakeModelClient.last_system_message)
+        self.assertIn("backend/UI mismatch", _FakeModelClient.last_system_message)
         tool_names = [
             tool["function"]["name"]
             for tool in (_FakeModelClient.seen_tools[-1] or [])
@@ -781,7 +1699,7 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
                 scope="conversation",
                 conversation_id="conversation-memory-v2-1",
                 content="Use the DB-backed memory system as the source of truth.",
-                memory_kind="decision",
+                memory_type="decision",
             )
         )
         await self.context.memory_repo.create(
@@ -790,7 +1708,7 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
                 scope="conversation",
                 conversation_id="conversation-memory-v2-1",
                 content="Finish the implementation spec before changing runtime behavior.",
-                memory_kind="task_commitment",
+                memory_type="task_commitment",
             )
         )
         await self.context.memory_repo.create(
@@ -800,7 +1718,7 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
                 created_by_user_id="user-1",
                 content="The user's timezone preference is Asia/Singapore.",
                 summary="Timezone preference is Asia/Singapore.",
-                memory_kind="preference",
+                memory_type="preference",
             )
         )
         await self.context.memory_repo.create(
@@ -811,7 +1729,7 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
                 source_conversation_id="conversation-memory-v2-1",
                 content="The day focused on designing the DB-first memory architecture.",
                 summary="Locked the DB-first memory design.",
-                memory_kind="daily_summary",
+                memory_type="daily_summary",
                 summary_date="2026-05-08",
                 archived_window_start="2026-05-08T00:00:00Z",
                 archived_window_end="2026-05-08T23:59:59Z",
@@ -824,7 +1742,7 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
                 created_by_user_id="user-1",
                 content="The user's API key is sk-secret.",
                 sensitive=True,
-                memory_kind="fact",
+                memory_type="fact",
             )
         )
         await self.setup_service.create_main_agent(
@@ -871,6 +1789,411 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[preference:memory-preference-1]", _FakeModelClient.last_system_message)
         self.assertIn("[daily_summary:memory-summary-1][2026-05-08]", _FakeModelClient.last_system_message)
         self.assertNotIn("sk-secret", _FakeModelClient.last_system_message)
+
+    async def test_context_pack_prompt_injection_is_disabled_by_default(self) -> None:
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Answer briefly.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+            )
+        )
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-context-pack-disabled",
+                "created_by_user_id": "user-1",
+                "channel_type": "api",
+            }
+        )
+        await self.context.memory_repo.create(
+            MemoryRecord(
+                id="context-pack-disabled",
+                scope="conversation",
+                conversation_id=conversation.id,
+                source_conversation_id=conversation.id,
+                source="compact_tool",
+                content="Compact context that should stay out of prompts by default.",
+                summary="Disabled context pack.",
+                memory_type="context_pack",
+                metadata={"mode": "handoff"},
+                tags=["context_pack", "conversation", "handoff"],
+            )
+        )
+
+        await self.service.post_message(
+            conversation.id,
+            {
+                "message": {
+                    "id": "message-context-pack-disabled",
+                    "role": "user",
+                    "message_type": "user_text",
+                    "plain_text": "What context do you have?",
+                    "content": {"text": "What context do you have?"},
+                },
+            },
+        )
+
+        assert _FakeModelClient.last_system_message is not None
+        self.assertNotIn("Relevant compact conversation context", _FakeModelClient.last_system_message)
+        self.assertNotIn("Disabled context pack", _FakeModelClient.last_system_message)
+        self.assertNotIn("Compact context that should stay out", _FakeModelClient.last_system_message)
+
+    async def test_context_pack_prompt_injection_can_be_enabled(self) -> None:
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Answer briefly.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+            )
+        )
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-context-pack-enabled",
+                "created_by_user_id": "user-1",
+                "channel_type": "api",
+            }
+        )
+        await self.context.memory_repo.create(
+            MemoryRecord(
+                id="context-pack-enabled",
+                scope="conversation",
+                conversation_id=conversation.id,
+                source_conversation_id=conversation.id,
+                source="compact_tool",
+                content="The compact pack says the user wants context packs used for long conversations.",
+                summary="Enabled context pack.",
+                memory_type="context_pack",
+                metadata={"mode": "handoff"},
+                tags=["context_pack", "conversation", "handoff"],
+            )
+        )
+
+        with patch.dict(os.environ, {"MEMORY_CONTEXT_PACK_PROMPT_INJECTION_ENABLED": "true"}, clear=False):
+            reset_settings_cache()
+            await self.service.post_message(
+                conversation.id,
+                {
+                    "message": {
+                        "id": "message-context-pack-enabled",
+                        "role": "user",
+                        "message_type": "user_text",
+                        "plain_text": "What context do you have?",
+                        "content": {"text": "What context do you have?"},
+                    },
+                },
+            )
+            reset_settings_cache()
+
+        assert _FakeModelClient.last_system_message is not None
+        self.assertIn("Relevant compact conversation context", _FakeModelClient.last_system_message)
+        self.assertIn("Enabled context pack", _FakeModelClient.last_system_message)
+        self.assertIn("The compact pack says", _FakeModelClient.last_system_message)
+
+    async def test_context_pack_prompt_injection_prefers_higher_importance_pack(self) -> None:
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Answer briefly.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+            )
+        )
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-context-pack-importance",
+                "created_by_user_id": "user-1",
+                "channel_type": "api",
+            }
+        )
+        await self.context.memory_repo.create(
+            MemoryRecord(
+                id="context-pack-low-importance",
+                scope="conversation",
+                conversation_id=conversation.id,
+                source_conversation_id=conversation.id,
+                source="compact_tool",
+                content="Lower importance context pack.",
+                summary="Low importance pack.",
+                memory_type="context_pack",
+                importance=20,
+                metadata={"mode": "handoff"},
+                tags=["context_pack", "conversation", "handoff"],
+            )
+        )
+        await self.context.memory_repo.create(
+            MemoryRecord(
+                id="context-pack-high-importance",
+                scope="conversation",
+                conversation_id=conversation.id,
+                source_conversation_id=conversation.id,
+                source="compact_tool",
+                content="Higher importance context pack.",
+                summary="High importance pack.",
+                memory_type="context_pack",
+                importance=95,
+                metadata={"mode": "handoff"},
+                tags=["context_pack", "conversation", "handoff"],
+            )
+        )
+
+        with patch.dict(
+                os.environ,
+                {
+                    "MEMORY_CONTEXT_PACK_PROMPT_INJECTION_ENABLED": "true",
+                    "MEMORY_CONTEXT_PACK_PROMPT_LIMIT": "1",
+                },
+                clear=False,
+        ):
+            reset_settings_cache()
+            await self.service.post_message(
+                conversation.id,
+                {
+                    "message": {
+                        "id": "message-context-pack-importance",
+                        "role": "user",
+                        "message_type": "user_text",
+                        "plain_text": "Which compact context do you use?",
+                        "content": {"text": "Which compact context do you use?"},
+                    },
+                },
+            )
+            reset_settings_cache()
+
+        assert _FakeModelClient.last_system_message is not None
+        self.assertIn("High importance pack.", _FakeModelClient.last_system_message)
+        self.assertIn("Higher importance context pack.", _FakeModelClient.last_system_message)
+        self.assertNotIn("Low importance pack.", _FakeModelClient.last_system_message)
+
+    async def test_context_pack_history_compaction_keeps_recent_raw_messages(self) -> None:
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Answer briefly.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+            )
+        )
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-context-pack-history-compaction",
+                "created_by_user_id": "user-1",
+                "channel_type": "api",
+            }
+        )
+        await self.context.memory_repo.create(
+            MemoryRecord(
+                id="context-pack-history-compaction",
+                scope="conversation",
+                conversation_id=conversation.id,
+                source_conversation_id=conversation.id,
+                source="compact_tool",
+                content="Older discussion has already been compacted into this handoff pack.",
+                summary="History compaction pack.",
+                memory_type="context_pack",
+                metadata={"mode": "handoff"},
+                tags=["context_pack", "conversation", "handoff"],
+            )
+        )
+        for index in range(12):
+            await self.context.conversation_message_repo.create(
+                ConversationMessage(
+                    id=f"message-history-compaction-{index:02d}",
+                    conversation_id=conversation.id,
+                    role=ConversationRole.USER,
+                    message_type=ConversationMessageType.USER_TEXT,
+                    plain_text=f"Old raw message {index}",
+                    content={"text": f"Old raw message {index}"},
+                )
+            )
+
+        with patch.dict(
+                os.environ,
+                {
+                    "MEMORY_CONTEXT_PACK_PROMPT_INJECTION_ENABLED": "true",
+                    "MEMORY_CONTEXT_PACK_HISTORY_COMPACTION_ENABLED": "true",
+                    "MEMORY_CONTEXT_PACK_HISTORY_MIN_MESSAGES": "10",
+                    "MEMORY_CONTEXT_PACK_HISTORY_RECENT_MESSAGES": "3",
+                },
+                clear=False,
+        ):
+            reset_settings_cache()
+            await self.service.post_message(
+                conversation.id,
+                {
+                    "message": {
+                        "id": "message-history-compaction-latest",
+                        "role": "user",
+                        "message_type": "user_text",
+                        "plain_text": "Latest raw message must stay visible.",
+                        "content": {"text": "Latest raw message must stay visible."},
+                    },
+                },
+            )
+            reset_settings_cache()
+
+        model_messages = _FakeModelClient.seen_messages[-1]
+        flattened = "\n".join(str(content) for _, content, _ in model_messages)
+        self.assertIn("Relevant compact conversation context", flattened)
+        self.assertIn("History compaction pack", flattened)
+        self.assertIn("Latest raw message must stay visible.", flattened)
+        self.assertIn("Old raw message 11", flattened)
+        self.assertNotIn("Old raw message 0", flattened)
+        self.assertLessEqual(len([role for role, _, _ in model_messages if role == "user"]), 3)
+
+    async def test_context_pack_history_compaction_can_use_estimated_token_threshold(self) -> None:
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Answer briefly.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+            )
+        )
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-context-pack-token-compaction",
+                "created_by_user_id": "user-1",
+                "channel_type": "api",
+            }
+        )
+        await self.context.memory_repo.create(
+            MemoryRecord(
+                id="context-pack-token-compaction",
+                scope="conversation",
+                conversation_id=conversation.id,
+                source_conversation_id=conversation.id,
+                source="compact_tool",
+                content="Token-heavy older discussion is already compacted.",
+                summary="Token threshold pack.",
+                memory_type="context_pack",
+                metadata={"mode": "handoff"},
+                tags=["context_pack", "conversation", "handoff"],
+            )
+        )
+        long_text = "Token-heavy old raw message. " * 20
+        for index in range(4):
+            await self.context.conversation_message_repo.create(
+                ConversationMessage(
+                    id=f"message-token-compaction-{index:02d}",
+                    conversation_id=conversation.id,
+                    role=ConversationRole.USER,
+                    message_type=ConversationMessageType.USER_TEXT,
+                    plain_text=f"{long_text}{index}",
+                    content={"text": f"{long_text}{index}"},
+                )
+            )
+
+        with patch.dict(
+                os.environ,
+                {
+                    "MEMORY_CONTEXT_PACK_PROMPT_INJECTION_ENABLED": "true",
+                    "MEMORY_CONTEXT_PACK_HISTORY_COMPACTION_ENABLED": "true",
+                    "MEMORY_CONTEXT_PACK_HISTORY_MIN_MESSAGES": "100",
+                    "MEMORY_CONTEXT_PACK_HISTORY_MAX_RAW_TOKENS": "20",
+                    "MEMORY_CONTEXT_PACK_HISTORY_RECENT_MESSAGES": "2",
+                },
+                clear=False,
+        ):
+            reset_settings_cache()
+            await self.service.post_message(
+                conversation.id,
+                {
+                    "message": {
+                        "id": "message-token-compaction-latest",
+                        "role": "user",
+                        "message_type": "user_text",
+                        "plain_text": "Latest token-threshold message must stay visible.",
+                        "content": {"text": "Latest token-threshold message must stay visible."},
+                    },
+                },
+            )
+            reset_settings_cache()
+
+        model_messages = _FakeModelClient.seen_messages[-1]
+        flattened = "\n".join(str(content) for _, content, _ in model_messages)
+        self.assertIn("Token threshold pack.", flattened)
+        self.assertIn("Latest token-threshold message must stay visible.", flattened)
+        self.assertNotIn("message. 0", flattened)
+        self.assertLessEqual(len([role for role, _, _ in model_messages if role == "user"]), 2)
+
+    async def test_context_pack_auto_create_enables_history_compaction(self) -> None:
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Answer briefly.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+            )
+        )
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-context-pack-auto-create",
+                "created_by_user_id": "user-1",
+                "channel_type": "api",
+            }
+        )
+        for index in range(12):
+            await self.context.conversation_message_repo.create(
+                ConversationMessage(
+                    id=f"message-auto-context-pack-{index:02d}",
+                    conversation_id=conversation.id,
+                    role=ConversationRole.USER,
+                    message_type=ConversationMessageType.USER_TEXT,
+                    plain_text=f"Auto compact old raw message {index}",
+                    content={"text": f"Auto compact old raw message {index}"},
+                )
+            )
+
+        with patch.dict(
+                os.environ,
+                {
+                    "MEMORY_CONTEXT_PACK_AUTO_CREATE_ENABLED": "true",
+                    "MEMORY_CONTEXT_PACK_PROMPT_INJECTION_ENABLED": "true",
+                    "MEMORY_CONTEXT_PACK_HISTORY_COMPACTION_ENABLED": "true",
+                    "MEMORY_CONTEXT_PACK_HISTORY_MIN_MESSAGES": "10",
+                    "MEMORY_CONTEXT_PACK_HISTORY_RECENT_MESSAGES": "3",
+                },
+                clear=False,
+        ):
+            reset_settings_cache()
+            await self.service.post_message(
+                conversation.id,
+                {
+                    "message": {
+                        "id": "message-auto-context-pack-latest",
+                        "role": "user",
+                        "message_type": "user_text",
+                        "plain_text": "Latest message after auto compact.",
+                        "content": {"text": "Latest message after auto compact."},
+                    },
+                },
+            )
+            reset_settings_cache()
+
+        packs = await self.context.memory_repo.query(
+            conversation_id=conversation.id,
+            memory_types=["context_pack"],
+            tags=["handoff"],
+            limit=10,
+        )
+        self.assertEqual(len(packs), 1)
+        self.assertEqual(packs[0].metadata["source_range"], "older_than_recent")
+        self.assertTrue(str(packs[0].metadata["idempotency_key"]).startswith("auto-handoff:"))
+
+        model_messages = _FakeModelClient.seen_messages[-1]
+        user_messages = [str(content) for role, content, _ in model_messages if role == "user"]
+        self.assertLessEqual(len(user_messages), 3)
+        self.assertIn("Latest message after auto compact.", "\n".join(user_messages))
+        assert _FakeModelClient.last_system_message is not None
+        self.assertIn("Relevant compact conversation context", _FakeModelClient.last_system_message)
 
     async def test_main_agent_policy_hides_denied_workflows_and_tools(self) -> None:
         await self.context.workflow_repo.save(
@@ -953,26 +2276,26 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         agent = await self.context.agent_repo.get(created.agent_id)
         assert agent is not None
+        expected_system_tool_ids = [
+            *workflow_system_tool_ids(),
+            *tool_management_system_tool_ids(),
+            *agent_management_system_tool_ids(),
+            *connector_system_tool_ids(),
+            *memory_system_tool_ids(),
+            *execution_system_tool_ids(),
+            *command_system_tool_ids(),
+            *graph_system_tool_ids(),
+        ]
         self.assertEqual(
             sorted(agent.tool_ids),
-            [
-                "agency.command.run",
-                "agency.memory.delete",
-                "agency.memory.list",
-                "agency.memory.remember",
-                "agency.memory.update",
-                "agency.tool.get",
-                "agency.tool.list",
-                "agency.tool.propose-create",
-                "agency.tool.propose-update",
-                "agency.workflow.get",
-                "agency.workflow.list",
-                "agency.workflow.propose-create",
-                "agency.workflow.propose-update",
-                "agency.workflow.run",
-                "mcp:computer-use-macos:press_key",
-                "mcp:computer-use-macos:snapshot",
-            ],
+            sorted(
+                [
+                    *expected_system_tool_ids,
+                    *DEFAULT_MAIN_AGENT_SPEECH_TOOL_IDS,
+                    "mcp:computer-use-macos:press_key",
+                    "mcp:computer-use-macos:snapshot",
+                ]
+            ),
         )
 
     async def test_post_message_executes_safe_tool_calls_and_persists_tool_messages(self) -> None:
@@ -1345,21 +2668,40 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["assistant_message"]["message_type"], "workflow_proposal")
         self.assertEqual(result["approval_request"]["approval_type"], "workflow_create")
         self.assertIsNone(await self.context.workflow_repo.get("workflow-tool-create"))
-        approved = await self.service.approve_request(
-            result["approval_request"]["id"],
-            actor_user_id="user-1",
-            reason="Create it",
-        )
+        with patch.dict(os.environ, {"MEMORY_CONTEXT_PACK_AUTO_CREATE_ENABLED": "true"}, clear=False):
+            reset_settings_cache()
+            approved = await self.service.approve_request(
+                result["approval_request"]["id"],
+                actor_user_id="user-1",
+                reason="Create it",
+            )
+            reset_settings_cache()
         self.assertEqual(approved["workflow"]["id"], "workflow-tool-create")
         persisted = await self.context.workflow_repo.get("workflow-tool-create")
         assert persisted is not None
         self.assertEqual(persisted.metadata["created_by"], "user-1")
         self.assertEqual(persisted.metadata["owner_ids"], ["user-1"])
         self.assertEqual(persisted.metadata["provenance"]["approval_request_id"], result["approval_request"]["id"])
+        packs = await self.context.memory_repo.query(
+            workflow_id="workflow-tool-create",
+            source="compact_tool",
+            memory_types=["context_pack"],
+            tags=["handoff"],
+            limit=10,
+        )
+        self.assertEqual(len(packs), 1)
+        self.assertEqual(packs[0].scope.value, "workflow")
+        self.assertEqual(packs[0].metadata["target_scope"], "workflow")
+        self.assertTrue(str(packs[0].metadata["idempotency_key"]).startswith("workflow-mutation-handoff:"))
         messages = await self.service.list_messages(conversation.id)
         self.assertEqual(
             [item["message_type"] for item in messages["items"]],
-            ["user_text", "tool_call", "workflow_proposal", "approval_result"],
+            ["user_text", "tool_call", "workflow_proposal", "tool_result", "approval_result"],
+        )
+        self.assertEqual(messages["items"][3]["content"]["result"]["status"], "approval_requested")
+        self.assertEqual(
+            messages["items"][3]["content"]["result"]["approval_request_id"],
+            result["approval_request"]["id"],
         )
 
     async def test_workflow_mutation_kill_switch_blocks_main_agent_proposals(self) -> None:
@@ -1465,6 +2807,76 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(proposed["agent_definitions"][0]["model_profile_id"], "profile-fake")
         self.assertEqual(proposed["task_definitions"][0]["agent_id"], proposed["agent_definitions"][0]["id"])
         self.assertEqual(proposed["metadata"]["generated_by"], "workflow_builder")
+
+    async def test_main_agent_prefers_reusing_matching_global_agents_when_building_workflows(self) -> None:
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Create workflows when asked.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+                agent_id="main-agent",
+                workflow_id="main-workflow",
+            )
+        )
+        await self.context.agent_repo.create(
+            AgentDefinition(
+                id="agent-launch-strategist",
+                name="Launch Strategist",
+                role="Plans the workflow approach",
+                description="Reusable strategist for launch planning workflows.",
+                instructions="Use the existing catalog strategist playbook.",
+                backstory="Catalog agent",
+                model_profile_id="profile-fake",
+            )
+        )
+        _FakeModelClient.responses = [
+            ModelResponse(
+                content=None,
+                tool_calls=[
+                    ModelToolCall(
+                        id="tool-call-propose-create-goal-reuse",
+                        name="ProposeNewWorkflow",
+                        arguments={
+                            "summary": "Create a launch planning workflow.",
+                            "goal": "Create a workflow that drafts a concise product launch plan.",
+                            "conversation_history": "The user wants reusable launch planning.",
+                        },
+                    )
+                ],
+                provider="fake",
+                model="fake-model",
+            )
+        ]
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-workflow-create-goal-tool-reuse-1",
+                "created_by_user_id": "user-1",
+                "channel_type": "api",
+            }
+        )
+
+        result = await self.service.post_message(
+            conversation.id,
+            {
+                "message": {
+                    "id": "message-workflow-create-goal-tool-reuse-1",
+                    "role": "user",
+                    "message_type": "user_text",
+                    "plain_text": "Create a launch planning workflow",
+                    "content": {"text": "Create a launch planning workflow"},
+                },
+            },
+        )
+
+        proposed = result["approval_request"]["proposed_payload"]["workflow"]
+        self.assertEqual(proposed["agent_definitions"][0]["id"], "agent-launch-strategist")
+        self.assertEqual(
+            proposed["agent_definitions"][0]["metadata"]["workflow_builder_reused_global_agent_id"],
+            "agent-launch-strategist",
+        )
+        self.assertEqual(proposed["task_definitions"][0]["agent_id"], "agent-launch-strategist")
 
     async def test_main_agent_repairs_generated_workflow_create_payload_before_approval(self) -> None:
         await self.setup_service.create_main_agent(
@@ -1685,11 +3097,14 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(workflow.description, "Original description")
         replace_mock = AsyncMock(return_value=["execution-replacement"])
         self.context.control_plane.replace_active_executions_for_workflow_revision = replace_mock
-        approved = await self.service.approve_request(
-            result["approval_request"]["id"],
-            actor_user_id="user-1",
-            reason="Update it",
-        )
+        with patch.dict(os.environ, {"MEMORY_CONTEXT_PACK_AUTO_CREATE_ENABLED": "true"}, clear=False):
+            reset_settings_cache()
+            approved = await self.service.approve_request(
+                result["approval_request"]["id"],
+                actor_user_id="user-1",
+                reason="Update it",
+            )
+            reset_settings_cache()
         self.assertEqual(approved["workflow"]["versioning"]["revision"], 2)
         workflow = await self.context.workflow_repo.get("workflow-tool-update")
         assert workflow is not None
@@ -1703,11 +3118,570 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
             replacement_revision=2,
             source="main_agent_workflow_update",
         )
+        packs = await self.context.memory_repo.query(
+            workflow_id="workflow-tool-update",
+            source="compact_tool",
+            memory_types=["context_pack"],
+            tags=["handoff"],
+            limit=10,
+        )
+        self.assertEqual(len(packs), 1)
+        self.assertEqual(packs[0].scope.value, "workflow")
+        self.assertEqual(packs[0].metadata["target_scope"], "workflow")
+        self.assertTrue(str(packs[0].metadata["idempotency_key"]).startswith("workflow-mutation-handoff:"))
         messages = await self.service.list_messages(conversation.id)
         self.assertEqual(
             [item["message_type"] for item in messages["items"]],
-            ["user_text", "tool_call", "workflow_update_proposal", "approval_result"],
+            ["user_text", "tool_call", "workflow_update_proposal", "tool_result", "approval_result"],
         )
+        self.assertEqual(messages["items"][3]["content"]["result"]["status"], "approval_requested")
+        self.assertEqual(
+            messages["items"][3]["content"]["result"]["approval_request_id"],
+            result["approval_request"]["id"],
+        )
+
+    async def test_popup_provider_metadata_drives_workflow_update_tool_and_approval_diff(self) -> None:
+        await self.context.workflow_repo.save(
+            WorkflowDefinition(
+                id="workflow-popup-provider-update",
+                name="Popup Provider Workflow",
+                description="Original popup description",
+                entrypoint="node-1",
+                metadata={"visible_to_main_agent": True, "mutable_by_main_agent": True},
+                versioning={
+                    "version": "1.0.0",
+                    "revision": 1,
+                    "parent_version": None,
+                    "is_published": True,
+                    "labels": [],
+                },
+            )
+        )
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Use page providers when the popup supplies them.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+                agent_id="main-agent",
+                workflow_id="main-workflow",
+            )
+        )
+        _FakeModelClient.responses = [
+            ModelResponse(
+                content=None,
+                tool_calls=[
+                    ModelToolCall(
+                        id="tool-call-popup-provider-update",
+                        name="ProposeWorkflowUpdate",
+                        arguments={
+                            "workflow_id": "workflow-popup-provider-update",
+                            "summary": "Append popup provider smoke text.",
+                            "workflow": self._workflow_payload(
+                                workflow_id="workflow-popup-provider-update",
+                                name="Popup Provider Workflow",
+                                description="Original popup description. Verified by popup provider.",
+                            ),
+                        },
+                    )
+                ],
+                provider="fake",
+                model="fake-model",
+            )
+        ]
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-popup-provider-update",
+                "created_by_user_id": "user-1",
+                "channel_type": "api",
+            }
+        )
+
+        result = await self.service.post_message(
+            conversation.id,
+            {
+                "message": {
+                    "id": "message-popup-provider-update",
+                    "role": "user",
+                    "message_type": "user_text",
+                    "plain_text": "On this workflow page, propose appending the provider smoke text.",
+                    "content": {"text": "On this workflow page, propose appending the provider smoke text."},
+                    "metadata": {
+                        "page_context": {
+                            "surface": "workflow.detail",
+                            "route": "/workflows/workflow-popup-provider-update",
+                            "selection": {"workflowId": "workflow-popup-provider-update"},
+                            "entities": [
+                                {
+                                    "type": "workflow",
+                                    "id": "workflow-popup-provider-update",
+                                    "label": "Popup Provider Workflow",
+                                }
+                            ],
+                            "allowedActions": ["workflow.inspect", "workflow.propose_update"],
+                        },
+                        "assistant_providers": {
+                            "version": "2026-05-27",
+                            "providers": [
+                                {
+                                    "id": "workflow.provider",
+                                    "label": "Workflow provider",
+                                    "systemToolIds": [
+                                        "agency.workflow.get",
+                                        "agency.workflow.propose-update",
+                                    ],
+                                    "selection": {"workflowId": "workflow-popup-provider-update"},
+                                }
+                            ],
+                        },
+                    },
+                },
+            },
+        )
+
+        assert _FakeModelClient.last_system_message is not None
+        self.assertIn("assistant_providers", _FakeModelClient.last_system_message)
+        self.assertIn("workflow.provider", _FakeModelClient.last_system_message)
+        self.assertIn("agency.workflow.propose-update", _FakeModelClient.last_system_message)
+        self.assertIn("Do not treat arbitrary hyphenated marker text", _FakeModelClient.last_system_message)
+        self.assertEqual(result["assistant_message"]["message_type"], "workflow_update_proposal")
+        approval = result["approval_request"]
+        self.assertEqual(approval["approval_type"], "workflow_update")
+        self.assertEqual(approval["conversation_id"], conversation.id)
+        self.assertEqual(approval["origin_message_id"], "message-popup-provider-update")
+        self.assertEqual(approval["metadata"]["source"], "popup_assistant")
+        self.assertEqual(approval["metadata"]["source_surface"], "workflow.detail")
+        self.assertEqual(approval["metadata"]["source_route"], "/workflows/workflow-popup-provider-update")
+        self.assertEqual(approval["metadata"]["source_page_context"]["selection"]["workflowId"],
+                         "workflow-popup-provider-update")
+        self.assertEqual(approval["metadata"]["source_provider_ids"], ["workflow.provider"])
+        diff_rows = approval["proposed_payload"]["diff"]
+        self.assertEqual(diff_rows[0]["path"], "description")
+        self.assertEqual(diff_rows[0]["current"], "Original popup description")
+        self.assertEqual(
+            diff_rows[0]["proposed"],
+            "Original popup description. Verified by popup provider.",
+        )
+        approvals = await self.service.list_approval_requests(conversation.id)
+        self.assertEqual([item["id"] for item in approvals["items"]], [approval["id"]])
+
+        approved = await self.service.approve_request(
+            approval["id"],
+            actor_user_id="user-1",
+            reason="Approve popup provider smoke update.",
+        )
+
+        self.assertEqual(approved["approval_request"]["status"], "approved")
+        workflow = await self.context.workflow_repo.get("workflow-popup-provider-update")
+        assert workflow is not None
+        self.assertEqual(workflow.description, "Original popup description. Verified by popup provider.")
+        self.assertEqual(workflow.metadata["provenance"]["approval_request_id"], approval["id"])
+        messages = await self.service.list_messages(conversation.id)
+        self.assertEqual(
+            [item["message_type"] for item in messages["items"]],
+            ["user_text", "tool_call", "workflow_update_proposal", "tool_result", "approval_result"],
+        )
+        self.assertEqual(messages["items"][3]["content"]["result"]["status"], "approval_requested")
+        self.assertEqual(messages["items"][3]["content"]["result"]["approval_request_id"], approval["id"])
+
+    async def test_popup_agent_provider_drives_agent_update_tool_and_approval_diff(self) -> None:
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Use agent page providers when supplied.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+                agent_id="main-agent",
+                workflow_id="main-workflow",
+            )
+        )
+        await self.context.agent_repo.save(
+            AgentDefinition(
+                id="agent-popup-provider",
+                name="Popup Agent",
+                description="Original agent description",
+                instructions="Original instructions",
+            )
+        )
+        _FakeModelClient.responses = [
+            ModelResponse(
+                content=None,
+                tool_calls=[
+                    ModelToolCall(
+                        id="tool-call-popup-agent-update",
+                        name="ProposeAgentUpdate",
+                        arguments={
+                            "agent_id": "agent-popup-provider",
+                            "summary": "Update popup agent description.",
+                            "patch": {"description": "Updated by popup agent provider"},
+                        },
+                    )
+                ],
+                provider="fake",
+                model="fake-model",
+            )
+        ]
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-popup-agent-provider",
+                "created_by_user_id": "user-1",
+                "channel_type": "api",
+            }
+        )
+
+        result = await self.service.post_message(
+            conversation.id,
+            {
+                "message": {
+                    "id": "message-popup-agent-provider",
+                    "role": "user",
+                    "message_type": "user_text",
+                    "plain_text": "On this agent page, propose updating the selected agent description.",
+                    "content": {"text": "On this agent page, propose updating the selected agent description."},
+                    "metadata": {
+                        "page_context": {
+                            "surface": "agent.list",
+                            "selection": {"agentId": "agent-popup-provider"},
+                            "entities": [{"type": "agent", "id": "agent-popup-provider", "label": "Popup Agent"}],
+                        },
+                        "assistant_providers": {
+                            "version": "2026-05-27",
+                            "providers": [
+                                {
+                                    "id": "agent.provider",
+                                    "label": "Agent provider",
+                                    "systemToolIds": ["agency.agent.get", "agency.agent.propose-update"],
+                                    "selection": {"agentId": "agent-popup-provider"},
+                                }
+                            ],
+                        },
+                    },
+                },
+            },
+        )
+
+        assert _FakeModelClient.last_system_message is not None
+        self.assertIn("agent.provider", _FakeModelClient.last_system_message)
+        self.assertIn("agency.agent.propose-update", _FakeModelClient.last_system_message)
+        approval = result["approval_request"]
+        self.assertEqual(result["assistant_message"]["message_type"], "approval_request")
+        self.assertEqual(approval["conversation_id"], conversation.id)
+        self.assertEqual(approval["origin_message_id"], "message-popup-agent-provider")
+        self.assertEqual(approval["target_type"], "agent")
+        self.assertEqual(approval["target_id"], "agent-popup-provider")
+        self.assertEqual(approval["metadata"]["source"], "popup_assistant")
+        self.assertEqual(approval["metadata"]["source_surface"], "agent.list")
+        self.assertEqual(approval["metadata"]["source_provider_ids"], ["agent.provider"])
+        diff_rows = approval["proposed_payload"]["diff"]
+        self.assertEqual(diff_rows[0]["path"], "description")
+        self.assertEqual(diff_rows[0]["current"], "Original agent description")
+        self.assertEqual(diff_rows[0]["proposed"], "Updated by popup agent provider")
+
+        approved = await self.service.approve_request(
+            approval["id"],
+            actor_user_id="user-1",
+            reason="Approve agent provider update.",
+        )
+
+        self.assertEqual(approved["approval_request"]["status"], "approved")
+        agent = await self.context.agent_repo.get("agent-popup-provider")
+        assert agent is not None
+        self.assertEqual(agent.description, "Updated by popup agent provider")
+        self.assertEqual(agent.metadata["provenance"]["approval_request_id"], approval["id"])
+
+    async def test_popup_tool_provider_drives_tool_update_tool_and_approval_diff(self) -> None:
+        await self.context.tool_repo.create(
+            ToolDefinition.model_validate(
+                self._tool_payload(
+                    tool_id="tool-popup-provider",
+                    name="popup_provider_tool",
+                    description="Original tool provider description",
+                )
+            )
+        )
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Use tool page providers when supplied.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+                agent_id="main-agent",
+                workflow_id="main-workflow",
+            )
+        )
+        _FakeModelClient.responses = [
+            ModelResponse(
+                content=None,
+                tool_calls=[
+                    ModelToolCall(
+                        id="tool-call-popup-tool-update",
+                        name="ProposeToolUpdate",
+                        arguments={
+                            "tool_id": "tool-popup-provider",
+                            "summary": "Update popup provider tool.",
+                            "tool": self._tool_payload(
+                                tool_id="tool-popup-provider",
+                                name="popup_provider_tool",
+                                description="Updated by popup tool provider",
+                            ),
+                        },
+                    )
+                ],
+                provider="fake",
+                model="fake-model",
+            )
+        ]
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-popup-tool-provider",
+                "created_by_user_id": "user-1",
+                "channel_type": "api",
+            }
+        )
+
+        result = await self.service.post_message(
+            conversation.id,
+            {
+                "message": {
+                    "id": "message-popup-tool-provider",
+                    "role": "user",
+                    "message_type": "user_text",
+                    "plain_text": "On this tool page, propose updating the selected tool description.",
+                    "content": {"text": "On this tool page, propose updating the selected tool description."},
+                    "metadata": {
+                        "page_context": {
+                            "surface": "tools.contracts",
+                            "selection": {"toolId": "tool-popup-provider"},
+                            "entities": [{"type": "tool", "id": "tool-popup-provider", "label": "popup_provider_tool"}],
+                        },
+                        "assistant_providers": {
+                            "version": "2026-05-27",
+                            "providers": [
+                                {
+                                    "id": "tool.provider",
+                                    "label": "Tool provider",
+                                    "systemToolIds": ["agency.tool.get", "agency.tool.propose-update"],
+                                    "selection": {"toolId": "tool-popup-provider"},
+                                }
+                            ],
+                        },
+                    },
+                },
+            },
+        )
+
+        assert _FakeModelClient.last_system_message is not None
+        self.assertIn("tool.provider", _FakeModelClient.last_system_message)
+        self.assertIn("agency.tool.propose-update", _FakeModelClient.last_system_message)
+        approval = result["approval_request"]
+        self.assertEqual(result["assistant_message"]["message_type"], "approval_request")
+        self.assertEqual(approval["approval_type"], "tool_update")
+        self.assertEqual(approval["conversation_id"], conversation.id)
+        self.assertEqual(approval["origin_message_id"], "message-popup-tool-provider")
+        self.assertEqual(approval["metadata"]["source"], "popup_assistant")
+        self.assertEqual(approval["metadata"]["source_surface"], "tools.contracts")
+        self.assertEqual(approval["metadata"]["source_provider_ids"], ["tool.provider"])
+        diff_rows = approval["proposed_payload"]["diff"]
+        self.assertEqual(diff_rows[0]["path"], "description")
+        self.assertEqual(diff_rows[0]["current"], "Original tool provider description")
+        self.assertEqual(diff_rows[0]["proposed"], "Updated by popup tool provider")
+
+        approved = await self.service.approve_request(
+            approval["id"],
+            actor_user_id="user-1",
+            reason="Approve tool provider update.",
+        )
+
+        self.assertEqual(approved["approval_request"]["status"], "approved")
+        tool = await self.context.tool_repo.get("tool-popup-provider")
+        assert tool is not None
+        self.assertEqual(tool.description, "Updated by popup tool provider")
+        self.assertEqual(tool.framework_hints.metadata["provenance"]["approval_request_id"], approval["id"])
+
+    async def test_popup_execution_provider_drives_execution_control_tool(self) -> None:
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Use execution page providers when supplied.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+                agent_id="main-agent",
+                workflow_id="main-workflow",
+            )
+        )
+        paused_execution = Execution(
+            id="execution-popup-provider",
+            workflow_id="workflow-popup-provider-update",
+            runtime_adapter_id="native",
+            status=ExecutionStatus.PAUSED,
+            input_payload={},
+        )
+        self.context.control_plane.pause = AsyncMock(return_value=paused_execution)
+        _FakeModelClient.responses = [
+            ModelResponse(
+                content=None,
+                tool_calls=[
+                    ModelToolCall(
+                        id="tool-call-popup-execution-pause",
+                        name="pause_execution",
+                        arguments={"execution_id": "execution-popup-provider"},
+                    )
+                ],
+                provider="fake",
+                model="fake-model",
+            ),
+            ModelResponse(content="Paused the selected run.", provider="fake", model="fake-model"),
+        ]
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-popup-execution-provider",
+                "created_by_user_id": "user-1",
+                "channel_type": "api",
+            }
+        )
+
+        result = await self.service.post_message(
+            conversation.id,
+            {
+                "message": {
+                    "id": "message-popup-execution-provider",
+                    "role": "user",
+                    "message_type": "user_text",
+                    "plain_text": "On this run page, pause the selected execution.",
+                    "content": {"text": "On this run page, pause the selected execution."},
+                    "metadata": {
+                        "page_context": {
+                            "surface": "runs.detail",
+                            "selection": {"runId": "execution-popup-provider"},
+                            "entities": [{"type": "run", "id": "execution-popup-provider", "label": "Selected run"}],
+                        },
+                        "assistant_providers": {
+                            "version": "2026-05-27",
+                            "providers": [
+                                {
+                                    "id": "execution.provider",
+                                    "label": "Execution provider",
+                                    "systemToolIds": ["agency.execution.get", "agency.execution.pause"],
+                                    "selection": {"runId": "execution-popup-provider"},
+                                }
+                            ],
+                        },
+                    },
+                },
+            },
+        )
+
+        assert _FakeModelClient.last_system_message is not None
+        self.assertIn("execution.provider", _FakeModelClient.last_system_message)
+        self.assertIn("agency.execution.pause", _FakeModelClient.last_system_message)
+        self.assertEqual(result["assistant_message"]["plain_text"], "Paused the selected run.")
+        self.context.control_plane.pause.assert_awaited_once_with("execution-popup-provider")
+        messages = await self.service.list_messages(conversation.id)
+        self.assertEqual(
+            [item["message_type"] for item in messages["items"]],
+            ["user_text", "tool_call", "tool_result", "assistant_text"],
+        )
+        tool_result = messages["items"][2]["content"]["result"]
+        self.assertEqual(tool_result["status"], "ok")
+        self.assertEqual(tool_result["execution"]["status"], "paused")
+
+    async def test_popup_connector_provider_drives_connector_credentials_tool_with_redaction(self) -> None:
+        await self.context.credential_repo.create(
+            CredentialDefinition(
+                id="credential-popup-provider",
+                owner_user_id="user-1",
+                name="Popup Telegram",
+                provider="telegram-bot",
+                secret_ref="env://TELEGRAM_BOT_TOKEN",
+                metadata={"bot_token": "should-redact", "chat_id": "12345"},
+            )
+        )
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Use connector page providers when supplied.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+                agent_id="main-agent",
+                workflow_id="main-workflow",
+            )
+        )
+        _FakeModelClient.responses = [
+            ModelResponse(
+                content=None,
+                tool_calls=[
+                    ModelToolCall(
+                        id="tool-call-popup-connector-credentials",
+                        name="list_connector_credentials",
+                        arguments={"provider": "telegram"},
+                    )
+                ],
+                provider="fake",
+                model="fake-model",
+            ),
+            ModelResponse(content="Connector credentials are ready.", provider="fake", model="fake-model"),
+        ]
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-popup-connector-provider",
+                "created_by_user_id": "user-1",
+                "channel_type": "api",
+            }
+        )
+
+        result = await self.service.post_message(
+            conversation.id,
+            {
+                "message": {
+                    "id": "message-popup-connector-provider",
+                    "role": "user",
+                    "message_type": "user_text",
+                    "plain_text": "On this integrations page, inspect my Telegram connector credentials.",
+                    "content": {"text": "On this integrations page, inspect my Telegram connector credentials."},
+                    "metadata": {
+                        "page_context": {
+                            "surface": "integrations",
+                            "selection": {"provider": "telegram-bot"},
+                            "entities": [{"type": "connector", "id": "telegram-bot", "label": "Telegram"}],
+                        },
+                        "assistant_providers": {
+                            "version": "2026-05-27",
+                            "providers": [
+                                {
+                                    "id": "connector.provider",
+                                    "label": "Connector provider",
+                                    "systemToolIds": [
+                                        "agency.connector.capabilities",
+                                        "agency.connector.credentials",
+                                    ],
+                                    "selection": {"provider": "telegram-bot"},
+                                }
+                            ],
+                        },
+                    },
+                },
+            },
+        )
+
+        assert _FakeModelClient.last_system_message is not None
+        self.assertIn("connector.provider", _FakeModelClient.last_system_message)
+        self.assertIn("agency.connector.credentials", _FakeModelClient.last_system_message)
+        self.assertEqual(result["assistant_message"]["plain_text"], "Connector credentials are ready.")
+        messages = await self.service.list_messages(conversation.id)
+        self.assertEqual(
+            [item["message_type"] for item in messages["items"]],
+            ["user_text", "tool_call", "tool_result", "assistant_text"],
+        )
+        tool_result = messages["items"][2]["content"]["result"]
+        self.assertEqual(tool_result["status"], "ok")
+        self.assertEqual(tool_result["items"][0]["id"], "credential-popup-provider")
+        self.assertEqual(tool_result["items"][0]["metadata"]["bot_token"], "[REDACTED]")
+        self.assertEqual(tool_result["items"][0]["metadata"]["chat_id"], "12345")
 
     async def test_main_agent_can_propose_workflow_update_from_goal_tool_call(self) -> None:
         await self.context.workflow_repo.save(
@@ -1885,6 +3859,11 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
         proposed = result["approval_request"]["proposed_payload"]["workflow"]
         self.assertEqual(result["assistant_message"]["message_type"], "workflow_update_proposal")
         self.assertEqual(proposed["metadata"]["workflow_builder_enhancement"], "recommendation_to_code_pipeline")
+        self.assertEqual(proposed["metadata"]["repo_write_permission"]["status"], "pending_human_approval")
+        self.assertEqual(
+            result["assistant_message"]["content"]["repo_write_permission"]["permission_type"],
+            "repo_write",
+        )
         self.assertIn("agency.command.run", [item["id"] for item in proposed["tool_definitions"]])
         task_names = [item["name"].lower() for item in proposed["task_definitions"]]
         self.assertTrue(any("implement" in name for name in task_names))
@@ -2241,6 +4220,12 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result["assistant_message"]["plain_text"], "I found the tools.")
+        self.assertEqual(_FakeModelClient.seen_messages[1][-2][0], "assistant")
+        self.assertEqual(
+            _FakeModelClient.seen_message_tool_calls[1][-2],
+            [("tool-call-list-tools", "ListTools")],
+        )
+        self.assertEqual(_FakeModelClient.seen_messages[1][-1][0], "tool")
         messages = await self.service.list_messages(conversation.id)
         self.assertEqual(messages["items"][1]["content"]["tool_name"], "list_tools")
         tool_ids = [item["id"] for item in messages["items"][2]["content"]["result"]["tools"]]
@@ -2314,7 +4299,80 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
         messages = await self.service.list_messages(conversation.id)
         self.assertEqual(
             [item["message_type"] for item in messages["items"]],
-            ["user_text", "tool_call", "approval_request", "approval_result"],
+            ["user_text", "tool_call", "approval_request", "tool_result", "approval_result"],
+        )
+        self.assertEqual(messages["items"][3]["content"]["result"]["status"], "approval_requested")
+        self.assertEqual(
+            messages["items"][3]["content"]["result"]["approval_request_id"],
+            result["approval_request"]["id"],
+        )
+
+    async def test_main_agent_can_propose_agent_update_from_tool_call(self) -> None:
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Update agents when asked.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+                agent_id="main-agent",
+                workflow_id="main-workflow",
+            )
+        )
+        await self.context.agent_repo.save(
+            AgentDefinition(
+                id="agent-target",
+                name="Target Agent",
+                description="Original description",
+                instructions="Original instructions",
+            )
+        )
+        _FakeModelClient.responses = [
+            ModelResponse(
+                content=None,
+                tool_calls=[
+                    ModelToolCall(
+                        id="tool-call-propose-agent-update",
+                        name="ProposeAgentUpdate",
+                        arguments={
+                            "agent_id": "agent-target",
+                            "summary": "Update agent 'Target Agent'.",
+                            "patch": {"description": "Updated by agent management tool"},
+                        },
+                    )
+                ],
+                provider="fake",
+                model="fake-model",
+            )
+        ]
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-agent-update-1",
+                "created_by_user_id": "user-1",
+                "channel_type": "api",
+            }
+        )
+
+        result = await self.service.post_message(
+            conversation.id,
+            {
+                "message": {
+                    "id": "message-agent-update-1",
+                    "role": "user",
+                    "message_type": "user_text",
+                    "plain_text": "Update the target agent.",
+                    "content": {"text": "Update the target agent."},
+                },
+            },
+        )
+
+        self.assertEqual(result["assistant_message"]["message_type"], "approval_request")
+        self.assertEqual(result["approval_request"]["approval_type"], "other")
+        self.assertEqual(result["approval_request"]["target_type"], "agent")
+        self.assertEqual(result["approval_request"]["target_id"], "agent-target")
+        self.assertEqual(
+            result["approval_request"]["proposed_payload"]["agent"]["description"],
+            "Updated by agent management tool",
         )
 
     async def test_rejected_tool_create_stays_in_approval_history_only(self) -> None:
@@ -2376,6 +4434,70 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.context.tool_repo.get("tool-rejected"))
         approvals = await self.service.list_approval_requests(conversation.id)
         self.assertEqual(approvals["items"][0]["approval_type"], "tool_create")
+
+    async def test_tool_create_rejects_flattened_security_and_missing_implementation(self) -> None:
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Create tools when asked.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+                agent_id="main-agent",
+                workflow_id="main-workflow",
+            )
+        )
+        invalid_tool = self._tool_payload(tool_id="tool-invalid-create", name="invalid_create_tool")
+        invalid_tool.pop("implementation")
+        invalid_tool["read_only"] = True
+        _FakeModelClient.responses = [
+            ModelResponse(
+                content=None,
+                tool_calls=[
+                    ModelToolCall(
+                        id="tool-call-propose-tool-invalid-create",
+                        name="ProposeNewTool",
+                        arguments={
+                            "summary": "Create tool 'Invalid Create Tool'.",
+                            "tool": invalid_tool,
+                        },
+                    )
+                ],
+                provider="fake",
+                model="fake-model",
+            ),
+            ModelResponse(
+                content="I could not create that tool because the payload is invalid: missing required field(s): implementation.",
+                provider="fake",
+                model="fake-model",
+            ),
+        ]
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-tool-create-invalid-shape-1",
+                "created_by_user_id": "user-1",
+                "channel_type": "api",
+            }
+        )
+
+        result = await self.service.post_message(
+            conversation.id,
+            {
+                "message": {
+                    "id": "message-tool-create-invalid-shape-1",
+                    "role": "user",
+                    "message_type": "user_text",
+                    "plain_text": "Create an invalid tool payload",
+                    "content": {"text": "Create an invalid tool payload"},
+                },
+            },
+        )
+
+        self.assertIn("missing required field(s): implementation", result["assistant_message"]["plain_text"])
+        self.assertNotIn("read_only", result["assistant_message"]["plain_text"])
+        self.assertIsNone(await self.context.tool_repo.get("tool-invalid-create"))
+        approvals = await self.service.list_approval_requests(conversation.id)
+        self.assertEqual(approvals["items"], [])
 
     async def test_chat_tool_create_rejects_invalid_allowlist_policy_before_approval(self) -> None:
         await self.setup_service.create_main_agent(
@@ -2497,6 +4619,62 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNone(await self.context.tool_repo.get("agency.tool.hack"))
+        approvals = await self.service.list_approval_requests(conversation.id)
+        self.assertEqual(approvals["items"], [])
+        messages = await self.service.list_messages(conversation.id)
+        tool_result = next(item for item in messages["items"] if item["message_type"] == "tool_result")
+        self.assertIn("reserved system tool ids", tool_result["content"]["result"]["error"])
+
+    async def test_chat_tool_create_rejects_reserved_webhook_ids(self) -> None:
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Create tools when asked.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+                agent_id="main-agent",
+                workflow_id="main-workflow",
+            )
+        )
+        reserved_webhook_tool = self._tool_payload(tool_id="agency.webhook.send", name="send_webhook")
+        _FakeModelClient.responses = [
+            ModelResponse(
+                content=None,
+                tool_calls=[
+                    ModelToolCall(
+                        id="tool-call-propose-tool-webhook-reserved",
+                        name="ProposeNewTool",
+                        arguments={"tool": reserved_webhook_tool},
+                    )
+                ],
+                provider="fake",
+                model="fake-model",
+            ),
+            ModelResponse(content="I’ll use a non-reserved webhook id instead.", provider="fake", model="fake-model"),
+        ]
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-tool-create-webhook-reserved-1",
+                "created_by_user_id": "user-1",
+                "channel_type": "api",
+            }
+        )
+
+        await self.service.post_message(
+            conversation.id,
+            {
+                "message": {
+                    "id": "message-tool-create-webhook-reserved-1",
+                    "role": "user",
+                    "message_type": "user_text",
+                    "plain_text": "Create a webhook sender tool",
+                    "content": {"text": "Create a webhook sender tool"},
+                },
+            },
+        )
+
+        self.assertIsNone(await self.context.tool_repo.get("agency.webhook.send"))
         approvals = await self.service.list_approval_requests(conversation.id)
         self.assertEqual(approvals["items"], [])
         messages = await self.service.list_messages(conversation.id)
@@ -2837,6 +5015,12 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+        replayed_assistant_tool_calls = [
+            tool_calls
+            for message, tool_calls in zip(_FakeModelClient.seen_messages[-1], _FakeModelClient.seen_message_tool_calls[-1])
+            if message[0] == "assistant" and tool_calls
+        ]
+        self.assertEqual(replayed_assistant_tool_calls, [[("tool-call-2", "echo_tool")]])
         replayed_tool_messages = [item for item in _FakeModelClient.seen_messages[-1] if item[0] == "tool"]
         self.assertEqual(replayed_tool_messages, [("tool", "{\"echo\":\"persist me\"}", "echo_tool")])
 

@@ -12,7 +12,7 @@ from app.api.context import create_database_test_api_context
 from app.api.main import create_app
 from app.core.config import reset_settings_cache
 from app.core.time import utc_now
-from app.db.models import Base, ToolInvocationORM
+from app.db.models import ApprovalRequestORM, Base, ToolInvocationORM
 from app.db.session import get_async_engine, get_session_maker, reset_session_state
 from app.domain import (
     AgentDefinition,
@@ -27,9 +27,10 @@ from app.domain import (
     WorkflowDefinition,
     WorkflowNodeDefinition,
 )
-from app.runtime.adapters import NativeRuntimeAdapter, RuntimeAdapterRegistry
+from app.runtime.adapters.native_adapter import NativeRuntimeAdapter
 from app.runtime.native.engine import ExecutionEngine
 from app.runtime.native.state import SQLExecutionStore
+from app.runtime.registry import RuntimeAdapterRegistry
 from app.tools.registry import ToolRegistry
 from tests.test_native_execution_engine import FakeModelClient
 
@@ -230,6 +231,15 @@ class StorageMigrationIntegrationTests(unittest.IsolatedAsyncioTestCase):
         stored_execution = await self.context.execution_store.get_execution(execution_id)
         self.assertIsNotNone(stored_execution)
         self.assertEqual(stored_execution.created_by, "api-test")
+
+    async def test_runtime_tool_history_allows_workflow_embedded_tools(self) -> None:
+        tool_fk_targets = {
+            foreign_key.column.table.name
+            for table in (ApprovalRequestORM.__table__, ToolInvocationORM.__table__)
+            for foreign_key in table.foreign_keys
+            if foreign_key.parent.name == "tool_id"
+        }
+        self.assertNotIn("tools", tool_fk_targets)
 
     async def test_native_runtime_persists_execution_events_and_tool_invocations_in_database(self) -> None:
         tool = self._tool_definition()

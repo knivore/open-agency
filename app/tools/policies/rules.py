@@ -1,20 +1,12 @@
 from __future__ import annotations
 
-import fnmatch
 import re
 from pathlib import Path
 from typing import Any
 
 from app.tools.contracts.models import PolicyRuleResult, PolicyVerdict
+from app.tools.policies.paths import path_blocked
 
-BLOCKED_PATH_PATTERNS = (
-    ".env",
-    ".env.*",
-    "**/secrets/**",
-    "**/.ssh/**",
-    "**/node_modules/**",
-    "**/.git/**",
-)
 DENY_SECRET_PATTERNS = (
     re.compile(r"OPENAI_API_KEY\s*=", re.IGNORECASE),
     re.compile(r"AWS_SECRET_ACCESS_KEY\s*=", re.IGNORECASE),
@@ -64,7 +56,7 @@ def _dangerous_paths(payload: dict[str, Any]) -> list[PolicyRuleResult]:
     denied: list[str] = []
     for change in payload.get("changes") or []:
         path = str(change.get("path") or "")
-        if _path_blocked(path):
+        if path_blocked(path, include_edit_only=True):
             denied.append(path)
     if denied:
         return [
@@ -78,14 +70,7 @@ def _dangerous_paths(payload: dict[str, Any]) -> list[PolicyRuleResult]:
 
 
 def _path_blocked(path: str) -> bool:
-    normalized = path.replace("\\", "/").lstrip("/")
-    parts = [part for part in normalized.split("/") if part]
-    if any(part in {".git", ".ssh", "node_modules", "secrets"} for part in parts):
-        return True
-    if parts and (parts[-1] == ".env" or parts[-1].startswith(".env.")):
-        return True
-    return any(fnmatch.fnmatch(normalized, pattern) or fnmatch.fnmatch(f"/{normalized}", pattern)
-               for pattern in BLOCKED_PATH_PATTERNS)
+    return path_blocked(path, include_edit_only=True)
 
 
 def _likely_secrets(payload: dict[str, Any]) -> list[PolicyRuleResult]:

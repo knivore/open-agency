@@ -4,7 +4,7 @@ import base64
 import os
 import random
 import re
-from datetime import date, datetime
+from datetime import datetime
 from openai import AzureOpenAI
 from playwright.sync_api import Page
 from pydantic import BaseModel, Field

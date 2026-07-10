@@ -1,3 +1,5 @@
+"""Executor for tools that call a remote Agent2Agent endpoint."""
+
 from __future__ import annotations
 
 from app.domain import ToolDefinition, ToolType
@@ -7,6 +9,8 @@ from .base import ToolExecutionContext
 
 
 class A2ARemoteAgentToolExecutor:
+    """Dispatch an Agency tool invocation through the A2A adapter layer."""
+
     tool_type = ToolType.A2A_REMOTE_AGENT
     async_execution = True
 

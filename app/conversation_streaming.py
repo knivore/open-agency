@@ -1,3 +1,5 @@
+"""In-process pub/sub broker for per-conversation streaming events."""
+
 from __future__ import annotations
 
 import asyncio

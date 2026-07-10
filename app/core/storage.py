@@ -21,15 +21,42 @@ LOCAL_STORAGE_PATH = os.getenv("LOCAL_STORAGE_PATH", "local_storage")
 
 
 def is_local_environment() -> bool:
-    return os.getenv("ENVIRONMENT", "dev").lower() == "local"
+    environment = os.getenv("ENVIRONMENT", "").lower()
+    app_environment = os.getenv("APP_ENV", "").lower()
+    return environment == "local" or app_environment in {"dev", "development", "local"}
 
 
 def ensure_local_storage() -> None:
-    os.makedirs(LOCAL_STORAGE_PATH, exist_ok=True)
+    os.makedirs(local_storage_root(), exist_ok=True)
 
 
 def get_local_file_path(key: str) -> str:
-    return os.path.join(LOCAL_STORAGE_PATH, key)
+    normalized_key = _normalize_local_storage_key(key)
+    root = local_storage_root()
+    target = os.path.realpath(os.path.join(root, normalized_key))
+    if os.path.commonpath([root, target]) != root:
+        raise ValueError("Path traversal outside local storage root is not allowed")
+    return target
+
+
+def local_storage_root() -> str:
+    return os.path.realpath(LOCAL_STORAGE_PATH)
+
+
+def _normalize_local_storage_key(key: str) -> str:
+    if not isinstance(key, str):
+        raise ValueError("Storage key must be a string")
+    normalized = key.strip().replace("\\", "/")
+    if not normalized:
+        raise ValueError("Storage key must not be empty")
+    if normalized.startswith("/"):
+        raise ValueError("Absolute paths are not allowed")
+    clean = os.path.normpath(normalized)
+    if clean in {".", ""}:
+        raise ValueError("Storage key must reference a file path")
+    if clean == ".." or clean.startswith(f"..{os.sep}"):
+        raise ValueError("Path traversal is not allowed")
+    return clean
 
 
 def _is_file_like(value: object) -> bool:

@@ -2,11 +2,9 @@
 
 This guide is the canonical reference for Agency's Codex-based coding workflow.
 
-It covers two layers:
-
-- The `Coder` agent setup used in the frontend and backend agent registry.
-- The `app.coding_agent.*` runtime used to prepare, run, and review local Codex jobs without exposing unrestricted shell
-  access to frontend or Telegram users.
+The supported path is a `Coder` agent in the frontend/backend agent registry using the approval-gated
+`agency.command.run` tool. The `Coder` agent should prepare, run, review, and summarize local Codex work through that
+tool instead of relying on a separate backend coding-job package.
 
 ## Coder Agent Setup
 
@@ -16,11 +14,49 @@ The `Coder` agent can satisfy the runtime-agent checklist when all of these are 
 - The agent has `agency.command.run` assigned.
 - The command tool supports long-running commands through `timeout_seconds`.
 - The user approves command-tool executions when requested.
+- The agent adds concise inline comments, docstrings, or function-level notes for non-obvious implementation reasoning.
 - Codex CLI is installed and authenticated in the runtime that will invoke it: the host for `./run.sh start`,
   or the backend/worker container for fully Dockerized runs.
 
 If `agency.command.run` is not assigned, the agent can explain and plan, but it cannot execute Codex, inspect repos,
 capture diffs, or run tests.
+
+## Runtime Timeout Policy
+
+Agency resolves timeout configuration into one per-execution runtime policy and stores it on
+`execution.metadata.runtime_policy`. The policy controls the isolated worker hard timeout, stale-run monitoring,
+Codex CLI timeout, and LLM request timeout. The global defaults come from `AGENT_RUN_TIMEOUT_SECONDS`,
+`AGENT_ACTIVITY_IDLE_TIMEOUT_SECONDS`, `CODEX_CLI_TIMEOUT_SECONDS`, and `LLM_REQUEST_TIMEOUT_SECONDS`.
+
+Long-running coding agents can override those defaults through workflow, task, or agent metadata:
+
+```json
+{
+  "timeout_policy": {
+    "idle_timeout_seconds": 1200,
+    "run_timeout_seconds": 14400,
+    "codex_cli_timeout_seconds": 3600,
+    "llm_request_timeout_seconds": 90
+  }
+}
+```
+
+Use `runtime_policy` for new metadata and `timeout_policy` for compatibility with existing definitions. Isolated worker
+startup resolves the longest task/agent timeout in the workflow so a coding agent with a longer policy receives a longer
+worker lifetime before the first task activity event exists.
+
+Optional Agency Graph context:
+
+- `scripts/setup.py coder-agent` assigns `agency.graph.context` when `AGENCY_GRAPH_CONTEXT_TOOLS_ENABLED=true`.
+- Keep `agency.graph.context` assigned only for coding workflows that benefit from read-only graph history.
+- Query graph context before resuming nontrivial prior work, debugging repeated failures, or taking over a handoff.
+- Prefer intents `resume`, `debug`, or `learn`, `budget=balanced`, and raw graph output disabled by default.
+- Start from `anchor_type=task`, `workflow`, `run`, `execution`, `conversation`, or a query about the repository or working tree
+  when the exact anchor is unknown.
+- Inspect decisions, constraints, prior attempts, failures, and next actions before running commands so the agent does
+  not repeat known failed approaches.
+- If the graph is disabled, unavailable, or empty, fall back to durable memory, execution events, `git log`, and focused
+  repository inspection.
 
 ## Host Backend Runtime
 
@@ -68,13 +104,46 @@ docker compose exec backend codex login
 
 For API-key mode, set `OPENAI_API_KEY` in the host environment or `.env`; Compose passes it into the backend container
 when using the Docker backend.
+For device-code auth, which is usually easier from a headless container:
+
+```bash
+docker compose exec backend codex login --device-auth
+```
+
+Check whether the backend container can see a Codex login:
+
+```bash
+docker compose exec backend codex login status
+```
+
+If you have already logged into Codex on the host and want Docker to reuse that auth, set `CODEX_HOME_SOURCE` to a copy
+of the host Codex home before starting Compose. On Windows, Codex usually stores this at `%USERPROFILE%\.codex`.
+
+```powershell
+$env:CODEX_HOME_SOURCE = "C:/Users/chink/.codex"
+docker compose up --build --force-recreate -d backend
+docker compose exec backend codex login status
+```
+
+Mounting the host Codex home gives the backend container access to the same `auth.json` used by the host CLI. Treat that
+directory like credentials.
+
+For API-key mode, set `OPENAI_API_KEY` in the host environment or `.env`; Compose passes it into the backend container.
 
 Docker workspace defaults:
 
-- Backend: `/workspace/agency`
-- Frontend: `/workspace/agency-fe`
+- Backend: `AGENCY_BACKEND_WORKSPACE`
+- Frontend: `AGENCY_FRONTEND_WORKSPACE`
 
-Override the frontend host mount with `AGENCY_FE_DIR` when the frontend repo is not at `../agency-fe`.
+These trusted local development workspace mounts are read-write. Isolated workflow containers use the host paths from
+`AGENCY_BACKEND_HOST_WORKSPACE` and `AGENCY_FRONTEND_HOST_WORKSPACE`; when those paths or their mounted targets are
+visible to the backend, Agency probes them before launch and fails early with an operator-facing permission prompt if
+the current user cannot write. That prompt means the human should approve/fix host filesystem permissions or point the
+workspace env var at a writable checkout before retrying.
+
+Override the frontend host mount with `AGENCY_FE_DIR` when the frontend repo is not at `../open-agency-fe`. To expose another
+repo to coder workflows, add it through `EXECUTION_CONTAINER_EXTRA_MOUNTS` with `"read_only": false` and set the Codex
+working directory or task instructions to the matching configured container target.
 
 ## Required Tool
 
@@ -120,19 +189,11 @@ Both agents need `agency.command.run`; handoff links should allow coder to QA an
 6. Assign `agency.command.run`.
 7. Save the agent.
 
-If no canonical tools appear in the frontend, run backend startup/tool sync first. For normal first-run setup, use:
-
-```bash
-make setup-agents
-```
-
-To update only the Coder agent:
+If no canonical tools appear in the frontend, run backend startup/tool sync first or use:
 
 ```bash
 .venv/bin/python scripts/setup.py coder-agent
 ```
-
-`python scripts/setup.py` provisions this agent together with the main, Embedding, and Evaluation agents.
 
 Optional arguments:
 
@@ -155,16 +216,25 @@ You are the Agency coding runtime agent. Your job is to turn a workflow task int
 Use the existing command tool, usually tool id `agency.command.run`, callable name `run_command`, display name `Run Command`, for CLI-first work. Do not invent Codex-specific APIs or dashboards. If the command tool is not assigned, stop and report: "Missing required tool: agency.command.run".
 
 Default workspaces:
-- Backend: use alias `agency`, `agency-backend`, or `backend`. In Docker this resolves to `/workspace/agency`.
-- Frontend: use alias `agency-fe`, `agency-frontend`, or `frontend`. In Docker this resolves to `/workspace/agency-fe`.
+- Backend: use alias `agency`, `agency-backend`, or `backend`. In Docker this resolves to `AGENCY_BACKEND_WORKSPACE`.
+- Frontend: prefer alias `open-agency-fe` or `open-agency-frontend`; legacy `agency-fe`, `agency-frontend`, and `frontend` aliases remain accepted. In Docker this resolves to `AGENCY_FRONTEND_WORKSPACE`.
 
 Use only the selected or clearly inferred workspace. Do not access credential folders or secret files, including `.env`, `~/.ssh`, `~/.aws`, `~/.codex`, or `~/.config`.
+
+## Code Comments
+
+- Add concise inline comments, docstrings, or function-level notes when the purpose of a function, branch, integration boundary, domain rule, guardrail, async flow, cache, retry, or workaround is not obvious from names and structure.
+- Explain why the code exists, what constraint it protects, or what reasoning justifies a non-obvious step. Do not restate what each line already says.
+- Keep comments close to the code they clarify, and update or remove them when the behavior changes.
+- Avoid noisy comments in straightforward code; comment the reasoning and intent future maintainers would otherwise have to rediscover.
 
 ## Workflow
 
 1. Identify the target workspace and restate the concrete coding objective.
 2. Inspect first with read-only commands such as `pwd`, `git status --short`, `rg`, `ls`, and focused file reads.
-3. Create a task markdown file under `var/coding_jobs/<job-id>/task.md` when invoking Codex CLI. Include objective, workspace, constraints, expected deliverables, suggested checks, and original user request.
+3. For non-trivial Codex CLI calls, create or reference a task markdown file under `var/coding_jobs/<job-id>/task.md`
+   using the command tool. Include objective, workspace, constraints, expected deliverables, suggested checks, and
+   original user request.
 4. Run Codex locally with workspace sandboxing, for example:
    `codex exec --sandbox workspace-write "Read var/coding_jobs/<job-id>/task.md and implement it. Do not push to git."`
 5. Use a longer `timeout_seconds` for Codex, builds, and tests when the command tool supports it.
@@ -194,95 +264,81 @@ Return a concise review summary with:
 - Known issues or follow-ups.
 ```
 
-## Implemented Pieces
+## Current Architecture
 
-- `app/coding_agent/jobs.py` creates filesystem-backed job folders and structured `task.md` files.
-- `app/coding_agent/workspaces.py` resolves workspace aliases, allows existing local workspace paths, and blocks
-  credential-sensitive paths.
-- `app/coding_agent/codex_runner.py` invokes `codex exec --sandbox workspace-write` with stdout/stderr capture.
-- `app/coding_agent/git_tools.py` captures `git status --short` and `git diff --`.
-- `app/coding_agent/test_runner.py` runs detected npm or Python checks with timeouts.
+The `Coder` agent is the coding runtime. It should use `agency.command.run` to perform the same job lifecycle a
+dedicated coding-job service would have handled:
 
-## Workspace Matrix
+1. Resolve the target workspace from the user request or workflow context.
+2. Prepare a focused task file when the Codex prompt would otherwise become too large or ambiguous.
+3. Run `codex exec --sandbox workspace-write ...` from the selected workspace.
+4. Capture `git status --short`, `git diff --`, and relevant test/build output.
+5. Report changed files, verification results, and any unresolved issues.
 
-| Input | Resolution | Allowed | Notes |
-| --- | --- | --- | --- |
-| `agency`, `agency-backend`, `backend` | `AGENCY_BACKEND_WORKSPACE` or this repo root | Yes | Backend repo alias. Docker default: `/workspace/agency`. |
-| `agency-fe`, `agency-frontend`, `frontend` | `AGENCY_FRONTEND_WORKSPACE` or sibling `agency-fe` directory | Yes | Frontend repo alias. Docker default: `/workspace/agency-fe`. |
-| Existing absolute or relative directory | Resolved with `Path(...).expanduser().resolve()` | Yes | Allowed if it exists and is not credential-sensitive. |
-| Missing directory | Resolved path | No | Rejected before Codex or tests run. |
-| Path containing `..` | N/A | No | Rejected before resolution to avoid traversal ambiguity. |
-| Credential-sensitive directory | N/A | No | Paths containing `.ssh`, `.aws`, `.codex`, `.config`, `.docker`, `.gnupg`, or `.kube` are rejected. |
-| `.env` file path | N/A | No | Task files named `.env` are rejected. |
+Workspace aliases:
 
-Default aliases:
-
-- `AGENCY_BACKEND_WORKSPACE`, falling back to this repository root.
-- `AGENCY_FRONTEND_WORKSPACE`, falling back to a sibling `agency-fe` directory.
+| Alias                                      | Default target                                               | Notes                |
+|--------------------------------------------|--------------------------------------------------------------|----------------------|
+| `open-agency`, `open-agency-backend` | `AGENCY_BACKEND_WORKSPACE` or this repo root | Canonical backend repo aliases. |
+| `agency`, `agency-backend`, `backend` | Same Open Agency backend workspace | Legacy compatibility aliases. |
+| `open-agency-fe`, `open-agency-frontend` | `AGENCY_FRONTEND_WORKSPACE` or sibling `open-agency-fe` directory | Canonical frontend repo aliases. |
+| `agency-fe`, `agency-frontend`, `frontend` | Same Open Agency FE workspace | Legacy compatibility aliases. |
 
 ## Actor And Capability Matrix
 
-| Actor or tool | Workspace scope | Can read | Can modify | Can delete | Approval behavior |
-| --- | --- | --- | --- | --- | --- |
-| Main agent direct chat | Backend APIs and assigned tools | Yes, via assigned tools | Yes, if assigned mutation tools and policy allows | Only through assigned tools | Mutation tools and command tool are approval-gated where marked. |
-| `agency.command.run` | Current command working directory | Yes | Yes | Yes, but risky forms are gated or blocked | All command execution requires approval. Broad deletion and credential patterns are hard-blocked. |
-| Coding-agent Codex runner | Any existing non-blocked local workspace | Yes | Yes, inside Codex sandbox | Prompt-prohibited unless explicitly approved | Current enforcement is prompt-level for Codex file deletes; OS-level pre-delete approval is future work. |
-| Git capture tools | Resolved workspace | `git status`, `git diff` | No | No | Read-only; mutating git commands are blocked in `git_tools.py`. |
-| Test runner | Resolved workspace | Yes | Test commands may write build/cache artifacts | No explicit delete permission | Runs detected npm/Python checks with timeouts. |
-| Manual script | Provided workspace | Yes | Yes via Codex CLI | Prompt-prohibited unless explicitly approved | Same limitations as Codex runner. |
+| Actor or tool                | Workspace scope                   | Can read                | Can modify                                          | Can delete                                                | Approval behavior                                                                                 |
+|------------------------------|-----------------------------------|-------------------------|-----------------------------------------------------|-----------------------------------------------------------|---------------------------------------------------------------------------------------------------|
+| Main agent direct chat       | Backend APIs and assigned tools   | Yes, via assigned tools | Yes, if assigned mutation tools and policy allows   | Only through assigned tools                               | Mutation tools and command tool are approval-gated where marked.                                  |
+| `agency.command.run`         | Current command working directory | Yes                     | Yes                                                 | Yes, but risky forms are gated or blocked                 | All command execution requires approval. Broad deletion and credential patterns are hard-blocked. |
+| Coder agent via command tool | Selected workspace                | Yes                     | Yes, through approved commands and Codex sandboxing | Only through approved commands; broad deletion is blocked | Uses `agency.command.run` for Codex, git artifact capture, and tests.                             |
 
 ## Command Policy Matrix
 
-| Command class | Examples | Default behavior | Reason |
-| --- | --- | --- | --- |
-| Safe read-only inspection | `pwd`, `ls`, `cat non-secret`, `grep`, `sed`, `git status`, `git diff`, `git log` | Approval required by `agency.command.run`; allowed after approval | Useful for debugging and repository inspection. |
-| Build and tests | `npm test`, `npm run build`, `npm run lint`, `pytest`, `python -m pytest` | Approval required by `agency.command.run`; allowed after approval | May execute project code but is expected in development workflows. |
-| Package or environment mutation | `npm install`, `pip install`, `brew install`, `docker compose up`, `alembic upgrade` | Approval required; not hard-blocked by current executor | Can change local environment or data, so user approval is required. |
-| Normal file writes | `tee file`, `python script_that_writes.py`, `touch file` | Approval required; allowed after approval | Enables coding workflows. |
-| Targeted deletion | `rm path/to/file`, `rm -r local/generated-dir` | Approval required; allowed after approval unless it matches a hard block | User asked deletion to be permission-gated, not categorically impossible. |
-| Broad deletion | `rm -rf /`, `rm -rf $HOME`, `rm -rf ~` | Hard-blocked | Too destructive to allow through generic agent commands. |
-| Find deletion | `find . -delete` | Hard-blocked | Too easy to delete broad trees unintentionally. |
-| Privilege escalation | `sudo`, `su` | Hard-blocked | Breaks local trust boundary. |
-| Remote shell/file transfer | `ssh`, `scp` | Hard-blocked | Can expose credentials or affect remote systems. |
-| Remote install pipe | `curl ... | bash`, `wget ... | sh` | Hard-blocked | High-risk supply-chain pattern. |
-| Git push | `git push` | Hard-blocked | Publishing requires a separate explicit workflow. |
-| Credential reads | `cat ~/.ssh/*`, `cat ~/.aws/*`, `cat .env` | Hard-blocked | Secrets must not be exposed to agent context. |
+| Command class                   | Examples                                                                             | Default behavior                                                         | Reason                                                                    |
+|---------------------------------|--------------------------------------------------------------------------------------|--------------------------------------------------------------------------|---------------------------------------------------------------------------|
+| Safe read-only inspection       | `pwd`, `ls`, `cat non-secret`, `grep`, `sed`, `git status`, `git diff`, `git log`    | Approval required by `agency.command.run`; allowed after approval        | Useful for debugging and repository inspection.                           |
+| Build and tests                 | `npm test`, `npm run build`, `npm run lint`, `pytest`, `python -m pytest`            | Approval required by `agency.command.run`; allowed after approval        | May execute project code but is expected in development workflows.        |
+| Package or environment mutation | `npm install`, `pip install`, `brew install`, `docker compose up`, `alembic upgrade` | Approval required; not hard-blocked by current executor                  | Can change local environment or data, so user approval is required.       |
+| Normal file writes              | `tee file`, `python script_that_writes.py`, `touch file`                             | Approval required; allowed after approval                                | Enables coding workflows.                                                 |
+| Targeted deletion               | `rm path/to/file`, `rm -r local/generated-dir`                                       | Approval required; allowed after approval unless it matches a hard block | User asked deletion to be permission-gated, not categorically impossible. |
+| Broad deletion                  | `rm -rf /`, `rm -rf $HOME`, `rm -rf ~`                                               | Hard-blocked                                                             | Too destructive to allow through generic agent commands.                  |
+| Find deletion                   | `find . -delete`                                                                     | Hard-blocked                                                             | Too easy to delete broad trees unintentionally.                           |
+| Privilege escalation            | `sudo`, `su`                                                                         | Hard-blocked                                                             | Breaks local trust boundary.                                              |
+| Remote shell/file transfer      | `ssh`, `scp`                                                                         | Hard-blocked                                                             | Can expose credentials or affect remote systems.                          |
+| Remote install pipe             | `curl ...                                                                            | bash`, `wget ...                                                         | sh`                                                                       | Hard-blocked | High-risk supply-chain pattern. |
+| Git push                        | `git push`                                                                           | Hard-blocked                                                             | Publishing requires a separate explicit workflow.                         |
+| Credential reads                | `cat ~/.ssh/*`, `cat ~/.aws/*`, `cat .env`                                           | Hard-blocked                                                             | Secrets must not be exposed to agent context.                             |
 
 ## Delete Permission Matrix
 
-| Surface | Targeted delete | Broad delete | Current enforcement |
-| --- | --- | --- | --- |
-| `agency.command.run` | Requires approval, then allowed unless blocked | Hard-blocked for root/home recursive patterns and `find -delete` | Enforced before subprocess execution. |
-| Codex runner | Prompt says deletion requires explicit approval | Prompt says destructive commands are not allowed | Prompt-level only; needs future workspace runner for pre-delete interception. |
-| Git tools | Not supported | Not supported | Mutating git commands are blocked. |
-| Test runner | Not intended | Not intended | Runs command lists directly; default checks do not include delete commands. |
+| Surface                    | Targeted delete                                 | Broad delete                                                     | Current enforcement                                                                     |
+|----------------------------|-------------------------------------------------|------------------------------------------------------------------|-----------------------------------------------------------------------------------------|
+| `agency.command.run`       | Requires approval, then allowed unless blocked  | Hard-blocked for root/home recursive patterns and `find -delete` | Enforced before subprocess execution.                                                   |
+| Codex CLI invoked by Coder | Prompt says deletion requires explicit approval | Prompt says destructive commands are not allowed                 | Codex sandboxing plus command approval; review the final diff before accepting changes. |
 
-## Job Artifact Matrix
+## Review Artifacts
 
-| Artifact | Path inside job folder | Producer | Purpose |
-| --- | --- | --- | --- |
-| Task markdown | `task.md` | `create_coding_job` | Structured task for Codex. |
-| Job metadata | `job.json` | `create_coding_job` | Durable job record. |
-| Codex stdout | `codex_stdout.log` | Future orchestration layer | Captured Codex output. |
-| Codex stderr | `codex_stderr.log` | Future orchestration layer | Captured Codex errors. |
-| Git status | `git_status.txt` | Future orchestration layer using `get_git_status` | Changed-file summary. |
-| Git diff | `git_diff.patch` | Future orchestration layer using `get_git_diff` | Reviewable patch. |
-| Test output | `test_output.log` | Future orchestration layer using `run_default_checks` | Build/test result log. |
-| Summary | `summary.md` | Future orchestration layer | Human-facing completion summary. |
+For coding workflows, the `Coder` agent should produce these artifacts through normal commands:
+
+| Artifact      | Command or source                                 | Purpose                                |
+|---------------|---------------------------------------------------|----------------------------------------|
+| Task markdown | `var/coding_jobs/<job-id>/task.md` when useful    | Structured task for larger Codex runs. |
+| Codex output  | `codex exec --sandbox workspace-write ...` output | Implementation log and blockers.       |
+| Git status    | `git status --short`                              | Changed-file summary.                  |
+| Git diff      | `git diff --`                                     | Reviewable patch.                      |
+| Test output   | Targeted unit, build, lint, or test command       | Verification evidence.                 |
 
 ## Current Enforcement Gaps
 
-| Gap | Current behavior | Required next step |
-| --- | --- | --- |
-| Codex pre-delete approval | Prompt-level instruction only | Add an approval-aware workspace runner, filesystem monitor, or isolated worktree diff gate. |
-| API approval workflow | Not wired | Add backend coding-job routes and approval records before execution/commit. |
-| Frontend review UI | Not wired | Add coding-agent dashboard with task/log/diff/test panels. |
-| Commit flow | Not wired | Add explicit approve-commit endpoint; keep push disabled by default. |
-| Container isolation | Not wired for coding-agent jobs | Add Docker/devcontainer or disposable worktree isolation for high-risk automation. |
+| Gap                       | Current behavior                                                     | Required next step                                                                                          |
+|---------------------------|----------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------|
+| Codex pre-delete approval | Codex prompt-level instruction plus command approval and sandboxing  | Add stronger diff gates or isolated worktrees if needed.                                                    |
+| Durable coding-job UI     | Not implemented                                                      | Prefer extending the `Coder` agent workflow and frontend agent experience before adding a separate runtime. |
+| Commit flow               | Not wired                                                            | Add explicit approve-commit endpoint; keep push disabled by default.                                        |
+| Container isolation       | Available for workflow/tool executions depending on runtime settings | Add Docker/devcontainer or disposable worktree isolation for high-risk automation.                          |
 
 ## Current Non-Goals
 
-- no API routes yet
-- no frontend dashboard yet
 - no automatic commits or pushes
 - no unrestricted shell exposure to external channels
+- no separate backend coding-agent runtime package

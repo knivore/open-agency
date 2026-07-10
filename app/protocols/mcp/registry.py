@@ -1,6 +1,7 @@
+"""Registry for configured MCP servers and their discovered capabilities."""
+
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
@@ -17,10 +18,9 @@ class MCPRegistryError(RuntimeError):
 
 
 class MCPClientRegistry:
-    def __init__(self, *, allowlisted_commands: list[str] | None = None):
-        env_allowlist = [item.strip() for item in os.getenv("MCP_SERVER_COMMAND_ALLOWLIST", "").split(",") if
-                         item.strip()]
-        self.allowlisted_commands = set(allowlisted_commands or env_allowlist)
+    """Register MCP server definitions, discover catalogs, and call remote tools."""
+
+    def __init__(self):
         self._servers: dict[str, MCPServerDefinition] = {}
         self._snapshots: dict[str, MCPDiscoverySnapshot] = {}
 
@@ -38,9 +38,15 @@ class MCPClientRegistry:
     def _validate_server(self, definition: MCPServerDefinition) -> None:
         if not definition.enabled:
             raise MCPRegistryError(f"MCP server '{definition.id}' is disabled")
-        command_name = definition.allowlisted_command or Path(definition.command).name
-        if command_name not in self.allowlisted_commands:
-            raise MCPRegistryError(f"MCP server command '{command_name}' is not allowlisted")
+        command_name = Path(definition.command).name
+        if definition.allowlisted_command:
+            if definition.allowlisted_command != command_name:
+                raise MCPRegistryError(
+                    f"MCP server '{definition.id}' allowlisted command "
+                    f"'{definition.allowlisted_command}' does not match command '{command_name}'"
+                )
+            return
+        raise MCPRegistryError(f"MCP server '{definition.id}' does not declare an allowed command")
 
     def _client_for(self, definition: MCPServerDefinition):
         self._validate_server(definition)

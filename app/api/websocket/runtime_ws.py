@@ -1,17 +1,14 @@
+"""WebSocket endpoint for runtime event streams."""
+
 from __future__ import annotations
 
 import asyncio
 import os
-
 from fastapi import APIRouter, Query, WebSocket
 from starlette.websockets import WebSocketDisconnect
 
-from app.runtime.streaming import get_default_runtime_event_bus
-from app.runtime.streaming.stream_serialization import (
-    RUNTIME_STREAM_AUTH_ENV,
-    runtime_stream_connected_payload,
-    runtime_stream_heartbeat_payload,
-)
+from app.runtime.streaming.event_bus import get_default_runtime_event_bus
+from app.runtime.streaming.stream_filters import RuntimeEventFilter
 from app.runtime.streaming.stream_safety import (
     DEFAULT_RUNTIME_STREAM_MAX_EVENTS_PER_SECOND,
     RuntimeStreamRateLimiter,
@@ -19,7 +16,11 @@ from app.runtime.streaming.stream_safety import (
     safe_runtime_events_payload,
     should_drop_event_for_lag,
 )
-from app.runtime.streaming.stream_filters import RuntimeEventFilter
+from app.runtime.streaming.stream_serialization import (
+    RUNTIME_STREAM_AUTH_ENV,
+    runtime_stream_connected_payload,
+    runtime_stream_heartbeat_payload,
+)
 
 
 def authorize_runtime_websocket(websocket: WebSocket) -> bool:

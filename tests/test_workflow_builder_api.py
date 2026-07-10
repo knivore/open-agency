@@ -2,13 +2,27 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from unittest.mock import patch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api.context import create_test_api_context
 from app.api.routes import create_api_router
-from app.domain import ExecutionArtifact, ModelProfileDefinition, UserDefinition
+from app.core.config import reset_settings_cache
+from app.domain import (
+    AgentDefinition,
+    ExecutionArtifact,
+    MemoryRecord,
+    ModelProfileDefinition,
+    NodeType,
+    TaskDefinition,
+    ToolDefinition,
+    UserDefinition,
+    WorkflowDefinition,
+    WorkflowNodeDefinition,
+)
 from app.llm.base import ModelResponse
+from app.services.workflow_builder import WorkflowBuilderService
 
 
 class FakeBuilderModelClient:
@@ -222,6 +236,117 @@ class WorkflowBuilderApiTests(unittest.TestCase):
             "metadata": {},
         }
 
+    def _minimal_workflow_for_tool_planning(self, *, task_description: str) -> WorkflowDefinition:
+        agent = AgentDefinition(
+            id="agent-planner",
+            name="Planner Agent",
+            instructions="Execute the assigned workflow task.",
+        )
+        task = TaskDefinition(
+            id="task-planning",
+            name="Run tool-assisted step",
+            description=task_description,
+            instructions=task_description,
+            expected_output="Completed step output.",
+            agent_id=agent.id,
+        )
+        node = WorkflowNodeDefinition(
+            id="node-planning",
+            name=task.name,
+            node_type=NodeType.TASK,
+            task_id=task.id,
+        )
+        return WorkflowDefinition(
+            id="workflow-tool-planning",
+            name="Tool Planning Workflow",
+            description="Tests tool planning.",
+            entrypoint=node.id,
+            nodes=[node],
+            task_definitions=[task],
+            agent_definitions=[agent],
+            metadata={"visible_to_main_agent": True, "mutable_by_main_agent": True},
+        )
+
+    def test_workflow_builder_assigns_existing_matching_tool_to_task(self):
+        asyncio.run(
+            self.context.tool_repo.save(
+                ToolDefinition.model_validate(
+                    {
+                        **self._tool_payload(tool_id="tool-discord-send"),
+                        "name": "send_discord_message",
+                        "description": "Send a message to a Discord channel or webhook.",
+                    }
+                )
+            )
+        )
+        workflow = self._minimal_workflow_for_tool_planning(
+            task_description="Send the final news brief to a Discord channel webhook."
+        )
+
+        enriched = asyncio.run(
+            WorkflowBuilderService(self.context).enrich_with_existing_tools(
+                workflow=workflow,
+                goal="Create a news workflow that sends the final brief to Discord.",
+            )
+        )
+
+        self.assertEqual(enriched.task_definitions[0].tool_ids, ["tool-discord-send"])
+        self.assertEqual(enriched.agent_definitions[0].tool_ids, ["tool-discord-send"])
+        self.assertFalse(enriched.metadata.get("tool_creation_required", False))
+        self.assertEqual(
+            enriched.metadata["tool_planning"]["task_tool_matches"][0]["source"],
+            "existing_tool_match",
+        )
+
+    def test_workflow_builder_marks_missing_tool_creation_requirement(self):
+        workflow = self._minimal_workflow_for_tool_planning(
+            task_description="Send the final news brief to a Discord channel webhook."
+        )
+
+        enriched = asyncio.run(
+            WorkflowBuilderService(self.context).enrich_with_existing_tools(
+                workflow=workflow,
+                goal="Create a news workflow that sends the final brief to Discord.",
+            )
+        )
+
+        self.assertTrue(enriched.metadata["tool_creation_required"])
+        recommendation = enriched.metadata["tool_creation_recommendation"]
+        self.assertEqual(recommendation["recommended_agent"], "Coder Agent")
+        self.assertEqual(recommendation["recommended_existing_tool_id"], "agency.command.run")
+        self.assertEqual(recommendation["suggested_tools"][0]["capability"], "Discord delivery")
+
+    def test_workflow_builder_repair_accepts_bare_workflow_response(self):
+        workflow = WorkflowDefinition.model_validate(self._workflow_payload())
+        repaired_payload = workflow.model_copy(update={"description": "Repaired description"}).model_dump(mode="json")
+
+        with patch.object(WorkflowBuilderService, "_generate_structured", return_value=repaired_payload):
+            repaired = asyncio.run(
+                WorkflowBuilderService(self.context).repair_workflow_definition(
+                    workflow=workflow,
+                    validation_errors=["entrypoint is invalid"],
+                    goal="Repair the workflow.",
+                    model_profile_id="profile-builder",
+                )
+            )
+
+        self.assertEqual(repaired.description, "Repaired description")
+
+    def test_workflow_builder_update_accepts_bare_workflow_response(self):
+        workflow = WorkflowDefinition.model_validate(self._workflow_payload())
+        updated_payload = workflow.model_copy(update={"description": "Updated description"}).model_dump(mode="json")
+
+        with patch.object(WorkflowBuilderService, "_generate_structured", return_value=updated_payload):
+            updated = asyncio.run(
+                WorkflowBuilderService(self.context).update_workflow_definition(
+                    workflow=workflow,
+                    goal="Update the description.",
+                    model_profile_id="profile-builder",
+                )
+            )
+
+        self.assertEqual(updated.description, "Updated description")
+
     def test_workflow_builder_rewrite_routes(self):
         agent_response = self.client.post(
             "/workflow-builder/rewrite/agent",
@@ -249,6 +374,167 @@ class WorkflowBuilderApiTests(unittest.TestCase):
         )
         self.assertEqual(task_response.status_code, 200)
         self.assertEqual(task_response.json()["data"]["name"], "Draft Decision Memo")
+
+    def test_workflow_runtime_governance_controls_can_be_read_and_updated(self):
+        create_response = self.client.post("/workflows", json=self._workflow_payload())
+        self.assertEqual(create_response.status_code, 200)
+
+        initial = self.client.get("/workflows/workflow-1/runtime-governance")
+        self.assertEqual(initial.status_code, 200)
+        initial_payload = initial.json()
+        self.assertFalse(initial_payload["token_budget"]["configured"])
+        self.assertFalse(initial_payload["context_compaction"]["persist_context_pack"])
+        self.assertFalse(initial_payload["execution_policy"]["configured"])
+        self.assertEqual(initial_payload["execution_policy"]["approval_mode"], "task_policy")
+        self.assertEqual(initial_payload["operator_actions"]["update_controls"], "/workflows/workflow-1/runtime-governance")
+
+        updated = self.client.patch(
+            "/workflows/workflow-1/runtime-governance",
+            json={
+                "tokenBudget": {
+                    "runTotalTokens": 1000,
+                    "warnRatio": 0.5,
+                    "hardRatio": 0.9,
+                    "action": "compact_context",
+                },
+                "contextCompaction": {
+                    "enabled": True,
+                    "persistContextPack": True,
+                    "preserveRecentMessages": 3,
+                    "maxSummaryChars": 3000,
+                },
+                "executionPolicy": {
+                    "maxRuntimeSeconds": 1800,
+                    "maxRetries": 2,
+                    "concurrencyLimit": 1,
+                    "approvalMode": "all_tasks",
+                },
+            },
+        )
+
+        self.assertEqual(updated.status_code, 200)
+        body = updated.json()
+        runtime = body["runtime_governance"]
+        self.assertTrue(runtime["token_budget"]["configured"])
+        self.assertEqual(runtime["token_budget"]["run_total_tokens"], 1000)
+        self.assertEqual(runtime["token_budget"]["action"], "compact_context")
+        self.assertTrue(runtime["context_compaction"]["persist_context_pack"])
+        self.assertEqual(runtime["context_compaction"]["persist_context_pack_source"], "workflow")
+        self.assertEqual(runtime["context_compaction"]["preserve_recent_messages"], 3)
+        self.assertTrue(runtime["execution_policy"]["configured"])
+        self.assertEqual(runtime["execution_policy"]["max_runtime_seconds"], 1800)
+        self.assertEqual(runtime["execution_policy"]["max_retries"], 2)
+        self.assertEqual(runtime["execution_policy"]["concurrency_limit"], 1)
+        self.assertEqual(runtime["execution_policy"]["approval_mode"], "all_tasks")
+        self.assertEqual(runtime["execution_policy"]["effective_concurrency_limit"], 1)
+        persisted = asyncio.run(self.context.workflow_repo.get("workflow-1"))
+        governance = persisted.metadata["runtime_governance"]
+        self.assertEqual(governance["token_budget"]["run_total_tokens"], 1000)
+        self.assertTrue(governance["context_compaction"]["persist_context_pack"])
+        self.assertEqual(persisted.max_runtime_seconds, 1800)
+        self.assertEqual(persisted.max_retries, 2)
+        self.assertEqual(persisted.concurrency_limit, 1)
+        self.assertEqual(persisted.approval_mode, "all_tasks")
+
+        detail = self.client.get("/workflows/workflow-1")
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.json()["runtime_governance"]["token_budget"]["run_total_tokens"], 1000)
+        self.assertEqual(detail.json()["runtime_governance"]["execution_policy"]["approval_mode"], "all_tasks")
+
+    def test_workflow_runtime_governance_rejects_invalid_token_budget_action(self):
+        create_response = self.client.post("/workflows", json=self._workflow_payload())
+        self.assertEqual(create_response.status_code, 200)
+
+        response = self.client.patch(
+            "/workflows/workflow-1/runtime-governance",
+            json={"token_budget": {"action": "delete_everything"}},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Input should be", response.json()["detail"])
+
+    def test_workflow_runtime_governance_clearing_compaction_fields_restores_defaults(self):
+        create_response = self.client.post("/workflows", json=self._workflow_payload())
+        self.assertEqual(create_response.status_code, 200)
+
+        updated = self.client.patch(
+            "/workflows/workflow-1/runtime-governance",
+            json={
+                "contextCompaction": {
+                    "persistContextPack": True,
+                    "preserveRecentMessages": 3,
+                }
+            },
+        )
+        self.assertEqual(updated.status_code, 200)
+
+        cleared = self.client.patch(
+            "/workflows/workflow-1/runtime-governance",
+            json={
+                "contextCompaction": {
+                    "persistContextPack": None,
+                    "preserveRecentMessages": None,
+                }
+            },
+        )
+        self.assertEqual(cleared.status_code, 200)
+        payload = cleared.json()["runtime_governance"]["context_compaction"]
+        self.assertFalse(payload["persist_context_pack"])
+        self.assertEqual(payload["persist_context_pack_source"], "global_default")
+        self.assertEqual(payload["preserve_recent_messages"], 1)
+
+        persisted = asyncio.run(self.context.workflow_repo.get("workflow-1"))
+        governance = persisted.metadata["runtime_governance"]
+        self.assertNotIn("context_compaction", governance)
+
+    def test_workflow_runtime_governance_rejects_unknown_fields(self):
+        create_response = self.client.post("/workflows", json=self._workflow_payload())
+        self.assertEqual(create_response.status_code, 200)
+
+        response = self.client.patch(
+            "/workflows/workflow-1/runtime-governance",
+            json={"contextCompaction": {"unknownControl": True}},
+        )
+
+        self.assertEqual(response.status_code, 422)
+
+    def test_workflow_steering_approval_can_be_requested_from_graph_target(self):
+        create_response = self.client.post("/workflows", json=self._workflow_payload())
+        self.assertEqual(create_response.status_code, 200)
+
+        response = self.client.post(
+            "/workflows/workflow-1/steering-approvals",
+            json={
+                "recommendedAction": "request_replan",
+                "reason": "Selected from graph node.",
+                "targetTaskId": "task-1",
+                "operatorParameters": {
+                    "instructions": "Replan validation steps without hiding the task graph.",
+                },
+                "metadata": {"source": "workflow_graph_node"},
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["created"])
+        self.assertEqual(body["workflow_id"], "workflow-1")
+        self.assertEqual(body["approval"]["target_task_id"], "task-1")
+        self.assertEqual(body["approval"]["recommended_action"], "request_replan")
+        self.assertEqual(body["approval"]["status"], "approval_requested")
+        self.assertEqual(body["approval"]["created_by"], "user-owner")
+        self.assertEqual(body["approval"]["metadata"]["source"], "workflow_graph_node")
+        self.assertIsNotNone(body["approval"]["approval_request_id"])
+        self.assertEqual(body["approval"]["approval_request_id"], body["approval_request"]["id"])
+        response_steering = body["workflow"]["metadata"]["main_agent_monitoring"]["steering_approvals"][0]
+        self.assertEqual(response_steering["status"], "approval_requested")
+        self.assertEqual(response_steering["approval_request_id"], body["approval_request"]["id"])
+
+        persisted = asyncio.run(self.context.workflow_repo.get("workflow-1"))
+        steering = persisted.metadata["main_agent_monitoring"]["steering_approvals"][0]
+        self.assertEqual(steering["target_task_id"], "task-1")
+        self.assertEqual(steering["status"], "approval_requested")
+        self.assertEqual(steering["approval_request_id"], body["approval_request"]["id"])
 
     def test_workflow_builder_generate_routes(self):
         tasks_response = self.client.post(
@@ -302,6 +588,42 @@ class WorkflowBuilderApiTests(unittest.TestCase):
 
         delete = self.client.delete("/agents/agent-1")
         self.assertEqual(delete.status_code, 200)
+
+    def test_builder_reuses_matching_global_agent_definitions(self):
+        asyncio.run(
+            self.context.agent_repo.create(
+                AgentDefinition(
+                    id="agent-launch-strategist",
+                    name="Launch Strategist",
+                    role="Plans the workflow approach",
+                    description="Reusable strategist for launch planning workflows.",
+                    instructions="Use the existing catalog strategist playbook.",
+                    backstory="Catalog agent",
+                    model_profile_id="profile-builder",
+                )
+            )
+        )
+        service = WorkflowBuilderService(self.context)
+
+        workflow = asyncio.run(
+            service.build_workflow_definition(
+                goal="Create a workflow that drafts a concise product launch plan.",
+                conversation_history="The user wants reusable launch planning.",
+                model_profile_id="profile-builder",
+                default_agent_model_profile_id="profile-builder",
+            )
+        )
+
+        self.assertEqual(workflow.agent_definitions[0].id, "agent-launch-strategist")
+        self.assertEqual(
+            workflow.agent_definitions[0].instructions,
+            "Use the existing catalog strategist playbook.",
+        )
+        self.assertEqual(
+            workflow.agent_definitions[0].metadata["workflow_builder_reused_global_agent_id"],
+            "agent-launch-strategist",
+        )
+        self.assertEqual(workflow.task_definitions[0].agent_id, "agent-launch-strategist")
 
     def test_tool_crud(self):
         payload = self._tool_payload()
@@ -538,6 +860,11 @@ class WorkflowBuilderApiTests(unittest.TestCase):
         self.assertIn("agent.model_profile.incompatible", error_codes)
         self.assertIn("tool.security.dangerous", error_codes)
 
+        detail = self.client.get("/workflows/workflow-1")
+        self.assertEqual(detail.status_code, 200)
+        round_trip_validate = self.client.post("/workflows/validate", json=detail.json())
+        self.assertEqual(round_trip_validate.status_code, 200)
+
         self.assertEqual(self.client.delete("/workflows/workflow-1", headers=self.owner_headers).status_code, 200)
 
     def test_workflow_shared_memory_controls(self):
@@ -583,21 +910,78 @@ class WorkflowBuilderApiTests(unittest.TestCase):
         error_codes = {item["code"] for item in validate.json()["validation_errors"]}
         self.assertNotIn("tool.security.dangerous", error_codes)
 
+    def test_workflow_validation_rejects_connector_tool_without_binding(self):
+        workflow = self._workflow_payload(tool_id="connector-tool")
+        workflow["tool_definitions"] = [self._tool_payload(tool_id="connector-tool")]
+        workflow["tool_definitions"][0]["tags"] = ["connector"]
+        workflow["tool_definitions"][0]["implementation"]["config"] = {"provider": "slack"}
+
+        validate = self.client.post("/workflows/validate", json=workflow)
+
+        self.assertEqual(validate.status_code, 200)
+        errors = validate.json()["validation_errors"]
+        error_codes = {item["code"] for item in errors}
+        self.assertIn("tool.connector_binding.missing", error_codes)
+        self.assertIn("requires a connector binding", errors[-1]["message"])
+
+    def test_workflow_validation_accepts_workflow_connector_default_binding(self):
+        workflow = self._workflow_payload(tool_id="connector-tool")
+        workflow["tool_definitions"] = [self._tool_payload(tool_id="connector-tool")]
+        workflow["tool_definitions"][0]["tags"] = ["connector"]
+        workflow["tool_definitions"][0]["implementation"]["config"] = {"provider": "slack"}
+        workflow["metadata"] = {
+            **workflow.get("metadata", {}),
+            "connector_bindings": [
+                {
+                    "provider": "slack",
+                    "credential_id": "credential-slack-support",
+                    "purpose": "support_delivery",
+                    "target_scope": {"channel_id": "C123"},
+                }
+            ],
+        }
+
+        validate = self.client.post("/workflows/validate", json=workflow)
+
+        self.assertEqual(validate.status_code, 200)
+        error_codes = {item["code"] for item in validate.json()["validation_errors"]}
+        self.assertNotIn("tool.connector_binding.missing", error_codes)
+
     def test_execution_create_list_and_get(self):
         workflow = self._workflow_payload()
+        asyncio.run(
+            self.context.memory_repo.create(
+                MemoryRecord(
+                    id="context-pack-exec-1",
+                    scope="user",
+                    created_by_user_id="user-owner",
+                    content="Selected compact context for this workflow execution.",
+                    summary="Selected execution context.",
+                    source="compact_tool",
+                    memory_type="context_pack",
+                    tags=["context_pack", "user", "handoff"],
+                    metadata={"mode": "handoff"},
+                )
+            )
+        )
         create = self.client.post(
             "/executions",
             json={
                 "workflowId": "workflow-exec-1",
                 "input": {"topic": "hello"},
                 "trigger": {"created_by": "tester"},
+                "contextPackId": "context-pack-exec-1",
                 "runtimeAdapterId": "native",
                 "workflow_definition": {**workflow, "id": "workflow-exec-1"},
                 "model_profiles": [],
             },
         )
         self.assertEqual(create.status_code, 200)
-        execution_id = create.json()["id"]
+        created_payload = create.json()
+        execution_id = created_payload["id"]
+        self.assertEqual(created_payload["input_payload"]["context_pack_id"], "context-pack-exec-1")
+        self.assertEqual(created_payload["trigger_payload"]["context_pack_id"], "context-pack-exec-1")
+        self.assertEqual(created_payload["trigger_payload"]["context_pack"]["summary"], "Selected execution context.")
 
         listing = self.client.get("/executions")
         self.assertEqual(len(listing.json()["items"]), 1)

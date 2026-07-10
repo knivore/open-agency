@@ -129,6 +129,9 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+crewaivenvfinal/
+.data/
+.agency/
 local_storage/
 certs/
 
@@ -172,6 +175,16 @@ cython_debug/
 
 .DS_Store
 /logs/
+/.logs/
+database_exports/*.dump
+database_exports/*.json
 /.idea/
 /.venv/
 /.python-version
+
+/docs
+/docs/*
+!/docs/
+!/docs/long-running-autonomous-agents-checklist.md
+/alembic/archived_versions/
+/AGENTS.md

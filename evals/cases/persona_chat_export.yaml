@@ -1,0 +1,74 @@
+id: persona_chat_export
+suite: persona_distillation
+name: Persona chat export extraction
+mode: persona_distillation_fixture
+description: Checks persona/style extraction from chat-like source material.
+persona_distillation:
+  source_memories:
+    - id: coaching-chat-export
+      title: Coaching chat export
+      content: |
+        User: I prefer direct caring style when you give feedback.
+        Assistant: I will be concise and direct, while keeping the tone caring.
+        User: Do not infer private feelings or personal facts unless I explicitly stated them.
+      tags: ["persona-live-eval", "chat-export", "style"]
+  expected_items:
+    - id: direct_style
+      item_type: writing_style
+      memory_layer: persona
+      content_keywords: ["direct caring style"]
+      evidence: "I prefer direct caring style"
+    - id: uncertainty_guardrail
+      item_type: guardrail
+      memory_layer: persona
+      content_keywords: ["do not infer private feelings", "personal facts"]
+      evidence: "Do not infer private feelings or personal facts unless I explicitly stated them"
+  results:
+    deterministic:
+      items:
+        - title: Direct style
+          content: "Use a direct caring style."
+          item_type: writing_style
+          memory_layer: persona
+          source_evidence: "I prefer direct caring style"
+          evidence_verified: true
+      metrics: {latency_ms: 6, cost_usd: 0.0}
+    llm:
+      items:
+        - title: Direct caring style
+          content: "Use a direct caring style."
+          item_type: writing_style
+          memory_layer: persona
+          source_evidence: "I prefer direct caring style"
+          evidence_verified: true
+        - title: No unsupported private feelings
+          content: "Do not infer private feelings or personal facts unless explicitly stated."
+          item_type: guardrail
+          memory_layer: persona
+          source_evidence: "Do not infer private feelings or personal facts unless I explicitly stated them"
+          evidence_verified: true
+      metrics: {latency_ms: 111, cost_usd: 0.014}
+    hybrid:
+      items:
+        - title: Direct caring style
+          content: "Use a direct caring style."
+          item_type: writing_style
+          memory_layer: persona
+          source_evidence: "I prefer direct caring style"
+          evidence_verified: true
+        - title: No unsupported private feelings
+          content: "Do not infer private feelings or personal facts unless explicitly stated."
+          item_type: guardrail
+          memory_layer: persona
+          source_evidence: "Do not infer private feelings or personal facts unless I explicitly stated them"
+          evidence_verified: true
+      metrics: {latency_ms: 118, cost_usd: 0.014}
+assertions:
+  - type: persona_metric_min
+    mode: llm
+    metric: recall
+    value: 1.0
+  - type: persona_metric_gte
+    mode: hybrid
+    baseline: deterministic
+    metric: f1

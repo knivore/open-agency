@@ -1,3 +1,5 @@
+"""Runtime stream filtering by workflow and agent identifiers."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

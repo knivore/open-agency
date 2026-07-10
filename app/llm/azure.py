@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import httpx
 import json
 import time
 from openai import AzureOpenAI
@@ -8,6 +7,7 @@ from typing import Any, Dict, Iterator, List, Optional
 
 from app.domain import ModelProfileDefinition
 from app.llm.base import ModelMessage, ModelResponse, ModelToolCall
+from app.llm.openai_helpers import sanitize_openai_message_name
 from app.llm.registry import LLMEnvironmentConfig
 
 
@@ -73,7 +73,8 @@ class AzureOpenAIModelClient:
                             self.expires_at
                         )
                 else:
-                    raise RuntimeError("Azure OAuth token expired. Please re-authorize via 'POST /model-providers/{id}/authorize'")
+                    raise RuntimeError(
+                        "Azure OAuth token expired. Please re-authorize via 'POST /model-providers/{id}/authorize'")
 
     def _to_openai_messages(self, messages: List[ModelMessage]) -> List[Dict[str, Any]]:
         payload = []
@@ -82,8 +83,22 @@ class AzureOpenAIModelClient:
                 "role": message.role,
                 "content": message.content,
             }
+            if message.tool_calls:
+                item["tool_calls"] = [
+                    {
+                        "id": tool_call.id,
+                        "type": "function",
+                        "function": {
+                            "name": sanitize_openai_message_name(tool_call.name) or tool_call.name,
+                            "arguments": json.dumps(tool_call.arguments or {}),
+                        },
+                    }
+                    for tool_call in message.tool_calls
+                ]
             if message.name:
-                item["name"] = message.name
+                sanitized_name = sanitize_openai_message_name(message.name)
+                if sanitized_name:
+                    item["name"] = sanitized_name
             if message.tool_call_id:
                 item["tool_call_id"] = message.tool_call_id
             payload.append(item)

@@ -1,8 +1,13 @@
+"""Built-in app tool normalization.
+
+This module reads the app-owned tool catalog directly from the shared YAML
+registry, then attaches runtime schemas, implementations, and security metadata
+to produce canonical ToolDefinition objects for the builtin registry.
+"""
+
 from __future__ import annotations
 
-import yaml
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from app.domain import MCPExposureSettings, SecuritySettings, ToolDefinition, ToolImplementationReference, ToolType
@@ -16,17 +21,24 @@ from app.tools.implementations.browser import (
     BrowserSelectInput,
     BrowserVerifyInput,
 )
-from app.tools.implementations.audio import TranscribeAudioInput
 from app.tools.implementations.documents import SaveMarkdownToWordToolSchema
 from app.tools.implementations.http_integrations import CustomAPIInput
 from app.tools.implementations.human_input import HumanInputRequest
+from app.tools.implementations.media import MediaPublishInput, MediaSendInput
+from app.tools.implementations.speech import SpeechContinueInput, SpeechListenInput, SpeechSpeakInput
 from app.tools.implementations.spreadsheets import ExcelImageInput, ExcelJSONInput, ExcelTextInput
+from app.tools.implementations.voice import VoiceGenerateInput
+from app.tools.registry_config import load_agency_tool_registry_config
+
+SCHEMA_FILLED_BY_KEY = "x-agency-filled-by"
+SCHEMA_USER_VISIBLE_KEY = "x-agency-user-visible"
 
 
 def load_tool_catalog_config() -> dict[str, Any]:
-    config_path = Path(__file__).resolve().parent / "config" / "agency_tools.yaml"
-    with config_path.open("r", encoding="utf-8") as handle:
-        return yaml.safe_load(handle) or {}
+    """Load app-owned builtin tool metadata from the shared YAML registry."""
+    registry = load_agency_tool_registry_config()
+    app_tools = registry.get("app_tools") or {}
+    return dict(app_tools if isinstance(app_tools, dict) else {})
 
 
 def _metadata_to_schema(parameters_metadata: dict[str, Any]) -> dict[str, Any]:
@@ -50,10 +62,56 @@ def _metadata_to_schema(parameters_metadata: dict[str, Any]) -> dict[str, Any]:
     return schema
 
 
+def _schema_filled_by(details: dict[str, Any]) -> str | None:
+    raw_value = details.get("filled_by")
+    if isinstance(raw_value, str):
+        normalized = raw_value.strip().lower()
+        if normalized in {"user", "agent", "user_or_agent"}:
+            return normalized
+    if details.get("input_type") == "hidden":
+        return "agent"
+    return None
+
+
+def _apply_parameter_contract_metadata(
+        schema: dict[str, Any],
+        parameters_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return schema
+
+    next_properties: dict[str, Any] = {}
+    for name, property_schema in properties.items():
+        if not isinstance(property_schema, dict):
+            next_properties[name] = property_schema
+            continue
+
+        details = parameters_metadata.get(name) if isinstance(parameters_metadata, dict) else None
+        details = details if isinstance(details, dict) else {}
+        next_property_schema = dict(property_schema)
+        filled_by = _schema_filled_by(details)
+        if filled_by:
+            next_property_schema[SCHEMA_FILLED_BY_KEY] = filled_by
+        if details.get("input_type") == "hidden":
+            next_property_schema[SCHEMA_USER_VISIBLE_KEY] = False
+        next_properties[name] = next_property_schema
+
+    return {
+        **schema,
+        "properties": next_properties,
+    }
+
+
 def _input_schema_for(tool_id: str, parameters_metadata: dict[str, Any]) -> dict[str, Any]:
     schemas: dict[str, dict[str, Any]] = {
         "agency.human.ask": HumanInputRequest.model_json_schema(),
-        "agency.audio.transcribe": TranscribeAudioInput.model_json_schema(),
+        "agency.speech.listen": SpeechListenInput.model_json_schema(),
+        "agency.speech.speak": SpeechSpeakInput.model_json_schema(),
+        "agency.speech.continue": SpeechContinueInput.model_json_schema(),
+        "agency.voice.generate": VoiceGenerateInput.model_json_schema(),
+        "agency.media.publish": MediaPublishInput.model_json_schema(),
+        "agency.media.send": MediaSendInput.model_json_schema(),
         "agency.http.request": CustomAPIInput.model_json_schema(),
         "agency.document.markdown-to-word": SaveMarkdownToWordToolSchema.model_json_schema(),
         "agency.excel.write-image": ExcelImageInput.model_json_schema(),
@@ -68,8 +126,9 @@ def _input_schema_for(tool_id: str, parameters_metadata: dict[str, Any]) -> dict
         "agency.browser.type-text": BrowserInputText.model_json_schema(),
         "agency.browser.verify-content": BrowserVerifyInput.model_json_schema(),
     }
+    schema: dict[str, Any]
     if tool_id == "agency.browser.screenshot":
-        return {
+        schema = {
             "type": "object",
             "properties": {
                 "full_page_screenshot": {
@@ -83,8 +142,8 @@ def _input_schema_for(tool_id: str, parameters_metadata: dict[str, Any]) -> dict
                 },
             },
         }
-    if tool_id == "agency.file.write-text":
-        return {
+    elif tool_id == "agency.file.write-text":
+        schema = {
             "type": "object",
             "properties": {
                 "base_folder": {"type": "string", "description": "Allowed directory where the file will be written."},
@@ -99,9 +158,57 @@ def _input_schema_for(tool_id: str, parameters_metadata: dict[str, Any]) -> dict
             "required": ["base_folder", "content", "mode"],
             "additionalProperties": False,
         }
-    if tool_id == "agency.browser.close":
-        return {"type": "object", "properties": {}}
-    return schemas.get(tool_id) or _metadata_to_schema(parameters_metadata)
+    elif tool_id == "agency.repo.inspect":
+        schema = {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Repository alias or allowlisted absolute path."},
+                "query": {"type": ["string", "null"], "description": "Optional case-insensitive text search."},
+                "focus_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional repo-relative files or glob patterns to prioritize.",
+                },
+                "include_patterns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional repo-relative glob patterns to include.",
+                },
+                "exclude_patterns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional repo-relative glob patterns to exclude.",
+                },
+                "max_files": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 200,
+                    "default": 24,
+                    "description": "Maximum number of files to scan for matches.",
+                },
+                "max_hits": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 200,
+                    "default": 40,
+                    "description": "Maximum number of TODO or query hits to return.",
+                },
+                "excerpt_line_limit": {
+                    "type": "integer",
+                    "minimum": 4,
+                    "maximum": 120,
+                    "default": 24,
+                    "description": "Maximum number of lines to include per file excerpt.",
+                },
+            },
+            "required": ["repo"],
+            "additionalProperties": False,
+        }
+    elif tool_id == "agency.browser.close":
+        schema = {"type": "object", "properties": {}}
+    else:
+        schema = schemas.get(tool_id) or _metadata_to_schema(parameters_metadata)
+    return _apply_parameter_contract_metadata(schema, parameters_metadata)
 
 
 def _string_or_error_schema(*, description: str) -> dict[str, Any]:
@@ -145,7 +252,7 @@ def _output_schema_for(tool_id: str) -> dict[str, Any]:
             "required": ["status", "response"],
             "additionalProperties": False,
         },
-        "agency.audio.transcribe": {
+        "agency.speech.listen": {
             "type": "object",
             "properties": {
                 "status": {"type": "string", "enum": ["success"]},
@@ -166,6 +273,140 @@ def _output_schema_for(tool_id: str) -> dict[str, Any]:
                 },
             },
             "required": ["status", "text", "model", "response_format"],
+            "additionalProperties": True,
+        },
+        "agency.speech.speak": {
+            "type": "object",
+            "properties": {
+                "announcementId": {"type": "string", "description": "Generated announcement id."},
+                "status": {"type": "string", "enum": ["accepted"]},
+                "text": {"type": "string", "description": "Normalized announcement text."},
+                "targetKind": {"type": ["string", "null"], "description": "Target scope for delivery."},
+                "targetRef": {"type": ["string", "null"], "description": "Target reference for delivery."},
+                "channel": {"type": ["string", "null"], "description": "Requested delivery channel."},
+                "ssml": {"type": ["string", "null"], "description": "SSML payload when provided."},
+                "voice": {"type": ["string", "null"], "description": "Selected voice preset."},
+                "metadata": {"type": "object", "description": "Arbitrary delivery metadata."},
+            },
+            "required": ["announcementId", "status", "text", "metadata"],
+            "additionalProperties": True,
+        },
+        "agency.speech.continue": {
+            "type": "object",
+            "properties": {
+                "continuationId": {"type": "string", "description": "Generated continuation id."},
+                "status": {"type": "string", "enum": ["completed"]},
+                "replyText": {"type": "string", "description": "Agent reply generated for the follow-up."},
+                "replySsml": {"type": ["string", "null"], "description": "Optional SSML reply payload."},
+                "actionsTaken": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Actions triggered while handling the follow-up.",
+                },
+                "sessionId": {"type": ["string", "null"], "description": "Conversation session id."},
+                "priorAnnouncementId": {
+                    "type": ["string", "null"],
+                    "description": "Announcement id that prompted the response.",
+                },
+                "channel": {"type": ["string", "null"], "description": "Requested continuation channel."},
+                "metadata": {"type": "object", "description": "Arbitrary continuation metadata."},
+            },
+            "required": ["continuationId", "status", "replyText", "actionsTaken", "metadata"],
+            "additionalProperties": True,
+        },
+        "agency.voice.generate": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["preview", "generated", "setup_required"]},
+                "provider": {"type": "string", "description": "Resolved voice provider."},
+                "text": {"type": "string", "description": "Normalized text used for synthesis."},
+                "voice": {"type": ["string", "null"], "description": "Voice preset or local voice name."},
+                "reference_voice_path": {
+                    "type": ["string", "null"],
+                    "description": "Reference voice path when local OpenVoice generation is used.",
+                },
+                "file_path": {"type": ["string", "null"], "description": "Resolved local generated file path."},
+                "storage_key": {"type": "string", "description": "Agency storage key for the generated audio."},
+                "storage_uri": {"type": ["string", "null"], "description": "Internal Agency storage URI."},
+                "media_url": {
+                    "type": ["string", "null"],
+                    "description": "Download URL for downstream tools, workflows, or tied-application delivery.",
+                },
+                "content_type": {"type": ["string", "null"], "description": "Generated audio MIME type."},
+                "provider_fetchable": {
+                    "type": ["boolean", "null"],
+                    "description": "Whether external providers can fetch media_url directly.",
+                },
+                "ai_disclosure": {"type": "boolean", "description": "Whether AI speech disclosure is confirmed."},
+                "consent_confirmed": {
+                    "type": "boolean",
+                    "description": "Whether consent is confirmed for cloned/reference voice generation.",
+                },
+                "purpose": {"type": ["string", "null"], "description": "Audit purpose."},
+                "warnings": {"type": "array", "items": {"type": "string"}},
+                "setup": {"type": "object", "additionalProperties": True},
+                "metadata": {"type": "object", "additionalProperties": True},
+                "next_step": {"type": "string", "description": "Recommended follow-up action."},
+            },
+            "required": ["status", "provider", "text", "storage_key", "ai_disclosure", "consent_confirmed"],
+            "additionalProperties": True,
+        },
+        "agency.media.publish": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["preview", "published"],
+                    "description": "Whether the file copy was previewed or completed.",
+                },
+                "file_path": {"type": "string", "description": "Resolved local source file path."},
+                "storage_key": {"type": "string", "description": "Agency storage key for the media artifact."},
+                "storage_uri": {"type": "string", "description": "Internal storage URI for the artifact."},
+                "media_url": {
+                    "type": "string",
+                    "description": "Download URL for downstream tools, workflows, or tied-application delivery.",
+                },
+                "filename": {"type": "string", "description": "Stored filename used for the artifact."},
+                "content_type": {"type": "string", "description": "Resolved media MIME type."},
+                "provider_fetchable": {
+                    "type": "boolean",
+                    "description": "Whether the URL is expected to be directly fetchable by external providers.",
+                },
+                "warnings": {"type": "array", "items": {"type": "string"}},
+                "metadata": {"type": "object", "additionalProperties": True},
+            },
+            "required": [
+                "status",
+                "file_path",
+                "storage_key",
+                "storage_uri",
+                "media_url",
+                "filename",
+                "content_type",
+                "provider_fetchable",
+                "warnings",
+                "metadata",
+            ],
+            "additionalProperties": True,
+        },
+        "agency.media.send": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["preview", "sent", "failed", "requires_context"],
+                    "description": "Whether the tool previewed, sent, failed delivery, or needs API context.",
+                },
+                "provider": {"type": "string", "description": "Normalized connector provider key."},
+                "media": {"type": "object", "additionalProperties": True},
+                "destination": {"type": "object", "additionalProperties": True},
+                "provider_message": {"type": "object", "additionalProperties": True},
+                "warnings": {"type": "array", "items": {"type": "string"}},
+                "metadata": {"type": "object", "additionalProperties": True},
+                "delivery": {"type": ["object", "null"], "additionalProperties": True},
+                "error": {"type": ["string", "null"]},
+            },
+            "required": ["status", "provider", "media", "destination", "provider_message", "warnings", "metadata"],
             "additionalProperties": True,
         },
         "agency.http.request": {
@@ -190,6 +431,26 @@ def _output_schema_for(tool_id: str) -> dict[str, Any]:
             },
             "required": ["status", "message", "path"],
             "additionalProperties": False,
+        },
+        "agency.repo.inspect": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["ok"]},
+                "repo_id": {"type": "string"},
+                "repo_path": {"type": "string"},
+                "branch": {"type": "string"},
+                "head_commit": {"type": "string"},
+                "status_short": {"type": "array", "items": {"type": "string"}},
+                "recent_commits": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+                "tracked_file_count": {"type": "integer"},
+                "untracked_file_count": {"type": "integer"},
+                "scanned_files": {"type": "array", "items": {"type": "string"}},
+                "todo_hits": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+                "query_hits": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+                "file_excerpts": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+            },
+            "required": ["status", "repo_id", "repo_path", "branch", "head_commit"],
+            "additionalProperties": True,
         },
         "agency.excel.write-image": spreadsheet_schema,
         "agency.excel.write-json": spreadsheet_schema,
@@ -274,13 +535,19 @@ def _output_schema_for(tool_id: str) -> dict[str, Any]:
     return mapping.get(tool_id, {"type": "object", "description": "Generic object output."})
 
 
-def _implementation_for(tool_id: str) -> ToolImplementationReference:
+def _default_implementation_for(tool_id: str) -> ToolImplementationReference:
     mapping = {
         "agency.human.ask": ("app.tools.implementations.human_input", "request_human_input"),
-        "agency.audio.transcribe": ("app.tools.implementations.audio", "transcribe_audio"),
+        "agency.speech.listen": ("app.tools.implementations.speech", "listen_speech"),
+        "agency.speech.speak": ("app.tools.implementations.speech", "speak_speech"),
+        "agency.speech.continue": ("app.tools.implementations.speech", "continue_speech"),
+        "agency.voice.generate": ("app.tools.implementations.voice", "generate_voice"),
+        "agency.media.publish": ("app.tools.implementations.media", "publish_media"),
+        "agency.media.send": ("app.tools.implementations.media", "send_media"),
         "agency.http.request": ("app.tools.implementations.http_integrations", "execute_custom_api"),
         "agency.document.markdown-to-word": ("app.tools.implementations.documents", "save_markdown_to_word"),
         "agency.file.write-text": ("app.tools.implementations.custom.files", "write_text_file"),
+        "agency.repo.inspect": ("app.tools.implementations.custom.repo_inspect", "inspect_repo"),
         "agency.excel.write-image": ("app.tools.implementations.spreadsheets", "write_excel_image"),
         "agency.excel.write-json": ("app.tools.implementations.spreadsheets", "write_excel_json"),
         "agency.excel.write-text": ("app.tools.implementations.spreadsheets", "write_excel_text"),
@@ -303,9 +570,18 @@ def _implementation_for(tool_id: str) -> ToolImplementationReference:
     )
 
 
-def _security_for(tool_id: str) -> SecuritySettings:
+def _implementation_for(tool_id: str, config: dict[str, Any]) -> ToolImplementationReference:
+    implementation_config = config.get("implementation")
+    if isinstance(implementation_config, dict) and implementation_config:
+        return ToolImplementationReference.model_validate(implementation_config)
+    return _default_implementation_for(tool_id)
+
+
+def _default_security_for(tool_id: str, implementation: ToolImplementationReference) -> SecuritySettings:
     network_tools = {
-        "agency.audio.transcribe",
+        "agency.speech.listen",
+        "agency.media.publish",
+        "agency.media.send",
         "agency.http.request",
         "agency.browser.open",
         "agency.browser.screenshot",
@@ -317,6 +593,11 @@ def _security_for(tool_id: str) -> SecuritySettings:
         "agency.browser.type-text",
         "agency.browser.verify-content",
         "agency.browser.close",
+    }
+    external_mutation_tools = {
+        "agency.media.publish",
+        "agency.media.send",
+        "agency.http.request",
     }
     browser_tools = {
         "agency.browser.open",
@@ -330,20 +611,24 @@ def _security_for(tool_id: str) -> SecuritySettings:
         "agency.browser.verify-content",
         "agency.browser.close",
     }
-    filesystem_write_tools = {
+    filesystem_tools = {
         "agency.document.markdown-to-word",
+        "agency.media.publish",
+        "agency.media.send",
+        "agency.voice.generate",
         "agency.file.write-text",
         "agency.excel.write-image",
         "agency.excel.write-json",
         "agency.excel.write-text",
     }
-    dangerous_tools = filesystem_write_tools | {
+    dangerous_tools = filesystem_tools | {
         "agency.browser.click",
         "agency.browser.select-option",
         "agency.browser.type-text",
-    }
+    } | external_mutation_tools
     read_only_tools = {
-        "agency.audio.transcribe",
+        "agency.speech.listen",
+        "agency.speech.speak",
         "agency.browser.open",
         "agency.browser.screenshot",
         "agency.browser.analyze-screenshot",
@@ -351,22 +636,40 @@ def _security_for(tool_id: str) -> SecuritySettings:
         "agency.browser.scroll",
         "agency.browser.verify-content",
         "agency.browser.close",
+        "agency.repo.inspect",
     }
 
     return SecuritySettings(
         requires_approval=tool_id in dangerous_tools or tool_id == "agency.human.ask",
-        sandbox=True if tool_id in dangerous_tools or tool_id in browser_tools else False,
+        sandbox=tool_id in dangerous_tools or tool_id in browser_tools or tool_id in network_tools,
         allow_browser=tool_id in browser_tools,
-        allow_filesystem=tool_id in filesystem_write_tools,
+        allow_filesystem=tool_id in filesystem_tools or tool_id == "agency.repo.inspect",
         allow_network=tool_id in network_tools,
         allowed_domains=[],
-        allowed_paths=["local_storage", "logs", "."] if tool_id in filesystem_write_tools else [],
-        module_allowlist=[_implementation_for(tool_id).module],
-        function_allowlist=[_implementation_for(tool_id).function] if _implementation_for(tool_id).function else [],
+        allowed_paths=["local_storage", "logs", "."] if tool_id in filesystem_tools else [],
+        module_allowlist=[implementation.module],
+        function_allowlist=[implementation.function] if implementation.function else [],
         read_only=tool_id in read_only_tools,
         dangerous=tool_id in dangerous_tools,
         redaction_enabled=tool_id in {"agency.http.request"},
     )
+
+
+def _security_for(
+        tool_id: str,
+        config: dict[str, Any],
+        implementation: ToolImplementationReference,
+) -> SecuritySettings:
+    default_security = _default_security_for(tool_id, implementation).model_dump(mode="json")
+    override = config.get("security")
+    if not isinstance(override, dict) or not override:
+        return SecuritySettings.model_validate(default_security)
+    merged = {**default_security, **override}
+    if not merged.get("module_allowlist"):
+        merged["module_allowlist"] = [implementation.module]
+    if implementation.function and not merged.get("function_allowlist"):
+        merged["function_allowlist"] = [implementation.function]
+    return SecuritySettings.model_validate(merged)
 
 
 @dataclass(frozen=True)
@@ -385,6 +688,7 @@ def build_tool_catalog_specs() -> dict[str, ToolCatalogSpec]:
     specs: dict[str, ToolCatalogSpec] = {}
     for tool_id, config in load_tool_catalog_config().items():
         parameters_metadata = config.get("parameters", {}) or {}
+        implementation = _implementation_for(tool_id, config)
         tool_definition = ToolDefinition(
             id=config["id"],
             name=config["name"],
@@ -393,11 +697,11 @@ def build_tool_catalog_specs() -> dict[str, ToolCatalogSpec]:
             tool_type=ToolType.PYTHON_FUNCTION,
             input_schema=_input_schema_for(tool_id, parameters_metadata),
             output_schema=_output_schema_for(tool_id),
-            implementation=_implementation_for(tool_id),
-            security=_security_for(tool_id),
+            implementation=implementation,
+            security=_security_for(tool_id, config, implementation),
             mcp_exposure=MCPExposureSettings(),
-            tags=["catalog", "crewai"],
-            framework_hints={"preferred_adapter": "crewai"},
+            tags=list(config.get("tags") or ["catalog", "crewai"]),
+            framework_hints=config.get("framework_hints") or {"preferred_adapter": "crewai"},
         )
         specs[tool_id] = ToolCatalogSpec(
             id=config["id"],

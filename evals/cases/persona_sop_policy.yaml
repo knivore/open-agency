@@ -1,0 +1,74 @@
+id: persona_sop_policy
+suite: persona_distillation
+name: Persona SOP and policy extraction
+mode: persona_distillation_fixture
+description: Compares extraction modes on structured SOP and policy source material.
+persona_distillation:
+  source_memories:
+    - id: release-sop
+      title: Release review SOP
+      content: |
+        Release review SOP: the reviewer owns planning, testing, issue validation, and MLP drafting.
+        Do not report an observation without evidence from the workpaper, source system, or owner response.
+        If evidence is missing, mark the item as pending review rather than presenting it as final.
+      tags: ["persona-live-eval", "sop", "policy"]
+  expected_items:
+    - id: release_workflow
+      item_type: workflow
+      memory_layer: procedural
+      content_keywords: ["plan", "test", "validate", "draft"]
+      evidence: "planning, testing, issue validation, and MLP drafting"
+    - id: evidence_guardrail
+      item_type: guardrail
+      memory_layer: procedural
+      content_keywords: ["do not report", "without evidence"]
+      evidence: "Do not report an observation without evidence"
+  results:
+    deterministic:
+      items:
+        - title: Release review workflow
+          content: "Plan, test, validate issues, and draft the MLP."
+          item_type: workflow
+          memory_layer: procedural
+          source_evidence: "planning, testing, issue validation, and MLP drafting"
+          evidence_verified: true
+      metrics: {latency_ms: 8, cost_usd: 0.0}
+    llm:
+      items:
+        - title: Release review workflow
+          content: "Plan, test, validate issues, and draft the MLP."
+          item_type: workflow
+          memory_layer: procedural
+          source_evidence: "planning, testing, issue validation, and MLP drafting"
+          evidence_verified: true
+        - title: Evidence reporting guardrail
+          content: "Do not report without evidence."
+          item_type: guardrail
+          memory_layer: procedural
+          source_evidence: "Do not report an observation without evidence"
+          evidence_verified: true
+      metrics: {latency_ms: 95, cost_usd: 0.012}
+    hybrid:
+      items:
+        - title: Release review workflow
+          content: "Plan, test, validate issues, and draft the MLP."
+          item_type: workflow
+          memory_layer: procedural
+          source_evidence: "planning, testing, issue validation, and MLP drafting"
+          evidence_verified: true
+        - title: Evidence reporting guardrail
+          content: "Do not report without evidence."
+          item_type: guardrail
+          memory_layer: procedural
+          source_evidence: "Do not report an observation without evidence"
+          evidence_verified: true
+      metrics: {latency_ms: 101, cost_usd: 0.012}
+assertions:
+  - type: persona_metric_min
+    mode: hybrid
+    metric: recall
+    value: 1.0
+  - type: persona_metric_gte
+    mode: hybrid
+    baseline: deterministic
+    metric: f1

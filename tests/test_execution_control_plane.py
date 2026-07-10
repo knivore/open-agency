@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import unittest
-from datetime import datetime, timedelta
+from datetime import timedelta
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from unittest.mock import patch
 
 from app.api.context import create_test_api_context
 from app.api.routes.executions import create_executions_router
+from app.core.config import reset_settings_cache
 from app.core.time import utc_now
-from app.domain import AgentDefinition, Execution, ExecutionEvent, ExecutionEventType, ModelProfileDefinition, \
-    RuntimeRevision, RuntimeRevisionStatus, TaskDefinition, ToolDefinition, UserDefinition, WorkflowDefinition, \
-    WorkflowNodeDefinition
+from app.domain import AgentDefinition, Execution, ExecutionArtifact, ExecutionEvent, ExecutionEventType, \
+    ModelProfileDefinition, RuntimeRevision, RuntimeRevisionStatus, TaskDefinition, ToolDefinition, UserDefinition, \
+    WorkflowDefinition, WorkflowEdgeDefinition, WorkflowNodeDefinition
 from app.domain.models import FrameworkHints, MCPExposureSettings, MemorySettings, SecuritySettings, \
     ToolImplementationReference
 from app.llm.base import ModelResponse, ModelToolCall
@@ -73,6 +74,12 @@ class ApprovalAwareModelClient:
 
     def health_check(self):
         return {"ok": True}
+
+
+class HangingModelClient(ApprovalAwareModelClient):
+    async def agenerate_text(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+        await asyncio.sleep(0.05)
+        return ModelResponse(content="done", provider=self.profile.provider, model=self.profile.model, latency_ms=1)
 
 
 class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
@@ -159,6 +166,47 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(final)
         self.assertIn(final.status.value, {"completed", "running"})
 
+    async def test_low_risk_approval_can_be_delegated_to_main_agent(self):
+        workflow = self.workflow.model_copy(
+            deep=True,
+            update={
+                "id": "workflow-approval-delegated",
+                "metadata": {
+                    "main_agent_monitoring": {
+                        "delegate_hitl_to_main_agent": True,
+                    }
+                },
+            },
+        )
+        await self.context.runtime_registry.register_workflow(workflow)
+
+        execution = await self.context.runtime_registry.create_execution(
+            workflow.id,
+            {"topic": "delegated-approval"},
+            {"created_by": "tester"},
+            runtime_adapter_id="native",
+        )
+        await self.context.control_plane.queue_start(execution.id)
+        await asyncio.sleep(0.1)
+
+        final = await self.context.execution_store.get_execution(execution.id)
+        events = await self.context.execution_store.list_events(execution.id)
+
+        assert final is not None
+        self.assertEqual(final.status.value, "completed")
+        self.assertNotIn("pending_approval", final.metadata)
+        approval_grants = [event for event in events if event.event_type.value == "approval.granted"]
+        self.assertTrue(approval_grants)
+        decision_metadata = approval_grants[-1].payload["decision_metadata"]
+        self.assertEqual(decision_metadata["mode"], "delegated")
+        self.assertEqual(decision_metadata["delegate"], "main_agent")
+        self.assertEqual(decision_metadata["risk_gate"], "low_risk_only")
+        approval_requests = await self.context.execution_store.list_approval_requests(execution.id)
+        self.assertEqual(len(approval_requests), 1)
+        self.assertEqual(approval_requests[0]["status"], "approved")
+        self.assertEqual(approval_requests[0]["responded_by"], "main_agent")
+        self.assertEqual(approval_requests[0]["response_payload"]["metadata"]["mode"], "delegated")
+
     async def test_computer_use_mutation_requires_approval_and_completes_after_approval(self):
         self.context.llm_provider_registry.register(
             "fake",
@@ -224,6 +272,7 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
             agent_definitions=[agent],
             tool_definitions=[tool],
             default_runtime_adapter_id="native",
+            metadata={"main_agent_monitoring": {"delegate_hitl_to_main_agent": True}},
         )
         await self.context.runtime_registry.register_workflow(workflow)
 
@@ -245,6 +294,11 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(approval_events)
         self.assertEqual(approval_events[-1].payload["tool_name"], "click")
         self.assertEqual(approval_events[-1].payload["arguments"]["token"], "[REDACTED]")
+        self.assertIn("browser", approval_events[-1].payload["risk_labels"])
+        self.assertIn("local_privileged_execution", approval_events[-1].payload["risk_labels"])
+        self.assertTrue(approval_events[-1].payload["local_privileged_execution"])
+        approval_grants_before_manual = [event for event in events if event.event_type.value == "approval.granted"]
+        self.assertEqual(approval_grants_before_manual, [])
 
         approved = await self.context.control_plane.approve(execution.id, "tool-click", "approved")
         self.assertTrue(approved)
@@ -424,7 +478,23 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
             execution.status = execution.status.__class__(status)
             execution.worker_id = f"old-worker-{status}"
             execution.last_heartbeat_at = old_heartbeat
+            if status == "cancelling":
+                execution.output_payload = {
+                    "node_outputs": {"node-a": {"partial": True}},
+                    "checkpoint": {"current_node_id": "node-b"},
+                }
             await self.context.execution_store.update_execution(execution)
+            if status == "cancelling":
+                await self.context.execution_store.save_artifact(
+                    ExecutionArtifact(
+                        id="artifact-stale-partial",
+                        execution_id=execution.id,
+                        artifact_type="log",
+                        name="partial.log",
+                        content_text="partial",
+                        size_bytes=7,
+                    )
+                )
             executions[status] = execution
 
         repaired = await self.context.control_plane.repair_stale_executions()
@@ -450,17 +520,236 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
         cancelling = await self.context.execution_store.get_execution(executions["cancelling"].id)
         self.assertEqual(cancelling.status.value, "cancelled")
         self.assertIsNotNone(cancelling.completed_at)
+        self.assertEqual(cancelling.output_payload["node_outputs"]["node-a"], {"partial": True})
+        cancelling_artifacts = await self.context.execution_store.list_artifacts(cancelling.id)
+        self.assertEqual([artifact.id for artifact in cancelling_artifacts], ["artifact-stale-partial"])
+        preservation = cancelling.metadata["partial_result_preservation"]
+        self.assertEqual(preservation["reason"], "stale_execution_marked_cancelled")
+        self.assertEqual(preservation["artifact_count"], 1)
+        self.assertEqual(preservation["artifacts"][0]["artifact_id"], "artifact-stale-partial")
+        self.assertEqual(preservation["node_output_ids"], ["node-a"])
         cancelling_events = await self.context.execution_store.list_events(cancelling.id)
         self.assertEqual(cancelling_events[-1].event_type, ExecutionEventType.EXECUTION_CANCELLED)
+        self.assertEqual(cancelling_events[-1].payload["partial_result_preservation"], preservation)
 
         metrics = self.context.runtime_operations.snapshot_dict()
         self.assertEqual(metrics["counters"]["stale_execution_repairs"], 4)
         self.assertEqual(metrics["counters"]["stale_execution_repairs.requeued"], 3)
         self.assertEqual(metrics["counters"]["stale_execution_repairs.marked_cancelled"], 1)
 
+    async def test_stale_execution_repair_marks_completed_when_checkpoint_finished_terminal_nodes(self):
+        agent = self.workflow.agent_definitions[0]
+        first_task = TaskDefinition(
+            id="task-stale-first",
+            name="First Task",
+            description="First step",
+            agent_id=agent.id,
+        )
+        final_task = TaskDefinition(
+            id="task-stale-final",
+            name="Final Task",
+            description="Final step",
+            agent_id=agent.id,
+        )
+        first_node = WorkflowNodeDefinition(
+            id="node-stale-first",
+            name="First Node",
+            node_type="task",
+            task_id=first_task.id,
+            agent_id=agent.id,
+        )
+        final_node = WorkflowNodeDefinition(
+            id="node-stale-final",
+            name="Final Node",
+            node_type="task",
+            task_id=final_task.id,
+            agent_id=agent.id,
+        )
+        workflow = WorkflowDefinition(
+            id="workflow-stale-completed-checkpoint",
+            name="Stale Completed Checkpoint Workflow",
+            nodes=[first_node, final_node],
+            edges=[
+                WorkflowEdgeDefinition(
+                    id="edge-stale-final",
+                    source_node_id=first_node.id,
+                    target_node_id=final_node.id,
+                )
+            ],
+            entrypoint=first_node.id,
+            task_definitions=[first_task, final_task],
+            agent_definitions=[agent],
+            tool_definitions=[],
+            default_runtime_adapter_id="native",
+        )
+        await self.context.runtime_registry.register_workflow(workflow)
+        execution = await self.context.runtime_registry.create_execution(
+            workflow.id,
+            {"topic": "stale-completed"},
+            {"created_by": "tester"},
+            runtime_adapter_id="native",
+        )
+        execution.status = execution.status.__class__.RUNNING
+        execution.worker_id = "old-worker-completed"
+        execution.last_heartbeat_at = utc_now() - timedelta(seconds=60)
+        execution.output_payload = {
+            "checkpoint": {
+                "current_node_id": final_node.id,
+                "current_task_id": final_task.id,
+                "completed_node_ids": [first_node.id, final_node.id],
+                "planned_node_ids": [first_node.id, final_node.id],
+                "terminal_node_ids": [final_node.id],
+            },
+            "final_output": "External delivery already succeeded",
+            "node_outputs": {
+                first_node.id: "first output",
+                final_node.id: "External delivery already succeeded",
+            },
+        }
+        await self.context.execution_store.update_execution(execution)
+        future_task = TaskDefinition(
+            id="task-stale-future",
+            name="Future Task",
+            description="Task added after this execution started",
+            agent_id=agent.id,
+        )
+        future_node = WorkflowNodeDefinition(
+            id="node-stale-future",
+            name="Future Node",
+            node_type="task",
+            task_id=future_task.id,
+            agent_id=agent.id,
+        )
+        await self.context.runtime_registry.register_workflow(
+            workflow.model_copy(
+                deep=True,
+                update={
+                    "nodes": [*workflow.nodes, future_node],
+                    "edges": [
+                        *workflow.edges,
+                        WorkflowEdgeDefinition(
+                            id="edge-stale-future",
+                            source_node_id=final_node.id,
+                            target_node_id=future_node.id,
+                        ),
+                    ],
+                    "task_definitions": [*workflow.task_definitions, future_task],
+                },
+            )
+        )
+
+        repaired = await self.context.control_plane.repair_stale_executions(execution_id=execution.id)
+
+        self.assertEqual(repaired[0]["repair_action"], "marked_completed")
+        self.assertEqual(repaired[0]["new_status"], "completed")
+        current = await self.context.execution_store.get_execution(execution.id)
+        self.assertEqual(current.status.value, "completed")
+        self.assertIsNotNone(current.completed_at)
+        self.assertIsNone(current.worker_id)
+        self.assertIsNone(current.last_heartbeat_at)
+        self.assertIsNone(current.error)
+        self.assertNotIn("partial_result_preservation", current.metadata)
+        self.assertEqual(current.metadata["stale_repair"]["repair_action"], "marked_completed")
+        self.assertEqual(current.output_payload["final_output"], "External delivery already succeeded")
+        events = await self.context.execution_store.list_events(current.id)
+        self.assertEqual(events[-1].event_type, ExecutionEventType.EXECUTION_COMPLETED)
+        self.assertEqual(events[-1].payload["repair_action"], "marked_completed")
+        self.assertEqual(events[-1].payload["output"]["final_output"], "External delivery already succeeded")
+
+    async def test_stale_execution_repair_removes_stale_container_before_requeue(self):
+        class FakeRuntimeContainerManager:
+            def __init__(self):
+                self.stopped = []
+                self.removed = []
+
+            def inspect_container(self, container_id: str):
+                return RuntimeContainerState(
+                    container_id=container_id,
+                    name="agency-execution-container-stale",
+                    image="agency-runtime:stale",
+                    status="running",
+                    labels={"agency.execution_id": "execution-stale-container"},
+                    started_at=utc_now() - timedelta(seconds=30),
+                )
+
+            def stop_container(self, container_id: str):
+                self.stopped.append(container_id)
+                return RuntimeContainerState(
+                    container_id=container_id,
+                    name="agency-execution-container-stale",
+                    image="agency-runtime:stale",
+                    status="exited",
+                    labels={"agency.execution_id": "execution-stale-container"},
+                    started_at=utc_now() - timedelta(seconds=30),
+                    finished_at=utc_now(),
+                    exit_code=0,
+                )
+
+            def remove_container(self, container_id: str, *, force: bool = False):
+                self.removed.append((container_id, force))
+
+        execution = await self.context.runtime_registry.create_execution(
+            self.workflow.id,
+            {"topic": "stale-container"},
+            {"created_by": "tester"},
+            runtime_adapter_id="native",
+        )
+        execution.status = execution.status.__class__.RUNNING
+        execution.worker_id = "old-worker-container"
+        execution.last_heartbeat_at = utc_now() - timedelta(seconds=10)
+        execution.runtime_revision_id = "runtime-rev-stale"
+        execution.container_id = "container-stale"
+        execution.container_name = "agency-execution-container-stale"
+        execution.container_image = "agency-runtime:stale"
+        execution.container_status = "running"
+        await self.context.execution_store.update_execution(execution)
+
+        manager = FakeRuntimeContainerManager()
+        self.context.control_plane.runtime_container_manager = manager
+
+        repaired = await self.context.control_plane.repair_stale_executions(execution_id=execution.id)
+
+        current = await self.context.execution_store.get_execution(execution.id)
+        events = await self.context.execution_store.list_events(execution.id)
+        self.assertEqual(repaired[0]["repair_action"], "requeued")
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertEqual(current.status.value, "queued")
+        self.assertEqual(current.container_status, "removed")
+        self.assertIsNone(current.worker_id)
+        self.assertIsNone(current.last_heartbeat_at)
+        self.assertEqual(manager.stopped, ["container-stale"])
+        self.assertEqual(manager.removed, [("container-stale", True)])
+        container_repair = current.metadata["stale_repair"]["container_repair"]
+        self.assertEqual(container_repair["action"], "stopped_and_removed")
+        self.assertEqual(container_repair["container_id"], "container-stale")
+        event_types = [event.event_type for event in events]
+        self.assertIn(ExecutionEventType.CONTAINER_STOPPED, event_types)
+        self.assertEqual(events[-1].event_type, ExecutionEventType.EXECUTION_REPAIRED)
+        self.assertEqual(events[-1].payload["container_repair"]["action"], "stopped_and_removed")
+
+    async def test_queue_start_updates_heartbeat_during_local_execution(self):
+        self.context.llm_provider_registry.register("fake", lambda profile, env: HangingModelClient(profile, env))
+        self.context.control_plane.stale_after_seconds = 1
+        execution = await self.context.runtime_registry.create_execution(
+            self.workflow.id,
+            {"topic": "heartbeat"},
+            {"created_by": "tester"},
+            runtime_adapter_id="native",
+        )
+
+        await self.context.control_plane.queue_start(execution.id)
+        await asyncio.sleep(0.6)
+
+        current = await self.context.execution_store.get_execution(execution.id)
+        self.assertIsNotNone(current)
+        self.assertIsNotNone(current.last_heartbeat_at)
+        self.assertGreaterEqual(current.last_heartbeat_at, current.started_at)
+
     async def test_queue_start_prepares_isolated_runtime_when_enabled(self):
         class FakeRuntimeRevisionService:
             async def resolve_current_revision(self, *, metadata=None, mark_ready=True, strict=True):
+                _ = (mark_ready, strict)
                 return RuntimeRevision(
                     id="runtime-rev-1",
                     fingerprint="fp-1",
@@ -471,6 +760,7 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             async def invalidate_superseded_revisions(self, active_revision_id: str, *, reason: str = "superseded"):
+                _ = active_revision_id
                 return []
 
         class FakeRuntimeContainerManager:
@@ -479,7 +769,11 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
 
             config = Config()
 
+            def __init__(self):
+                self.created_spec = None
+
             def create_execution_container(self, spec):
+                self.created_spec = spec
                 return type(
                     "State",
                     (),
@@ -511,7 +805,8 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
 
         self.context.control_plane.execution_isolation_enabled = True
         self.context.control_plane.runtime_revision_service = FakeRuntimeRevisionService()
-        self.context.control_plane.runtime_container_manager = FakeRuntimeContainerManager()
+        container_manager = FakeRuntimeContainerManager()
+        self.context.control_plane.runtime_container_manager = container_manager
         self.context.control_plane.runtime_registry.start_execution = fail_start_execution
 
         execution = await self.context.runtime_registry.create_execution(
@@ -519,6 +814,7 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
             {"topic": "isolated"},
             {"created_by": "tester"},
             runtime_adapter_id="native",
+            goal_id="goal-isolated",
         )
         await self.context.control_plane.queue_start(execution.id)
         await asyncio.sleep(0.05)
@@ -530,9 +826,17 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
         assert current is not None
         self.assertEqual(current.runtime_revision_id, "runtime-rev-1")
         self.assertEqual(current.runtime_fingerprint, "fp-1")
+        self.assertEqual(current.goal_id, "goal-isolated")
+        self.assertEqual(current.metadata["worker_context"]["goal_id"], "goal-isolated")
+        self.assertEqual(current.metadata["worker_context"]["execution_id"], execution.id)
+        self.assertEqual(current.metadata["worker_context"]["workflow_id"], self.workflow.id)
         self.assertEqual(current.container_id, "container-1")
         self.assertEqual(current.container_status, "running")
         self.assertEqual(current.status.value, "queued")
+        self.assertIsNotNone(container_manager.created_spec)
+        assert container_manager.created_spec is not None
+        self.assertEqual(container_manager.created_spec.goal_id, "goal-isolated")
+        self.assertEqual(container_manager.created_spec.env["AGENCY_GOAL_ID"], "goal-isolated")
         event_types = [event.event_type.value for event in events]
         self.assertIn("runtime.revision.resolved", event_types)
         self.assertIn("container.created", event_types)
@@ -541,6 +845,7 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_queue_start_prepares_isolated_runtime_when_execution_requests_docker_host(self):
         class FakeRuntimeRevisionService:
             async def resolve_current_revision(self, *, metadata=None, mark_ready=True, strict=True):
+                _ = (mark_ready, strict)
                 return RuntimeRevision(
                     id="runtime-rev-host",
                     fingerprint="fp-host",
@@ -551,6 +856,7 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             async def invalidate_superseded_revisions(self, active_revision_id: str, *, reason: str = "superseded"):
+                _ = active_revision_id
                 return []
 
         class FakeRuntimeContainerManager:
@@ -616,6 +922,7 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_host_backend_mode_keeps_worker_codex_cwd_inside_container(self):
         class FakeRuntimeRevisionService:
             async def resolve_current_revision(self, *, metadata=None, mark_ready=True, strict=True):
+                _ = (mark_ready, strict)
                 return RuntimeRevision(
                     id="runtime-rev-host-backend",
                     fingerprint="fp-host-backend",
@@ -626,6 +933,7 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             async def invalidate_superseded_revisions(self, active_revision_id: str, *, reason: str = "superseded"):
+                _ = active_revision_id
                 return []
 
         class FakeRuntimeContainerManager:
@@ -678,8 +986,12 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
             "os.environ",
             {
                 "AGENCY_BACKEND_RUN_MODE": "host",
+                "CODEX_HOME": "/Users/example/.codex",
                 "CODEX_CLI_CWD": "/Users/example/workspace/agency",
                 "EXECUTION_CODEX_CLI_CWD": "",
+                "CODEX_CLI_TIMEOUT_SECONDS": "1800",
+                "LLM_REQUEST_TIMEOUT_SECONDS": "45",
+                "AGENCY_EXECUTION_TIMEOUT_SECONDS": "1800",
             },
             clear=False,
         ):
@@ -694,11 +1006,461 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(manager.created_spec)
         assert manager.created_spec is not None
+        self.assertEqual(manager.created_spec.env["CODEX_HOME"], "/codex")
         self.assertEqual(manager.created_spec.env["CODEX_CLI_CWD"], "/app")
+        self.assertEqual(manager.created_spec.env["CODEX_CLI_TIMEOUT_SECONDS"], "1800")
+        self.assertEqual(manager.created_spec.env["LLM_REQUEST_TIMEOUT_SECONDS"], "45")
+        self.assertEqual(manager.created_spec.env["AGENCY_EXECUTION_TIMEOUT_SECONDS"], "1800")
+
+    async def test_isolated_worker_defaults_codex_sandbox_to_workspace_write(self):
+        class FakeRuntimeRevisionService:
+            async def resolve_current_revision(self, *, metadata=None, mark_ready=True, strict=True):
+                _ = (mark_ready, strict)
+                return RuntimeRevision(
+                    id="runtime-rev-sandbox-default",
+                    fingerprint="fp-sandbox-default",
+                    build_status=RuntimeRevisionStatus.READY,
+                    image_name="agency-runtime",
+                    image_tag="sandbox-default",
+                    metadata_json=metadata or {},
+                )
+
+            async def invalidate_superseded_revisions(self, active_revision_id: str, *, reason: str = "superseded"):
+                _ = active_revision_id
+                return []
+
+        class FakeRuntimeContainerManager:
+            class Config:
+                runtime_base_image = "agency-runtime-base:latest"
+
+            config = Config()
+
+            def __init__(self):
+                self.created_spec = None
+
+            def create_execution_container(self, spec):
+                self.created_spec = spec
+                return type(
+                    "State",
+                    (),
+                    {
+                        "container_id": "container-sandbox-default",
+                        "name": "agency-execution-container-sandbox-default",
+                        "image": spec.image,
+                        "status": "created",
+                    },
+                )()
+
+            def start_container(self, container_id: str):
+                return type(
+                    "State",
+                    (),
+                    {
+                        "container_id": container_id,
+                        "name": "agency-execution-container-sandbox-default",
+                        "image": "agency-runtime:sandbox-default",
+                        "status": "running",
+                        "started_at": utc_now(),
+                        "finished_at": None,
+                        "exit_code": None,
+                    },
+                )()
+
+        async def fail_start_execution(execution_id: str):
+            raise AssertionError("Host runtime_registry.start_execution should not be called for isolated runs")
+
+        manager = FakeRuntimeContainerManager()
+        self.context.control_plane.execution_isolation_enabled = True
+        self.context.control_plane.runtime_revision_service = FakeRuntimeRevisionService()
+        self.context.control_plane.runtime_container_manager = manager
+        self.context.control_plane.runtime_registry.start_execution = fail_start_execution
+
+        with patch.dict("os.environ", {"CODEX_CLI_SANDBOX": ""}, clear=False):
+            execution = await self.context.runtime_registry.create_execution(
+                self.workflow.id,
+                {"topic": "sandbox-default"},
+                {"created_by": "tester"},
+                runtime_adapter_id="native",
+            )
+            await self.context.control_plane.queue_start(execution.id)
+            await asyncio.sleep(0.05)
+
+        self.assertIsNotNone(manager.created_spec)
+        assert manager.created_spec is not None
+        self.assertEqual(manager.created_spec.env["CODEX_CLI_SANDBOX"], "workspace-write")
+
+    async def test_isolated_worker_timeout_uses_resolved_agent_policy(self):
+        class FakeRuntimeRevisionService:
+            async def resolve_current_revision(self, *, metadata=None, mark_ready=True, strict=True):
+                _ = (mark_ready, strict)
+                return RuntimeRevision(
+                    id="runtime-rev-agent-timeout",
+                    fingerprint="fp-agent-timeout",
+                    build_status=RuntimeRevisionStatus.READY,
+                    image_name="agency-runtime",
+                    image_tag="agent-timeout",
+                    metadata_json=metadata or {},
+                )
+
+            async def invalidate_superseded_revisions(self, active_revision_id: str, *, reason: str = "superseded"):
+                _ = active_revision_id
+                return []
+
+        class FakeRuntimeContainerManager:
+            class Config:
+                runtime_base_image = "agency-runtime-base:latest"
+
+            config = Config()
+
+            def __init__(self):
+                self.created_spec = None
+
+            def create_execution_container(self, spec):
+                self.created_spec = spec
+                return type(
+                    "State",
+                    (),
+                    {
+                        "container_id": "container-agent-timeout",
+                        "name": "agency-execution-container-agent-timeout",
+                        "image": spec.image,
+                        "status": "created",
+                    },
+                )()
+
+            def start_container(self, container_id: str):
+                return type(
+                    "State",
+                    (),
+                    {
+                        "container_id": container_id,
+                        "name": "agency-execution-container-agent-timeout",
+                        "image": "agency-runtime:agent-timeout",
+                        "status": "running",
+                        "started_at": utc_now(),
+                        "finished_at": None,
+                        "exit_code": None,
+                    },
+                )()
+
+        async def fail_start_execution(execution_id: str):
+            raise AssertionError("Host runtime_registry.start_execution should not be called for isolated runs")
+
+        workflow = self.workflow.model_copy(deep=True, update={"id": "workflow-agent-timeout"})
+        workflow.agent_definitions[0].metadata = {
+            "timeout_policy": {
+                "idle_timeout_seconds": 1200,
+                "run_timeout_seconds": 14400,
+                "codex_cli_timeout_seconds": 3600,
+                "llm_request_timeout_seconds": 90,
+            }
+        }
+        await self.context.runtime_registry.register_workflow(workflow)
+
+        manager = FakeRuntimeContainerManager()
+        self.context.control_plane.execution_isolation_enabled = True
+        self.context.control_plane.runtime_revision_service = FakeRuntimeRevisionService()
+        self.context.control_plane.runtime_container_manager = manager
+        self.context.control_plane.runtime_registry.start_execution = fail_start_execution
+
+        with patch.dict(
+            "os.environ",
+            {
+                "AGENCY_EXECUTION_TIMEOUT_SECONDS": "",
+                "CODEX_CLI_TIMEOUT_SECONDS": "",
+                "LLM_REQUEST_TIMEOUT_SECONDS": "",
+            },
+            clear=False,
+        ):
+            execution = await self.context.runtime_registry.create_execution(
+                workflow.id,
+                {"topic": "agent-timeout"},
+                {"created_by": "tester"},
+                runtime_adapter_id="native",
+            )
+            await self.context.control_plane.queue_start(execution.id)
+            await asyncio.sleep(0.05)
+
+        self.assertIsNotNone(manager.created_spec)
+        assert manager.created_spec is not None
+        self.assertEqual(manager.created_spec.env["AGENCY_EXECUTION_TIMEOUT_SECONDS"], "14400")
+        self.assertEqual(manager.created_spec.env["CODEX_CLI_TIMEOUT_SECONDS"], "3600")
+        self.assertEqual(manager.created_spec.env["LLM_REQUEST_TIMEOUT_SECONDS"], "90")
+        current = await self.context.execution_store.get_execution(execution.id)
+        self.assertIsNotNone(current)
+        assert current is not None
+        runtime_policy = current.metadata["runtime_policy"]
+        self.assertEqual(runtime_policy["worker_hard_timeout_seconds"], 14400)
+        self.assertEqual(
+            runtime_policy["source_map"]["worker_hard_timeout_seconds"],
+            "agent:agent-approval.metadata.runtime_policy",
+        )
+
+    async def test_isolated_always_on_worker_omits_default_hard_timeout(self):
+        class FakeRuntimeRevisionService:
+            async def resolve_current_revision(self, *, metadata=None, mark_ready=True, strict=True):
+                _ = (mark_ready, strict)
+                return RuntimeRevision(
+                    id="runtime-rev-always-on",
+                    fingerprint="fp-always-on",
+                    build_status=RuntimeRevisionStatus.READY,
+                    image_name="agency-runtime",
+                    image_tag="always-on",
+                    metadata_json=metadata or {},
+                )
+
+            async def invalidate_superseded_revisions(self, active_revision_id: str, *, reason: str = "superseded"):
+                _ = active_revision_id
+                return []
+
+        class FakeRuntimeContainerManager:
+            class Config:
+                runtime_base_image = "agency-runtime-base:latest"
+
+            config = Config()
+
+            def __init__(self):
+                self.created_spec = None
+
+            def create_execution_container(self, spec):
+                self.created_spec = spec
+                return type(
+                    "State",
+                    (),
+                    {
+                        "container_id": "container-always-on",
+                        "name": "agency-execution-container-always-on",
+                        "image": spec.image,
+                        "status": "created",
+                    },
+                )()
+
+            def start_container(self, container_id: str):
+                return type(
+                    "State",
+                    (),
+                    {
+                        "container_id": container_id,
+                        "name": "agency-execution-container-always-on",
+                        "image": "agency-runtime:always-on",
+                        "status": "running",
+                        "started_at": utc_now(),
+                        "finished_at": None,
+                        "exit_code": None,
+                    },
+                )()
+
+        async def fail_start_execution(execution_id: str):
+            raise AssertionError("Host runtime_registry.start_execution should not be called for isolated runs")
+
+        workflow = self.workflow.model_copy(
+            deep=True,
+            update={
+                "id": "workflow-always-on-timeout",
+                "metadata": {
+                    "execution_lifecycle": {
+                        "run_mode": "always_on",
+                    }
+                },
+            },
+        )
+        await self.context.runtime_registry.register_workflow(workflow)
+
+        manager = FakeRuntimeContainerManager()
+        self.context.control_plane.execution_isolation_enabled = True
+        self.context.control_plane.runtime_revision_service = FakeRuntimeRevisionService()
+        self.context.control_plane.runtime_container_manager = manager
+        self.context.control_plane.runtime_registry.start_execution = fail_start_execution
+
+        with patch.dict("os.environ", {"AGENCY_EXECUTION_TIMEOUT_SECONDS": ""}, clear=False):
+            execution = await self.context.runtime_registry.create_execution(
+                workflow.id,
+                {"topic": "always-on"},
+                {"created_by": "tester"},
+                runtime_adapter_id="native",
+            )
+            await self.context.control_plane.queue_start(execution.id)
+            await asyncio.sleep(0.05)
+
+        current = await self.context.execution_store.get_execution(execution.id)
+        self.assertIsNotNone(manager.created_spec)
+        assert manager.created_spec is not None
+        self.assertNotIn("AGENCY_EXECUTION_TIMEOUT_SECONDS", manager.created_spec.env)
+        self.assertIsNotNone(current)
+        assert current is not None
+        runtime_policy = current.metadata["runtime_policy"]
+        self.assertIsNone(runtime_policy["worker_hard_timeout_seconds"])
+        self.assertEqual(
+            runtime_policy["source_map"]["worker_hard_timeout_seconds"],
+            "execution_lifecycle.always_on",
+        )
+
+    async def test_isolated_worker_receives_onecli_proxy_environment_when_enforced(self):
+        class FakeRuntimeRevisionService:
+            def __init__(self):
+                self.metadata = None
+
+            async def resolve_current_revision(self, *, metadata=None, mark_ready=True, strict=True):
+                self.metadata = metadata
+                return RuntimeRevision(
+                    id="runtime-rev-onecli-worker",
+                    fingerprint="fp-onecli-worker",
+                    build_status=RuntimeRevisionStatus.READY,
+                    image_name="agency-runtime",
+                    image_tag="onecli-worker",
+                    metadata_json=metadata or {},
+                )
+
+            async def invalidate_superseded_revisions(self, active_revision_id: str, *, reason: str = "superseded"):
+                _ = active_revision_id
+                return []
+
+        class FakeRuntimeContainerManager:
+            class Config:
+                runtime_base_image = "agency-runtime-base:latest"
+
+            config = Config()
+
+            def __init__(self):
+                self.created_spec = None
+
+            def create_execution_container(self, spec):
+                self.created_spec = spec
+                return type(
+                    "State",
+                    (),
+                    {
+                        "container_id": "container-onecli-worker",
+                        "name": "agency-execution-container-onecli-worker",
+                        "image": spec.image,
+                        "status": "created",
+                    },
+                )()
+
+            def start_container(self, container_id: str):
+                return type(
+                    "State",
+                    (),
+                    {
+                        "container_id": container_id,
+                        "name": "agency-execution-container-onecli-worker",
+                        "image": "agency-runtime:onecli-worker",
+                        "status": "running",
+                        "started_at": utc_now(),
+                        "finished_at": None,
+                        "exit_code": None,
+                    },
+                )()
+
+        async def fail_start_execution(execution_id: str):
+            raise AssertionError("Host runtime_registry.start_execution should not be called for isolated runs")
+
+        manager = FakeRuntimeContainerManager()
+        revision_service = FakeRuntimeRevisionService()
+        self.context.control_plane.execution_isolation_enabled = True
+        self.context.control_plane.runtime_revision_service = revision_service
+        self.context.control_plane.runtime_container_manager = manager
+        self.context.control_plane.runtime_registry.start_execution = fail_start_execution
+
+        with patch.dict(
+                "os.environ",
+                {
+                    "EXECUTION_ISOLATION_ENABLED": "true",
+                    "ONECLI_ENABLED": "true",
+                    "ONECLI_FORCE_FOR_ISOLATED_WORKERS": "true",
+                    "ONECLI_GATEWAY_URL": "http://onecli:10255",
+                    "ONECLI_GATEWAY_CA_BUNDLE_PATH": "/tmp/onecli-ca.pem",
+                    "ONECLI_GATEWAY_CA_BUNDLE_CONTAINER_PATH": "/etc/agency/onecli/ca.pem",
+                    "ONECLI_AGENT_TOKEN_SECRET_REF": "env://ONECLI_AGENT_TOKEN",
+                    "ONECLI_AGENT_TOKEN": "should-not-enter-worker",
+                    "ONECLI_WORKER_EGRESS_MODE": "docker_internal_network",
+                    "ONECLI_WORKER_EGRESS_NETWORK": "agency_onecli_worker_egress",
+                    "ONECLI_NODE_PROXY_BOOTSTRAP_PATH": "/app/app/runtime/node_onecli_proxy.cjs",
+                    "ONECLI_WORKER_NO_PROXY": "postgres,redis,agency-backend,onecli",
+                    "OPENAI_API_KEY": "should-not-enter-worker",
+                    "ANTHROPIC_API_KEY": "should-not-enter-worker",
+                    "GOOGLE_API_KEY": "should-not-enter-worker",
+                    "AZURE_OPENAI_API_KEY": "should-not-enter-worker",
+                },
+                clear=False,
+        ):
+            reset_settings_cache()
+            execution = await self.context.runtime_registry.create_execution(
+                self.workflow.id,
+                {"topic": "onecli-worker"},
+                {"created_by": "tester"},
+                runtime_adapter_id="native",
+            )
+            await self.context.control_plane.queue_start(execution.id)
+            await asyncio.sleep(0.05)
+        reset_settings_cache()
+
+        self.assertIsNotNone(manager.created_spec)
+        assert manager.created_spec is not None
+        env = manager.created_spec.env
+        self.assertEqual(env["HTTP_PROXY"], "http://onecli:10255")
+        self.assertEqual(env["HTTPS_PROXY"], "http://onecli:10255")
+        self.assertEqual(env["NO_PROXY"], "postgres,redis,agency-backend,onecli")
+        self.assertEqual(env["REQUESTS_CA_BUNDLE"], "/etc/agency/onecli/ca.pem")
+        self.assertEqual(env["NODE_EXTRA_CA_CERTS"], "/etc/agency/onecli/ca.pem")
+        self.assertEqual(env["ONECLI_NODE_PROXY_BOOTSTRAP_PATH"], "/app/app/runtime/node_onecli_proxy.cjs")
+        self.assertIn("--require /app/app/runtime/node_onecli_proxy.cjs", env["NODE_OPTIONS"])
+        self.assertEqual(env["ONECLI_AGENT_TOKEN_SECRET_REF_CONFIGURED"], "true")
+        self.assertNotIn("ONECLI_AGENT_TOKEN_SECRET_REF", env)
+        self.assertNotIn("ONECLI_AGENT_TOKEN", env)
+        self.assertNotIn("OPENAI_API_KEY", env)
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+        self.assertNotIn("GOOGLE_API_KEY", env)
+        self.assertNotIn("AZURE_OPENAI_API_KEY", env)
+        self.assertNotIn("should-not-enter-worker", str(env))
+        self.assertNotIn("should-not-enter-worker", str(manager.created_spec.command))
+        self.assertNotIn("should-not-enter-worker", str(manager.created_spec.labels))
+        self.assertEqual(manager.created_spec.labels["agency.onecli.enabled"], "true")
+        self.assertEqual(manager.created_spec.labels["agency.onecli.isolated_workers"], "true")
+        self.assertEqual(manager.created_spec.labels["agency.onecli.egress_mode"], "docker_internal_network")
+        self.assertEqual(manager.created_spec.network_name, "agency_onecli_worker_egress")
+        self.assertIsNotNone(revision_service.metadata)
+        assert revision_service.metadata is not None
+        self.assertEqual(revision_service.metadata["onecli"]["gateway_url"], "http://onecli:10255")
+        self.assertTrue(revision_service.metadata["onecli"]["agent_token_secret_ref_configured"])
+        self.assertEqual(revision_service.metadata["onecli"]["worker_egress_mode"], "docker_internal_network")
+        self.assertEqual(revision_service.metadata["onecli"]["worker_egress_network"], "agency_onecli_worker_egress")
+        self.assertTrue(revision_service.metadata["onecli"]["node_proxy_bootstrap_configured"])
+        self.assertNotIn("env://ONECLI_AGENT_TOKEN", str(revision_service.metadata))
+        self.assertNotIn("should-not-enter-worker", str(revision_service.metadata))
+
+        current = await self.context.execution_store.get_execution(execution.id)
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertNotIn("should-not-enter-worker", str(current.metadata))
+        diagnostics = current.metadata["onecli_worker_enforcement"]
+        self.assertEqual(diagnostics["enforcement_mode"], "docker_internal_network")
+        self.assertTrue(diagnostics["proxy_env_required"])
+        self.assertEqual(diagnostics["missing_proxy_env"], [])
+        self.assertEqual(diagnostics["missing_ca_env"], [])
+        self.assertTrue(diagnostics["direct_external_credentials_blocked"])
+        self.assertEqual(diagnostics["forbidden_env_present"], [])
+        self.assertEqual(diagnostics["container_level_egress_controls"], "docker_internal_network")
+        self.assertEqual(diagnostics["worker_network"], "agency_onecli_worker_egress")
+        self.assertTrue(diagnostics["node_proxy_bootstrap_configured"])
+        self.assertEqual(diagnostics["node_proxy_bootstrap_path"], "/app/app/runtime/node_onecli_proxy.cjs")
+        self.assertNotIn("env://ONECLI_AGENT_TOKEN", str(diagnostics))
+
+        events = await self.context.execution_store.list_events(execution.id)
+        onecli_events = [
+            event for event in events
+            if event.event_type == ExecutionEventType.ONECLI_WORKER_ENFORCEMENT_RECORDED
+        ]
+        self.assertTrue(onecli_events)
+        self.assertEqual(onecli_events[-1].payload["enforcement_mode"], "docker_internal_network")
+        self.assertTrue(onecli_events[-1].payload["agent_token_secret_ref_configured"])
+        self.assertNotIn("env://ONECLI_AGENT_TOKEN", str(onecli_events[-1].payload))
+        self.assertNotIn("should-not-enter-worker", str(onecli_events[-1].payload))
 
     async def test_queue_start_resolves_runtime_revision_in_shadow_mode_without_container_startup(self):
         class FakeRuntimeRevisionService:
             async def resolve_current_revision(self, *, metadata=None, mark_ready=True, strict=True):
+                _ = (mark_ready, strict)
                 return RuntimeRevision(
                     id="runtime-rev-shadow",
                     fingerprint="fp-shadow",
@@ -749,6 +1511,7 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
 
         class FakeRuntimeRevisionService:
             async def resolve_current_revision(self, *, metadata=None, mark_ready=True, strict=True):
+                _ = (mark_ready, strict)
                 return RuntimeRevision(
                     id="runtime-rev-2",
                     fingerprint="fp-2",
@@ -849,6 +1612,7 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_queue_start_replaces_outdated_execution_when_cancellation_enabled(self):
         class FakeRuntimeRevisionService:
             async def resolve_current_revision(self, *, metadata=None, mark_ready=True, strict=True):
+                _ = (mark_ready, strict)
                 return RuntimeRevision(
                     id="runtime-rev-2",
                     fingerprint="fp-2",
@@ -859,6 +1623,7 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             async def invalidate_superseded_revisions(self, active_revision_id: str, *, reason: str = "superseded"):
+                _ = active_revision_id
                 return []
 
         class FakeRuntimeContainerManager:
@@ -985,6 +1750,7 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_workflow_revision_replacement_cancels_active_container_and_queues_replacement(self):
         class FakeRuntimeRevisionService:
             async def resolve_current_revision(self, *, metadata=None, mark_ready=True, strict=True):
+                _ = (mark_ready, strict)
                 return RuntimeRevision(
                     id="runtime-rev-workflow",
                     fingerprint="fp-workflow",
@@ -995,6 +1761,7 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             async def invalidate_superseded_revisions(self, active_revision_id: str, *, reason: str = "superseded"):
+                _ = active_revision_id
                 return []
 
         class FakeRuntimeContainerManager:
@@ -1067,7 +1834,21 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
         old_execution.container_name = "agency-execution-container-old"
         old_execution.container_image = "agency-runtime:old"
         old_execution.container_status = "running"
+        old_execution.output_payload = {
+            "node_outputs": {"node-old": {"partial": "value"}},
+            "checkpoint": {"current_node_id": "node-next"},
+        }
         await self.context.execution_store.update_execution(old_execution)
+        await self.context.execution_store.save_artifact(
+            ExecutionArtifact(
+                id="artifact-workflow-replacement",
+                execution_id=old_execution.id,
+                artifact_type="json",
+                name="partial-result.json",
+                content_json={"partial": True},
+                mime_type="application/json",
+            )
+        )
 
         manager = FakeRuntimeContainerManager()
         self.context.control_plane.execution_isolation_enabled = True
@@ -1096,9 +1877,21 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(existing.status.value, "cancelled")
         self.assertEqual(existing.restart_reason, "workflow_revision_superseded")
         self.assertEqual(existing.container_status, "removed")
+        self.assertEqual(existing.output_payload["node_outputs"]["node-old"], {"partial": "value"})
+        existing_artifacts = await self.context.execution_store.list_artifacts(existing.id)
+        self.assertEqual([artifact.id for artifact in existing_artifacts], ["artifact-workflow-replacement"])
+        preservation = existing.metadata["partial_result_preservation"]
+        self.assertEqual(preservation["reason"], "workflow_revision_superseded")
+        self.assertEqual(preservation["artifact_count"], 1)
+        self.assertEqual(preservation["artifacts"][0]["artifact_id"], "artifact-workflow-replacement")
+        self.assertEqual(preservation["node_output_ids"], ["node-old"])
+        self.assertEqual(replacement.metadata["source_partial_result_preservation"], preservation)
         self.assertEqual(manager.stopped, ["container-old"])
         self.assertEqual(manager.removed, [("container-old", True)])
-        self.assertIn("container.replaced", [event.event_type.value for event in old_events])
+        container_replaced = [
+            event for event in old_events if event.event_type.value == "container.replaced"
+        ][0]
+        self.assertEqual(container_replaced.payload["partial_result_preservation"], preservation)
 
 
 class ExecutionControlPlaneStreamingTests(unittest.TestCase):
@@ -1124,7 +1917,7 @@ class ExecutionControlPlaneStreamingTests(unittest.TestCase):
         )
 
     def test_event_replay_endpoint(self):
-        execution = self.context.execution_store._executions.setdefault(  # noqa: SLF001
+        self.context.execution_store._executions.setdefault(  # noqa: SLF001
             "execution-stream",
             self.context.execution_store._executions.get("execution-stream")
             or Execution(
@@ -1145,6 +1938,367 @@ class ExecutionControlPlaneStreamingTests(unittest.TestCase):
         response = self.client.get("/executions/execution-stream/events?after_sequence=1")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.json()["items"]), 1)
+
+    def test_event_replay_endpoint_filters_event_types(self):
+        self.context.execution_store._executions["execution-stream"] = Execution(  # noqa: SLF001
+            id="execution-stream",
+            workflow_id="workflow-x",
+            runtime_adapter_id="native",
+            status="completed",
+            input_payload={},
+        )
+        self.context.execution_store._events["execution-stream"] = [  # noqa: SLF001
+            ExecutionEvent(
+                execution_id="execution-stream",
+                event_type=ExecutionEventType.EXECUTION_CREATED,
+                sequence=1,
+            ),
+            ExecutionEvent(
+                execution_id="execution-stream",
+                event_type=ExecutionEventType.TOKEN_BUDGET_WARNING,
+                sequence=2,
+            ),
+            ExecutionEvent(
+                execution_id="execution-stream",
+                event_type=ExecutionEventType.CONTEXT_COMPACTION_COMPLETED,
+                sequence=3,
+            ),
+        ]
+
+        response = self.client.get(
+            "/executions/execution-stream/events"
+            "?event_type=token.budget.warning"
+            "&event_type=context.compaction.completed"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(
+            [item["event_type"] for item in body["items"]],
+            ["token.budget.warning", "context.compaction.completed"],
+        )
+        self.assertEqual(
+            body["filters"]["event_types"],
+            ["context.compaction.completed", "token.budget.warning"],
+        )
+
+    def test_event_replay_endpoint_filters_comma_separated_event_types_after_sequence(self):
+        self.context.execution_store._executions["execution-stream"] = Execution(  # noqa: SLF001
+            id="execution-stream",
+            workflow_id="workflow-x",
+            runtime_adapter_id="native",
+            status="completed",
+            input_payload={},
+        )
+        self.context.execution_store._events["execution-stream"] = [  # noqa: SLF001
+            ExecutionEvent(
+                execution_id="execution-stream",
+                event_type=ExecutionEventType.TOKEN_BUDGET_WARNING,
+                sequence=1,
+            ),
+            ExecutionEvent(
+                execution_id="execution-stream",
+                event_type=ExecutionEventType.TOKEN_BUDGET_EXCEEDED,
+                sequence=2,
+            ),
+            ExecutionEvent(
+                execution_id="execution-stream",
+                event_type=ExecutionEventType.CONTEXT_HEALTH_RECORDED,
+                sequence=3,
+            ),
+        ]
+
+        response = self.client.get(
+            "/executions/execution-stream/events"
+            "?after_sequence=1"
+            "&event_types=token.budget.warning,context.health.recorded"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [item["event_type"] for item in response.json()["items"]],
+            ["context.health.recorded"],
+        )
+
+    def test_event_replay_endpoint_rejects_unknown_event_type_filter(self):
+        self.context.execution_store._executions["execution-stream"] = Execution(  # noqa: SLF001
+            id="execution-stream",
+            workflow_id="workflow-x",
+            runtime_adapter_id="native",
+            status="completed",
+            input_payload={},
+        )
+
+        response = self.client.get("/executions/execution-stream/events?event_type=not.real")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Unsupported execution event type filter", response.json()["detail"])
+
+    def test_usage_endpoint_returns_runtime_governance_snapshot(self):
+        self.context.execution_store._executions["execution-usage"] = Execution(  # noqa: SLF001
+            id="execution-usage",
+            workflow_id="workflow-x",
+            runtime_adapter_id="native",
+            status="completed",
+            input_payload={},
+            metadata={
+                "runtime_governance": {
+                    "token_usage": {
+                        "total": {
+                            "prompt_tokens": 20,
+                            "completion_tokens": 5,
+                            "total_tokens": 25,
+                            "estimated_cost": 0.0001,
+                            "currency": "USD",
+                        },
+                        "by_agent": {"agent-1": {"total_tokens": 25}},
+                        "by_task": {"task-1": {"total_tokens": 25}},
+                        "by_model": {"fake:fake-model": {"total_tokens": 25}},
+                        "processed_event_ids": ["internal-event-id"],
+                        "updated_at": "2026-05-25T06:00:00Z",
+                    },
+                    "budget_warnings_emitted": {
+                        "run:25:warning": {
+                            "scope": "run",
+                            "used_tokens": 25,
+                            "budget_tokens": 30,
+                            "status": "warning",
+                            "emitted_at": "2026-05-25T06:00:01Z",
+                        }
+                    },
+                }
+            },
+        )
+
+        response = self.client.get("/executions/execution-usage/usage")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["execution_id"], "execution-usage")
+        self.assertEqual(payload["token_usage"]["total"]["total_tokens"], 25)
+        self.assertNotIn("processed_event_ids", payload["token_usage"])
+        self.assertEqual(payload["budget_warnings"][0]["status"], "warning")
+
+    def test_usage_endpoint_falls_back_to_token_usage_events(self):
+        self.context.execution_store._executions["execution-usage-events"] = Execution(  # noqa: SLF001
+            id="execution-usage-events",
+            workflow_id="workflow-x",
+            runtime_adapter_id="native",
+            status="completed",
+            input_payload={},
+            metadata={},
+        )
+        asyncio.run(
+            self.context.execution_store.save_event(
+                ExecutionEvent(
+                    execution_id="execution-usage-events",
+                    workflow_id="workflow-x",
+                    agent_id="agent-1",
+                    task_id="task-1",
+                    model_request_id="request-1",
+                    event_type=ExecutionEventType.TOKEN_USAGE_RECORDED,
+                    payload={
+                        "usage": {
+                            "provider": "fake",
+                            "model": "fake-model",
+                            "prompt_tokens": 20,
+                            "completion_tokens": 5,
+                            "total_tokens": 25,
+                            "estimated_cost": 0.0001,
+                            "currency": "USD",
+                        }
+                    },
+                )
+            )
+        )
+
+        response = self.client.get("/executions/execution-usage-events/usage")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["source"], "execution.events")
+        self.assertEqual(payload["token_usage"]["total"]["total_tokens"], 25)
+        self.assertEqual(payload["token_usage"]["by_agent"]["agent-1"]["prompt_tokens"], 20)
+        self.assertEqual(payload["token_usage"]["by_task"]["task-1"]["completion_tokens"], 5)
+        self.assertEqual(payload["token_usage"]["by_model"]["fake:fake-model"]["total_tokens"], 25)
+        self.assertEqual(payload["token_usage"]["last_model_request_id"], "request-1")
+
+    def test_context_usage_endpoint_returns_health_and_compaction(self):
+        self.context.execution_store._executions["execution-context"] = Execution(  # noqa: SLF001
+            id="execution-context",
+            workflow_id="workflow-x",
+            runtime_adapter_id="native",
+            status="completed",
+            input_payload={},
+            metadata={
+                "runtime_governance": {
+                    "context_health": {
+                        "last": {
+                            "status": "critical",
+                            "estimated_total_context_tokens": 9000,
+                            "context_window": 10000,
+                            "usage_ratio": 0.9,
+                            "updated_at": "2026-05-25T06:00:00Z",
+                        }
+                    },
+                    "context_compaction": {
+                        "last": {
+                            "compacted": True,
+                            "reason": "context_health_threshold",
+                            "memory_id": "memory-compact",
+                            "estimated_tokens_saved": 1200,
+                            "metadata": {
+                                "protected_context_retained": True,
+                                "protected_message_count": 3,
+                                "protected_message_roles": ["system", "user", "tool"],
+                                "protected_message_reasons": {
+                                    "0": "system_message",
+                                    "1": "user_message",
+                                    "3": "pending_human_decision",
+                                },
+                            },
+                            "updated_at": "2026-05-25T06:00:01Z",
+                        },
+                        "records": [
+                            {
+                                "compacted": True,
+                                "reason": "context_health_threshold",
+                                "memory_id": "memory-compact",
+                                "estimated_tokens_saved": 1200,
+                                "metadata": {
+                                    "protected_context_retained": True,
+                                    "protected_message_count": 3,
+                                    "protected_message_roles": ["system", "user", "tool"],
+                                    "protected_message_reasons": {
+                                        "0": "system_message",
+                                        "1": "user_message",
+                                        "3": "pending_human_decision",
+                                    },
+                                },
+                                "updated_at": "2026-05-25T06:00:01Z",
+                            }
+                        ],
+                        "count": 1,
+                        "compacted_count": 1,
+                    },
+                }
+            },
+        )
+
+        response = self.client.get("/executions/execution-context/context-usage")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["latest_context_health"]["status"], "critical")
+        self.assertTrue(payload["latest_compaction"]["compacted"])
+        self.assertEqual(payload["compaction_records"][0]["memory_id"], "memory-compact")
+        self.assertTrue(payload["protected_context"]["retained"])
+        self.assertEqual(payload["protected_context"]["protected_message_count"], 3)
+        self.assertEqual(payload["protected_context"]["protected_message_roles"], ["system", "user", "tool"])
+        self.assertEqual(payload["protected_context"]["protected_message_reasons"]["3"], "pending_human_decision")
+
+    def test_context_usage_endpoint_falls_back_to_governance_events(self):
+        self.context.execution_store._executions["execution-context-events"] = Execution(  # noqa: SLF001
+            id="execution-context-events",
+            workflow_id="workflow-x",
+            runtime_adapter_id="native",
+            status="completed",
+            input_payload={},
+            metadata={},
+        )
+        asyncio.run(
+            self.context.execution_store.save_event(
+                ExecutionEvent(
+                    execution_id="execution-context-events",
+                    workflow_id="workflow-x",
+                    agent_id="agent-1",
+                    task_id="task-1",
+                    event_type=ExecutionEventType.CONTEXT_HEALTH_RECORDED,
+                    payload={
+                        "status": "warning",
+                        "estimated_total_context_tokens": 7500,
+                        "context_window": 10000,
+                        "usage_ratio": 0.75,
+                    },
+                )
+            )
+        )
+        asyncio.run(
+            self.context.execution_store.save_event(
+                ExecutionEvent(
+                    execution_id="execution-context-events",
+                    workflow_id="workflow-x",
+                    agent_id="agent-1",
+                    task_id="task-1",
+                    event_type=ExecutionEventType.CONTEXT_COMPACTION_COMPLETED,
+                    payload={
+                        "record": {
+                            "compacted": True,
+                            "reason": "context_health_threshold",
+                            "estimated_tokens_saved": 1200,
+                        }
+                    },
+                )
+            )
+        )
+
+        response = self.client.get("/executions/execution-context-events/context-usage")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["source"], "execution.events")
+        self.assertEqual(payload["latest_context_health"]["status"], "warning")
+        self.assertEqual(payload["latest_context_health"]["event_id"], payload["context_health"]["last"]["event_id"])
+        self.assertTrue(payload["latest_compaction"]["compacted"])
+        self.assertEqual(payload["context_compaction"]["count"], 1)
+        self.assertEqual(payload["context_compaction"]["estimated_tokens_saved"], 1200)
+        self.assertEqual(payload["compaction_records"][0]["reason"], "context_health_threshold")
+
+    def test_approval_requests_endpoint(self):
+        self.context.execution_store._executions["execution-approval"] = Execution(  # noqa: SLF001
+            id="execution-approval",
+            workflow_id="workflow-x",
+            runtime_adapter_id="native",
+            status="completed",
+            input_payload={},
+        )
+        request_id = asyncio.run(
+            self.context.execution_store.create_approval_request(
+                execution_id="execution-approval",
+                event_id="event-approval-requested",
+                tool_id="tool-approval",
+                status="pending",
+                payload={
+                    "arguments": {"text": "approve me"},
+                    "approval_metadata": {"risk_labels": ["low_risk"]},
+                },
+            )
+        )
+        asyncio.run(
+            self.context.execution_store.update_approval_request(
+                request_id,
+                status="approved",
+                response_payload={
+                    "granted": True,
+                    "reason": "Delegated approval",
+                    "metadata": {"mode": "delegated", "delegate": "main_agent"},
+                },
+                responded_by="main_agent",
+            )
+        )
+
+        response = self.client.get("/executions/execution-approval/approvals")
+
+        self.assertEqual(response.status_code, 200)
+        items = response.json()["items"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["id"], request_id)
+        self.assertEqual(items[0]["event_id"], "event-approval-requested")
+        self.assertEqual(items[0]["tool_id"], "tool-approval")
+        self.assertEqual(items[0]["status"], "approved")
+        self.assertEqual(items[0]["responded_by"], "main_agent")
+        self.assertEqual(items[0]["request_payload"]["approval_metadata"]["risk_labels"], ["low_risk"])
+        self.assertEqual(items[0]["response_payload"]["metadata"]["delegate"], "main_agent")
 
     def test_streaming_endpoint(self):
         self.context.execution_store._executions["execution-stream"] = Execution(  # noqa: SLF001

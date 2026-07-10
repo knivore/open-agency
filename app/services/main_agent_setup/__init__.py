@@ -1,5 +1,11 @@
+"""Main-agent setup package.
+
+The package root is the stable import surface for scripts and startup code;
+the concrete implementation lives in `service.py` so setup internals can stay
+grouped without leaking the file layout to callers.
+"""
+
 from .service import (
-    MainAgentBootstrapConfig,
     MainAgentModelProfileRequiredError,
     MainAgentSetupConfig,
     MainAgentSetupError,
@@ -9,7 +15,6 @@ from .service import (
 )
 
 __all__ = [
-    "MainAgentBootstrapConfig",
     "MainAgentModelProfileRequiredError",
     "MainAgentSetupConfig",
     "MainAgentSetupError",

@@ -1,3 +1,5 @@
+"""Domain contracts for conversations, messages, channels, and approvals."""
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -25,6 +27,8 @@ class ConversationChannelType(str, Enum):
     TELEGRAM = "telegram"
     DISCORD = "discord"
     WHATSAPP = "whatsapp"
+    MICROSOFT_TEAMS = "microsoft-teams"
+    SLACK = "slack"
     OTHER = "other"
 
 

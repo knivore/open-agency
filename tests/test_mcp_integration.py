@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
+import tempfile
 import unittest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pathlib import Path
+from unittest.mock import patch
 
 from app.api.context import create_test_api_context
 from app.api.main import create_app
@@ -15,6 +18,8 @@ from app.domain import AgentDefinition, MCPServerDefinition, MCPTransportType, M
     UserDefinition, WorkflowDefinition, WorkflowNodeDefinition
 from app.llm.base import ModelResponse, ModelToolCall
 from app.protocols.mcp.computer_use_adapter import adapt_computer_use_arguments, normalize_computer_use_response
+from app.protocols.mcp.client import build_mcp_process_environment, resolve_mcp_command
+from app.protocols.mcp.registry import MCPClientRegistry, MCPRegistryError
 from app.protocols.mcp.schemas import MCPToolDescriptor
 from app.protocols.mcp.tool_adapter import mcp_tool_to_definition
 
@@ -63,7 +68,6 @@ class MCPModelClient:
 class MCPIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.context = create_test_api_context()
-        self.context.mcp_registry.allowlisted_commands.add(Path(sys.executable).name)
         self.server_definition = MCPServerDefinition(
             id="mcp-mock",
             name="Mock MCP",
@@ -82,6 +86,40 @@ class MCPIntegrationTests(unittest.TestCase):
 
     def test_discovery_syncs_tools_resources_and_prompts(self):
         asyncio.run(self._assert_discovery_syncs_tools_resources_and_prompts())
+
+    def test_user_added_stdio_server_authorizes_its_saved_command(self):
+        registry = MCPClientRegistry()
+        definition = MCPServerDefinition(
+            id="mcp-user-added",
+            name="User Added MCP",
+            transport=MCPTransportType.STDIO,
+            command=sys.executable,
+            args=[str(Path(__file__).with_name("mock_mcp_server.py"))],
+            enabled=True,
+        )
+
+        registry.register(definition)
+        discovered = registry.discover("mcp-user-added")
+
+        self.assertEqual(definition.allowlisted_command, Path(sys.executable).name)
+        self.assertTrue(discovered["mcp-user-added"].tools)
+
+    def test_server_record_rejects_mismatched_allowlisted_command(self):
+        registry = MCPClientRegistry()
+        definition = MCPServerDefinition(
+            id="mcp-mismatch",
+            name="Mismatched MCP",
+            transport=MCPTransportType.STDIO,
+            command=sys.executable,
+            args=[str(Path(__file__).with_name("mock_mcp_server.py"))],
+            enabled=True,
+            allowlisted_command="different-command",
+        )
+
+        registry.register(definition)
+
+        with self.assertRaisesRegex(MCPRegistryError, "does not match command"):
+            registry.discover("mcp-mismatch")
 
     async def _assert_discovery_syncs_tools_resources_and_prompts(self):
         sync = await self.context.sync_mcp_catalog(server_id="mcp-mock")
@@ -110,10 +148,78 @@ class MCPIntegrationTests(unittest.TestCase):
         self.assertEqual(macos_server.command, "uvx")
         self.assertEqual(macos_server.args, ["macos-mcp"])
         self.assertEqual(macos_server.metadata["platform"], "macos")
+        self.assertEqual(macos_server.allowlisted_command, "uvx")
         self.assertEqual(windows_server.command, "uvx")
         self.assertEqual(windows_server.args, ["windows-mcp"])
         self.assertEqual(windows_server.metadata["platform"], "windows")
-        self.assertIn("uvx", self.context.mcp_registry.allowlisted_commands)
+        self.assertEqual(windows_server.allowlisted_command, "uvx")
+
+    def test_builtin_firecrawl_server_seed_uses_env_ref_and_npx(self):
+        with patch.dict(os.environ, {"FIRECRAWL_API_KEY": "fc-test"}, clear=False):
+            seeded = asyncio.run(self.context.ensure_builtin_research_mcp_server_seed_data())
+
+        server = seeded[self.context.FIRECRAWL_MCP_SERVER_ID]
+        self.assertTrue(server.enabled)
+        self.assertEqual(server.command, "npx")
+        self.assertEqual(server.args, ["-y", "firecrawl-mcp"])
+        self.assertEqual(server.allowlisted_command, "npx")
+        self.assertEqual(server.env_refs[0].ref, "env://FIRECRAWL_API_KEY")
+        self.assertEqual(server.env_refs[0].key, "FIRECRAWL_API_KEY")
+
+    def test_builtin_context7_server_seed_uses_npx_and_optional_env_ref(self):
+        with patch.dict(os.environ, {"CONTEXT7_API_KEY": "ctx7-test"}, clear=False):
+            seeded = asyncio.run(self.context.ensure_builtin_research_mcp_server_seed_data())
+
+        server = seeded[self.context.CONTEXT7_MCP_SERVER_ID]
+        self.assertTrue(server.enabled)
+        self.assertEqual(server.command, "npx")
+        self.assertEqual(server.args, ["-y", "@upstash/context7-mcp"])
+        self.assertEqual(server.allowlisted_command, "npx")
+        self.assertEqual(server.env_refs[0].ref, "env://CONTEXT7_API_KEY")
+        self.assertEqual(server.env_refs[0].key, "CONTEXT7_API_KEY")
+
+    def test_builtin_context7_can_run_without_api_key_when_explicitly_enabled(self):
+        with patch.dict(os.environ, {"CONTEXT7_MCP_ENABLED": "true"}, clear=False):
+            os.environ.pop("CONTEXT7_API_KEY", None)
+            seeded = asyncio.run(self.context.ensure_builtin_research_mcp_server_seed_data())
+
+        server = seeded[self.context.CONTEXT7_MCP_SERVER_ID]
+        self.assertTrue(server.enabled)
+        self.assertEqual(server.env_refs, [])
+
+    def test_stdio_mcp_env_refs_resolve_into_process_env_without_parent_path(self):
+        server = MCPServerDefinition(
+            id="mcp-env",
+            name="Env MCP",
+            transport=MCPTransportType.STDIO,
+            command="npx",
+            env_refs=[
+                {
+                    "ref": "env://FIRECRAWL_API_KEY",
+                    "key": "FIRECRAWL_API_KEY",
+                    "source": "env",
+                }
+            ],
+            enabled=True,
+            allowlisted_command="npx",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            npx_path = Path(temp_dir) / "npx"
+            npx_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            npx_path.chmod(0o755)
+            with patch.dict(
+                    os.environ,
+                    {"FIRECRAWL_API_KEY": "fc-secret", "PATH": "/usr/bin", "MCP_SERVER_EXTRA_PATHS": temp_dir},
+                    clear=True,
+            ):
+                env = build_mcp_process_environment(server)
+                resolved_command = resolve_mcp_command("npx", env)
+
+        self.assertEqual(env["FIRECRAWL_API_KEY"], "fc-secret")
+        self.assertEqual(env["PATH"].split(os.pathsep)[0], temp_dir)
+        self.assertIn("/opt/homebrew/bin", env["PATH"].split(os.pathsep))
+        self.assertEqual(resolved_command, str(npx_path))
 
     async def _seed_builtin_computer_use_servers(self) -> tuple[
         dict[str, MCPServerDefinition], dict[str, MCPServerDefinition]]:
@@ -340,7 +446,7 @@ class MCPIntegrationTests(unittest.TestCase):
         asyncio.run(self._assert_workflow_can_execute_mcp_tool_with_redacted_approval_logs())
 
     async def _assert_workflow_can_execute_mcp_tool_with_redacted_approval_logs(self):
-        sync = await self.context.sync_mcp_catalog(server_id="mcp-mock")
+        await self.context.sync_mcp_catalog(server_id="mcp-mock")
         risky_tool = await self.context.tool_repo.get("mcp:mcp-mock:shell_access")
         profile = ModelProfileDefinition(
             id="profile-mcp",
@@ -413,7 +519,6 @@ class MCPIntegrationTests(unittest.TestCase):
 class MCPCatalogApiTests(unittest.TestCase):
     def setUp(self):
         self.context = create_test_api_context()
-        self.context.mcp_registry.allowlisted_commands.add(Path(sys.executable).name)
         asyncio.run(
             self.context.user_repo.create(
                 UserDefinition(id="user-mcp-catalog", email="mcp-catalog@example.com", display_name="MCP Catalog User")
@@ -440,11 +545,11 @@ class MCPCatalogApiTests(unittest.TestCase):
             "url": None,
             "env_refs": [],
             "enabled": True,
-            "allowlisted_command": Path(sys.executable).name,
             "metadata": {},
         }
         create = self.client.post("/mcp-servers", json=payload)
         self.assertEqual(create.status_code, 200)
+        self.assertEqual(create.json()["allowlisted_command"], Path(sys.executable).name)
 
         discover = self.client.post("/mcp-servers/discover", json={"serverId": "mcp-mock"})
         self.assertEqual(discover.status_code, 200)

@@ -1,8 +1,9 @@
 """Export and import local Docker Compose Postgres database snapshots.
 
-The snapshots are intended for small personal/dev databases that need to move
-between machines through git. They can contain application secrets, credentials,
-tokens, and user data, so only commit them to a private repository.
+The snapshots are intended for small personal/dev databases that need to stay
+local or move between machines through a trusted private channel. They can
+contain application secrets, credentials, tokens, and user data, so they should
+not be committed as raw repository artifacts.
 """
 
 from __future__ import annotations
@@ -170,8 +171,10 @@ def ensure_database_exists(target: DatabaseTarget) -> None:
             target.user,
             "-d",
             "postgres",
+            "-v",
+            f"target_database={target.database}",
             "-tAc",
-            f"SELECT 1 FROM pg_database WHERE datname = '{target.database}'",
+            "SELECT 1 FROM pg_database WHERE datname = :'target_database'",
         ],
         capture=True,
     )
@@ -220,7 +223,7 @@ def import_database(target: DatabaseTarget, *, dump_file: Path | None, yes: bool
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Export/import local Docker Compose Postgres snapshots for git-based machine sync."
+        description="Export/import local Docker Compose Postgres snapshots for local recovery or private transfer."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -234,7 +237,7 @@ def build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument(
         "--git-add",
         action="store_true",
-        help="Stage the exported snapshot and manifest with git after a successful export.",
+        help="Stage the exported snapshot and manifest with git after a successful export; use only for sanitized fixtures.",
     )
 
     import_parser = subparsers.add_parser("import", help="Import one or more databases from database_exports/")

@@ -50,7 +50,8 @@ class GoogleModelClient:
                         )
                 else:
                     # Token expired and no refresh token
-                    raise RuntimeError("Google OAuth token expired. Please re-authorize via 'POST /model-providers/{id}/authorize'")
+                    raise RuntimeError(
+                        "Google OAuth token expired. Please re-authorize via 'POST /model-providers/{id}/authorize'")
 
     def _ensure_api_key(self) -> str:
         if self.access_token:

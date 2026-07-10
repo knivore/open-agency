@@ -1,3 +1,4 @@
-from .registry import MCPClientRegistry, MCPRegistryError
+"""MCP protocol package.
 
-__all__ = ["MCPClientRegistry", "MCPRegistryError"]
+Import registry types from `app.protocols.mcp.registry`.
+"""

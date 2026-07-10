@@ -3,13 +3,13 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from app.runtime.streaming import (
+from app.runtime.streaming.runtime_event_models import (
     RuntimeEventActor,
     RuntimeEventLevel,
-    RuntimeEventPublisher,
     RuntimeEventType,
     RuntimeStreamEvent,
 )
+from app.runtime.streaming.runtime_event_publisher import RuntimeEventPublisher
 
 
 def publish_tool_runtime_event(
@@ -36,11 +36,11 @@ def publish_tool_runtime_event(
 
 
 def _runtime_event_type(lifecycle_type: str, verdict: str | None) -> RuntimeEventType:
-    if lifecycle_type == "tool.run.started":
+    if lifecycle_type == "tool.run.started" or lifecycle_type.endswith(".started"):
         return RuntimeEventType.TOOL_STARTED
-    if lifecycle_type == "tool.policy.completed":
+    if lifecycle_type == "tool.policy.completed" or lifecycle_type.endswith(".completed"):
         return RuntimeEventType.TOOL_COMPLETED
-    if verdict == "deny":
+    if verdict == "deny" or lifecycle_type.endswith(".denied") or lifecycle_type.endswith(".failed"):
         return RuntimeEventType.TOOL_FAILED
     return RuntimeEventType.TOOL_COMPLETED
 
@@ -60,6 +60,16 @@ def _runtime_event_message(lifecycle_type: str, tool_name: str, verdict: str | N
         return f"{tool_name} run started"
     if lifecycle_type == "tool.policy.completed":
         return f"{tool_name} policy completed with verdict {verdict}"
+    if lifecycle_type == "onecli.http.request.started":
+        return f"{tool_name} OneCLI HTTP request started"
+    if lifecycle_type == "onecli.http.request.completed":
+        return f"{tool_name} OneCLI HTTP request completed"
+    if lifecycle_type == "onecli.http.request.denied":
+        return f"{tool_name} OneCLI HTTP request denied"
+    if lifecycle_type == "onecli.http.request.rate_limited":
+        return f"{tool_name} OneCLI HTTP request rate-limited"
+    if lifecycle_type == "onecli.http.request.failed":
+        return f"{tool_name} OneCLI HTTP request failed"
     return f"{tool_name} run completed with verdict {verdict}"
 
 

@@ -1,7 +1,10 @@
+"""Memory repository implementations for in-memory and SQL-backed storage."""
+
 from __future__ import annotations
 
-from datetime import date, datetime
-from sqlalchemy import delete, or_, select, text
+from datetime import date
+from sqlalchemy import cast, delete, or_, select, text
+from sqlalchemy.dialects.postgresql import JSONB
 from typing import Any
 
 from app.db.models import MemoryRecordORM
@@ -27,7 +30,8 @@ class InMemoryMemoryRepository(InMemoryCatalogRepository[MemoryRecord]):
             workflow_id: str | None = None,
             agent_id: str | None = None,
             source: str | None = None,
-            memory_kinds: list[str] | None = None,
+            memory_types: list[str] | None = None,
+            tags: list[str] | None = None,
             statuses: list[str] | None = None,
             source_conversation_id: str | None = None,
             source_execution_id: str | None = None,
@@ -53,7 +57,9 @@ class InMemoryMemoryRepository(InMemoryCatalogRepository[MemoryRecord]):
                 continue
             if source is not None and item.source != source:
                 continue
-            if memory_kinds and (item.memory_kind.value if item.memory_kind is not None else None) not in memory_kinds:
+            if memory_types and (item.memory_type.value if item.memory_type is not None else None) not in memory_types:
+                continue
+            if tags and not all(tag in item.tags for tag in tags):
                 continue
             if statuses and item.status.value not in statuses:
                 continue
@@ -97,7 +103,7 @@ class SQLMemoryRepository:
                 "workflow_id": orm.workflow_id,
                 "agent_id": orm.agent_id,
                 "source": orm.source,
-                "memory_kind": orm.memory_kind,
+                "memory_type": orm.memory_type,
                 "status": orm.status,
                 "importance": orm.importance,
                 "summary_date": orm.summary_date,
@@ -132,7 +138,7 @@ class SQLMemoryRepository:
             workflow_id=item.workflow_id,
             agent_id=item.agent_id,
             source=item.source,
-            memory_kind=item.memory_kind.value if item.memory_kind is not None else None,
+            memory_type=item.memory_type.value if item.memory_type is not None else None,
             status=item.status.value,
             importance=item.importance,
             summary_date=item.summary_date,
@@ -180,7 +186,7 @@ class SQLMemoryRepository:
                         "workflow_id",
                         "agent_id",
                         "source",
-                        "memory_kind",
+                        "memory_type",
                         "status",
                         "importance",
                         "summary_date",
@@ -239,7 +245,8 @@ class SQLMemoryRepository:
             workflow_id: str | None = None,
             agent_id: str | None = None,
             source: str | None = None,
-            memory_kinds: list[str] | None = None,
+            memory_types: list[str] | None = None,
+            tags: list[str] | None = None,
             statuses: list[str] | None = None,
             source_conversation_id: str | None = None,
             source_execution_id: str | None = None,
@@ -249,6 +256,8 @@ class SQLMemoryRepository:
             limit: int = 20,
     ) -> list[MemoryRecord]:
         async with self.session_factory() as session:
+            bind = session.get_bind()
+            filter_tags_in_python = bool(tags)
             stmt = select(MemoryRecordORM)
             if scopes:
                 stmt = stmt.where(MemoryRecordORM.scope.in_(scopes))
@@ -264,8 +273,11 @@ class SQLMemoryRepository:
                 stmt = stmt.where(MemoryRecordORM.agent_id == agent_id)
             if source is not None:
                 stmt = stmt.where(MemoryRecordORM.source == source)
-            if memory_kinds:
-                stmt = stmt.where(MemoryRecordORM.memory_kind.in_(memory_kinds))
+            if memory_types:
+                stmt = stmt.where(MemoryRecordORM.memory_type.in_(memory_types))
+            if tags and bind is not None and bind.dialect.name == "postgresql":
+                stmt = stmt.where(cast(MemoryRecordORM.tags_json, JSONB).contains(tags))
+                filter_tags_in_python = False
             if statuses:
                 stmt = stmt.where(MemoryRecordORM.status.in_(statuses))
             if source_conversation_id is not None:
@@ -279,9 +291,15 @@ class SQLMemoryRepository:
             if text and text.strip():
                 pattern = f"%{text.strip()}%"
                 stmt = stmt.where(or_(MemoryRecordORM.content.ilike(pattern), MemoryRecordORM.summary.ilike(pattern)))
-            stmt = stmt.order_by(MemoryRecordORM.updated_at.desc(), MemoryRecordORM.id.desc()).limit(max(limit, 0))
+            stmt = stmt.order_by(MemoryRecordORM.updated_at.desc(), MemoryRecordORM.id.desc())
+            if not filter_tags_in_python:
+                stmt = stmt.limit(max(limit, 0))
             result = await session.execute(stmt)
-            return [self._to_domain(item) for item in result.scalars().all()]
+            records = [self._to_domain(item) for item in result.scalars().all()]
+            if filter_tags_in_python and tags:
+                records = [item for item in records if all(tag in item.tags for tag in tags)]
+                records = records[:max(limit, 0)]
+            return records
 
     async def query_by_embedding(
             self,
@@ -294,7 +312,8 @@ class SQLMemoryRepository:
             workflow_id: str | None = None,
             agent_id: str | None = None,
             source: str | None = None,
-            memory_kinds: list[str] | None = None,
+            memory_types: list[str] | None = None,
+            tags: list[str] | None = None,
             statuses: list[str] | None = None,
             source_conversation_id: str | None = None,
             source_execution_id: str | None = None,
@@ -322,8 +341,10 @@ class SQLMemoryRepository:
                 stmt = stmt.where(MemoryRecordORM.agent_id == agent_id)
             if source is not None:
                 stmt = stmt.where(MemoryRecordORM.source == source)
-            if memory_kinds:
-                stmt = stmt.where(MemoryRecordORM.memory_kind.in_(memory_kinds))
+            if memory_types:
+                stmt = stmt.where(MemoryRecordORM.memory_type.in_(memory_types))
+            if tags:
+                stmt = stmt.where(cast(MemoryRecordORM.tags_json, JSONB).contains(tags))
             if statuses:
                 stmt = stmt.where(MemoryRecordORM.status.in_(statuses))
             if source_conversation_id is not None:

@@ -1,3 +1,5 @@
+"""Domain contracts for authenticated users."""
+
 from __future__ import annotations
 
 from enum import Enum

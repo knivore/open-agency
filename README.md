@@ -1,675 +1,386 @@
-# agency
+# Open Agency
 
-`agency` is the backend for an app-centric agentic workflow platform. It exposes APIs for defining agents, tools,
-workflows, schedules, runtime adapters, model providers, and executions, then runs those executions through a native
-runtime with compatibility support for framework adapters.
+Open-source control plane for operating real agent systems.
 
-The canonical architecture now lives under `app/`, with Postgres, SQLAlchemy, and Alembic as the primary persistence
-stack.
+Open Agency gives teams the backend layer agents need after the prototype: workflows, memory, tools, approvals, observability, channels, and local-first setup in one system.
 
-## Project Purpose
+`Multi-agent orchestration · Memory · Tools · Approvals · Local + Cloud Models · MCP + A2A · Open Source`
 
-This backend provides:
+## Opening Hook
 
-- catalog APIs for agents, tools, workflows, model providers, model profiles, runtime adapters, MCP servers, and A2A
-  agents
-- execution APIs for starting, observing, approving, and inspecting workflow runs
-- schedule-driven execution and execution event persistence
-- adapter-based runtime integration for native execution and CrewAI compatibility
-- a security model for tool execution, approval, sandboxing, and protocol boundaries
+Most agent projects start with a model call and a few tools. Then the real work begins: execution state, retries, memory, approvals, audit history, chat channels, model routing, credentials, and safe side effects.
 
-Tool definitions use a split identity contract:
+That glue code becomes the product. Frameworks help you build demos quickly, but they usually stop before the operational layer: who can run what, what happened, what changed, what needs approval, and how the system recovers.
 
-- `id` is the stable persistence and routing identity, for example `agency.memory.delete`
-- `name` is the callable-safe agent/runtime name, for example `delete_memory`
-- `display_name` is the human label for UI surfaces, for example `Delete Memory`
+Open Agency exists for that gap. It is the backend for agents that need to behave like production software: inspectable, governable, durable, and usable from a browser, API, CLI, or chat channel.
 
-Agents, model payloads, CLI discovery, and runtime execution should use callable `name` values. Frontend surfaces should
-render `display_name` and avoid exposing raw implementation details unless they are in an explicit developer/debug view.
+## Visual Architecture
 
-## Architecture Overview
+```text
+                     Browser UI / CLI / API / Chat Channels
+                                Discord / Telegram / Slack
+                                      |
+                                      v
++--------------------------------------------------------------------------------+
+|                                 Open Agency                                    |
+|                                                                                |
+|  +-------------------+    +-------------------+    +------------------------+  |
+|  | Setup + Admin     |    | Conversations     |    | Workflows + Runtime    |  |
+|  | Local onboarding  |--->| Main agent entry  |--->| Events / approvals     |  |
+|  +-------------------+    +-------------------+    +------------------------+  |
+|            |                        |                           |              |
+|            v                        v                           v              |
+|  +-------------------+    +-------------------+    +------------------------+  |
+|  | Model Profiles    |    | Memory + Docs     |    | Tools / MCP / A2A      |  |
+|  | Local + cloud LLM |    | Personas + graph  |    | Safe side effects      |  |
+|  +-------------------+    +-------------------+    +------------------------+  |
+|                                                                                |
++--------------------------------------+-----------------------------------------+
+                                       |
+                                       v
+             Postgres · Redis · Docker Workers · LLM Providers · Integrations
+```
 
-The backend is structured around these layers:
+## What It Does
 
-- `app/api`: FastAPI app factory, routes, dependency wiring, and API schemas
-- `app/domain`: canonical Pydantic models independent of any execution framework
-- `app/db`: SQLAlchemy base, async session management, ORM models, and repositories
-- `app/services`: thin service layer used by routes and orchestration code
-- `app/runtime`: native runtime, execution control plane, and framework adapters
-- `app/tools`: tool definitions, registry, validation, executors, and implementations
-- `app/llm`: model provider and profile resolution
-- `app/scheduler`: schedule loading, trigger calculation, and queued workflow execution
-- `app/protocols`: MCP and A2A integration boundaries
-- `app/observability`: execution timeline and telemetry aggregation
+### Launch a usable agent backend quickly
 
-Core reference docs:
+- Start the stack with one launcher command.
+- Open first-run users into `/setup` instead of developer internals.
+- Create a local admin, connect an LLM, and finish main-agent setup through a guided flow.
 
+### Run agents with operational control
+
+- Start, observe, approve, cancel, and inspect workflow executions.
+- Persist runtime events, artifacts, status, approvals, and failure state.
+- Keep schedules and recurring work inside the same control plane.
+
+### Give agents durable context
+
+- Store memory records, documents, summaries, personas, and shared workflow recall.
+- Preserve context beyond a single prompt or chat turn.
+- Project graph-backed context for debugging, lineage, and agent handoff.
+
+### Keep tools and side effects governed
+
+- Register tools with identities, schemas, permissions, and approval policies.
+- Support Open Agency-native tools plus MCP and A2A integration boundaries.
+- Use Docker-backed runtime isolation where stronger execution boundaries are needed.
+
+### Reach users through multiple surfaces
+
+- Power browser, API, and CLI flows from the same backend.
+- Reuse the same conversation/runtime engine across chat adapters.
+- Keep Discord, Telegram, WhatsApp, Slack, and Teams as adapters rather than separate products.
+
+## Why It Exists
+
+**The hard part of agent systems is not text generation. It is operations.**
+
+Open Agency is built around a few design principles:
+
+- The backend is the product boundary. Agents, tools, workflows, memory, models, and schedules should be governed through stable APIs.
+- Runtime behavior must be inspectable. Every execution should have events, artifacts, status, and audit history.
+- Tools need contracts. Side effects should be typed, discoverable, permission, and approval-aware.
+- Memory should survive the prompt. Durable recall cannot live only in transient context windows.
+- Integrations should stay open. Local models, cloud models, MCP servers, A2A agents, and custom tools should fit the same system.
+
+## Quick Start
+
+This repository is the Open Agency backend. Its companion frontend is
+[`open-agency-fe`](https://github.com/knivore/open-agency-fe), expected as a sibling checkout by
+the local launchers. The `AGENCY_*` environment variables, `x-agency-*` headers, and `./agency`
+CLI name are retained as stable protocol and command identifiers.
+
+### Mac
+
+```bash
+git clone https://github.com/knivore/open-agency.git
+cd open-agency
+bash install/install-mac.sh
+```
+
+Then follow the browser setup flow:
+
+```text
+/setup -> create local admin -> connect model -> finish main agent
+```
+
+### Windows
+
+Run from PowerShell:
+
+```powershell
+git clone https://github.com/knivore/open-agency.git
+cd open-agency
+powershell -ExecutionPolicy Bypass -File .\install\install-windows.ps1
+```
+
+Then follow the browser setup flow:
+
+```text
+/setup -> create local admin -> connect model -> finish main agent
+```
+
+### Linux / WSL
+
+```bash
+git clone https://github.com/knivore/open-agency.git
+cd open-agency
+bash install/install-linux.sh
+```
+
+For WSL, install Docker Desktop for Windows first and enable WSL integration for your Linux distro.
+
+### Existing Checkout
+
+If you already have the repo:
+
+```bash
+./agency start
+```
+
+Start later on Mac or Linux:
+
+```bash
+cd ~/OpenAgency/open-agency
+./agency start
+```
+
+Start later on Windows:
+
+```powershell
+cd $HOME\OpenAgency\open-agency
+.\run-windows.cmd start
+```
+
+Useful commands:
+
+```bash
+./agency doctor
+./agency bootstrap
+./agency start
+./agency logs
+./agency stop
+./agency status
+```
+
+Prerequisites:
+
+- Docker Desktop or Docker Engine
+- Python 3.12+
+- Node.js/npm when running the sibling `open-agency-fe` frontend locally
+
+Installer options:
+
+```bash
+bash install/install-mac.sh --no-start
+bash install/install-linux.sh --backend-only
+bash install/install-mac.sh --ngrok
+bash install/install-linux.sh --cloudflare
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install\install-windows.ps1 -NoStart
+powershell -ExecutionPolicy Bypass -File .\install\install-windows.ps1 -BackendOnly
+powershell -ExecutionPolicy Bypass -File .\install\install-windows.ps1 -TunnelProvider ngrok
+```
+
+Tunnel behavior:
+
+- First launch tries a public tunnel by default.
+- Use `-local` when you want local-only startup.
+- Use `--domain agency.example.com` with `-ngrok` or `-cloudflare` when you already own a reserved provider hostname.
+- The setup UI can save local-only, ngrok, Cloudflare, or automatic mode.
+- A browser-saved tunnel preference becomes the default on later launches.
+- Custom domains can be stored for ngrok or Cloudflare-managed tunnel setups.
+
+## Example Usage
+
+Start Open Agency:
+
+```bash
+./agency start
+```
+
+Complete onboarding in the browser. On first run, the launcher points you to `/setup`; after setup, it points you to the main product surface.
+
+Inspect the backend directly:
+
+```bash
+curl http://localhost:8000/health
+curl http://localhost:8000/conversations/main-agent-profile | jq
+curl http://localhost:8000/tools | jq
+```
+
+At that point you have:
+
+- a database-backed main agent
+- durable memory infrastructure
+- governed tool access
+- runtime execution APIs
+- setup-managed model configuration
+- a backend reusable from an app, CLI, or chat adapter
+
+## Key Features
+
+### Simple Installer
+
+Get from a clean machine to a running local system without hand-wiring the stack.
+
+The Mac, Windows, and Linux installers clone the project, check prerequisites, bootstrap dependencies, run health checks, and hand off to the same launcher/onboarding flow.
+
+### Browser Onboarding
+
+Turn first-run setup into a guided product flow.
+
+The `/setup` surface handles local admin creation, model profile setup, main-agent bootstrap, recommended supporting agents, and tunnel preference management.
+
+### Native Runtime
+
+Run agents and workflows with lifecycle control.
+
+Open Agency records events, artifacts, approvals, failures, and status so operators can see what happened instead of guessing from logs.
+
+### Durable Memory
+
+Give agents context that survives a prompt.
+
+Memory records, document ingestion, summaries, graph context, and workflow shared memory let agents build continuity over time.
+
+### Governed Tools
+
+Make side effects safe enough to operate.
+
+Tools have stable identities, schemas, permissions, labels, and approval policies, with support for generated tools and runtime execution boundaries.
+
+### Multi-Channel Conversations
+
+Use one agent backend across many user surfaces.
+
+Chat adapters can connect to the same conversation, memory, approval, and runtime systems instead of creating separate bot backends.
+
+### Persona Factory
+
+Turn source material into reusable agent expertise.
+
+Personas package knowledge, style, guardrails, and provenance, then publish into runtime agents through a governed review flow.
+
+### Open Integration Boundaries
+
+Connect Open Agency to the broader agent ecosystem.
+
+MCP and A2A support let Open Agency expose and consume capabilities without giving up its own runtime controls.
+
+## How It Works
+
+Open Agency is organized into four layers:
+
+1. API and catalog
+   FastAPI routes manage agents, tools, workflows, schedules, model profiles, memory, and executions.
+
+2. Runtime and orchestration
+   The native runtime executes workflows, enforces policy, records events, manages approvals, and coordinates workers.
+
+3. Knowledge and identity
+   Memory, documents, graph projection, and personas provide durable context for agents and operators.
+
+4. Integration boundary
+   Model providers, channel adapters, MCP servers, A2A endpoints, optional modules, and generated tools connect to one backend.
+
+Core backend areas:
+
+- `app/api`
+- `app/domain`
+- `app/db`
+- `app/services`
+- `app/runtime`
+- `app/tools`
+- `app/protocols`
+- `app/observability`
+
+Related frontend:
+
+- `open-agency-fe` is the sibling Next.js UI used for onboarding, workflows, conversations, integrations, and optional-module surfaces.
+
+## Comparison
+
+| Approach              | Good for            | Where it breaks                                                | Why Open Agency is different                            |
+|-----------------------|---------------------|----------------------------------------------------------------|---------------------------------------------------------|
+| Agent framework       | Fast prototypes     | Ops, memory, approvals, audit, and channels become custom glue | Open Agency starts at the backend layer the demo skips  |
+| Internal glue stack   | Full control        | Expensive to standardize and hard to maintain                  | Open Agency gives the shared control plane upfront      |
+| Bot-specific backend  | One chat surface    | Logic gets copied across every channel                         | Open Agency keeps channels as adapters over one runtime |
+| Workflow automation   | Deterministic jobs  | Weak agent identity, memory, and planning semantics            | Open Agency is designed for agentic execution           |
+| Hosted agent platform | Managed convenience | Less control over runtime, memory, tools, and local data       | Open Agency is open and local-first                     |
+
+## Real Use Cases
+
+- Build an internal main agent that can answer questions, use tools, request approvals, and remember project state.
+- Run recurring agent workflows with durable history, artifacts, and operator visibility.
+- Add a Discord or Telegram assistant backed by the same runtime your app uses.
+- Give workflow agents shared project memory instead of forcing every run to start cold.
+- Publish source-backed personas for support, research, operations, or domain-specific assistants.
+- Expose Open Agency-managed capabilities through MCP or A2A for interoperability.
+- Connect optional capability packs while keeping orchestration behind one backend contract.
+
+## Roadmap
+
+- Clean-machine installer validation across macOS, Windows, Linux, and WSL.
+- Signed and versioned release distribution with update and rollback behavior.
+- Richer setup UX for model routing, supporting agents, and optional integrations.
+- Deeper graph-backed runtime context and debugging flows.
+- Stronger generated-tool packaging and discovery.
+- Expanded persona review, governance, and publishing loops.
+- Continued hardening of multi-channel operations and observability.
+
+## Contributing
+
+Open Agency is a long-lived backend. Contributions should preserve clear module boundaries and avoid parallel systems.
+
+Start here:
+
+```bash
+./agency bootstrap
+make test
+make check-architecture
+make check-tool-registry
+```
+
+Guidelines:
+
+- Keep route handlers thin and move behavior into services.
+- Treat `app/domain` contracts as canonical.
+- Keep add-on feature work behind optional module specs instead of hardcoding pack-specific routes, tools, or settings into core.
+- Document non-obvious orchestration, approval, retry, adapter, or guardrail logic close to the code.
+- Open an issue first for larger changes or feature proposals.
+
+If you use Open Agency as a foundation for your own product, deployment, fork, or internal platform, please retain attribution
+to the original project and consider opening pull requests for fixes, hardening work, documentation improvements, or
+general-purpose features that could help the upstream project.
+
+Contributor docs:
+
+- [Contributing](./CONTRIBUTING.md)
+- [Code of Conduct](./CODE_OF_CONDUCT.md)
+- [Security Policy](./SECURITY.md)
 - [Architecture](./docs/architecture.md)
-- [Database](./docs/database.md)
-- [Frontend API](./docs/frontend-api.md)
-- [Main Agent](./docs/main-agent.md)
-- [Model Profiles](./docs/model-profiles.md)
-- [Runtime](./docs/runtime.md)
-- [Runtime Adapters](./docs/runtime-adapters.md)
-- [Computer Use](./docs/computer-use.md)
-- [MCP Integration](./docs/mcp-integration.md)
-- [A2A Integration](./docs/a2a-integration.md)
-- [Tools](./docs/tools.md)
-- [Voice and Transcription](./docs/voice.md)
-- [Tool Contracts](./docs/tool-contracts.md)
-- [Coding Agent](./docs/coding-agent.md)
-- [Evaluation Agent](./docs/evaluation-agent.md)
 - [Development](./docs/development.md)
 - [Testing](./docs/testing.md)
+- [Runtime](./docs/runtime.md)
+- [Tools](./docs/tools.md)
+- [Memory](./docs/memory.md)
+- [Persona Factory](./docs/persona-factory.md)
+- [Platform Runbook](./docs/runbook.md)
 
-Documentation state:
+## Author and Attribution
 
-- the active source of truth is `README.md` plus the current developer docs under `docs/`
-- keep future docs focused on setup, architecture, API contracts, runtime behavior, persistence, tools/integrations, and
-  testing
+Open Agency was created by Keh Chin Leong (KEH) and is maintained with contributions from the Open Agency community.
 
-## Computer Use MCP Backends
+When redistributing or building on this repository, please credit the original Open Agency project and preserve applicable
+copyright, license, and attribution notices.
 
-Built-in Computer Use MCP backend seeding, environment overrides, and operational requirements are documented
-in [docs/computer-use.md](./docs/computer-use.md).
+## License
 
-## Local Setup
+Licensed under the [Apache License 2.0](./LICENSE).
 
-Create a local environment on macOS/Linux:
-
-```bash
-pyenv install 3.12.13
-pyenv local 3.12.13
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python -m playwright install
-cp .env.example .env
-```
-
-Create a local environment on Windows with PowerShell:
-
-```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-python -m playwright install
-Copy-Item .env.example .env
-```
-
-If PowerShell blocks virtual environment activation, allow local scripts for the current user, then activate again:
-
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-.\.venv\Scripts\Activate.ps1
-```
-
-If the `py -3.12` launcher cannot find Python 3.12, install Python 3.12 from
-[python.org](https://www.python.org/downloads/windows/) or with `winget`:
-
-```powershell
-winget install Python.Python.3.12
-```
-
-The requirements file skips Unix-only or unused native packages on Windows, including `uvloop`, `chromadb`,
-`chroma-hnswlib`, and `xattr`. Durable memory uses the Postgres/pgvector stack documented below.
-
-If Playwright browser installation fails with `unable to verify the first certificate`, your network is probably
-intercepting TLS certificates. Prefer configuring Node with your organization's root CA:
-
-```powershell
-$env:NODE_EXTRA_CA_CERTS = "C:\path\to\your-company-root-ca.pem"
-python -m playwright install
-Remove-Item Env:NODE_EXTRA_CA_CERTS
-```
-
-For a one-time local browser download only, you can bypass Node TLS verification temporarily:
-
-```powershell
-$env:NODE_TLS_REJECT_UNAUTHORIZED = "0"
-python -m playwright install
-Remove-Item Env:NODE_TLS_REJECT_UNAUTHORIZED
-```
-
-Recommended minimum `.env` values:
-
-```env
-APP_ENV=development
-DATABASE_URL=postgresql://postgres:postgres@localhost:5432/agency
-DATABASE_ECHO=false
-DATABASE_POOL_SIZE=5
-DATABASE_MAX_OVERFLOW=10
-INTEGRATIONS_RUNTIME_ENABLED=false
-EXECUTION_ISOLATION_ENABLED=false
-WORKFLOW_SCHEDULER_ENABLED=true
-WORKFLOW_SCHEDULER_INTERVAL_SECONDS=30
-WORKFLOW_RESTART_ACTIVE_EXECUTIONS_ON_REVISION_CHANGE=false
-RUNTIME_RECONCILER_ENABLED=false
-RUNTIME_RECONCILER_INTERVAL_SECONDS=30
-RUNTIME_IMAGE_RETENTION_COUNT=10
-RUNTIME_CONTAINER_TTL_SECONDS=86400
-REDIS_HOST=localhost
-REDIS_PORT=6379
-ENVIRONMENT=local
-LOCAL_STORAGE_PATH=local_storage
-```
-
-Some compatibility flows still use additional environment variables for Redis, object storage, CrewAI, and
-provider-specific credentials. Those are optional unless you are exercising those integrations.
-
-## Start The Repo
-
-The normal local loop is:
-
-```bash
-make start
-```
-
-That is a shortcut for:
-
-```bash
-./run.sh start
-```
-
-This starts Postgres, Redis, and supporting containers, writes `../agency-fe/.env.local` LAN proxy settings, builds the
-backend image for isolated workers, runs Alembic migrations, runs agent setup, starts the FastAPI backend on the host,
-and starts the frontend on `0.0.0.0`.
-
-Use these one-shot commands for the common lifecycle:
-
-```bash
-make start
-make stop
-make status
-```
-
-Equivalent script commands:
-
-```bash
-./run.sh start
-./run.sh stop
-./run.sh status
-```
-
-`make start` creates or updates the main agent, Coder, Embedding, and Evaluation agents as part of startup.
-
-The Makefile is a convenience layer for common repo tasks. The launch scripts remain the source of truth for starting
-and stopping the local stack.
-
-Windows users should run the Bash launcher from Git Bash or WSL, not plain PowerShell:
-
-```bash
-./run-windows.sh start
-./run-windows.sh stop
-./run-windows.sh status
-```
-
-From PowerShell or Command Prompt, use the wrapper:
-
-```bat
-.\run-windows.cmd start
-.\run-windows.cmd stop
-.\run-windows.cmd status
-```
-
-If you only want dependencies in Docker and a manually started host backend:
-
-```bash
-docker compose up -d postgres redis
-make migrate
-make dev
-```
-
-Useful Makefile commands:
-
-```bash
-make start
-make stop
-make status
-make setup-agents
-make migrate
-make test
-make eval
-```
-
-## Runtime Behavior
-
-Workflow schedules are driven by Agency's internal scheduler runner, not by OS cron. Set
-`WORKFLOW_SCHEDULER_ENABLED=true` on the backend process that should fire due schedules. On startup, that process starts
-a background loop that calls the scheduler every `WORKFLOW_SCHEDULER_INTERVAL_SECONDS` seconds, creates executions for
-due schedules, and queues those executions through the runtime control plane. In multi-replica deployments, enable this
-on only one process unless the deployment is using the database-backed schedule fire claims table. The claim table
-enforces one winner per `(schedule_id, scheduled_fire_at)` so multiple scheduler runners cannot create duplicate
-executions for the same scheduled fire time.
-
-Scheduled workflows are modeled as recurring execution requests, not as a single permanently running container. Each
-scheduled fire creates an execution tagged with `execution_lifecycle.run_mode=scheduled`; manual/API runs are tagged as
-`one_time`. By default, both modes persist final execution state, output, events, and artifacts to the Agency database,
-then remove the finished worker container after reconciliation. Future always-on workflows can opt out through workflow
-metadata `execution_lifecycle.terminate_container_on_completion=false`.
-
-Workflow revision replacement is opt-in. By default, publishing a new workflow revision affects future executions only;
-already-running executions continue with the workflow definition they started with. Set
-`WORKFLOW_RESTART_ACTIVE_EXECUTIONS_ON_REVISION_CHANGE=true`, or pass `restart_active_executions: true` when publishing,
-to create replacement executions with the same input payload and cancel/remove active containers for the superseded
-revision.
-
-Runtime-isolation-specific settings:
-
-- `EXECUTION_RUNTIME_DATABASE_URL`
-  Use this when the worker container must connect to a different runtime-visible database address than the host process.
-  This is mainly useful for local SQLite-backed Docker tests or unusual mount-based runtime setups.
-- `EXECUTION_CONTAINER_EXTRA_MOUNTS`
-  JSON list of extra mounts passed to isolated worker containers. Example:
-
-```json
-[
-  {
-    "source": "/host/path",
-    "target": "/runtime/path",
-    "read_only": false
-  }
-]
-```
-
-## Database Snapshot
-
-Start the local backend dependencies:
-
-```bash
-docker compose up -d postgres redis
-```
-
-Export the local app database into a git-trackable snapshot:
-
-```bash
-python scripts/db_snapshot.py export --database agency
-git add database_exports/agency.dump database_exports/agency.json
-```
-
-After pulling the repository on Windows, import that snapshot into the local Docker Postgres service:
-
-```powershell
-docker compose up -d postgres
-py scripts\db_snapshot.py import --database agency --yes
-```
-
-Only commit database snapshots to a private repository; they can include credentials, tokens, memory records, and local
-conversation data.
-
-## Runtime Modes
-
-Use `make start` for day-to-day work. The underlying host-backend mode runs the main FastAPI/Codex process on the host
-and keeps Postgres, Redis, and isolated execution workers in Docker. Workflow/tool execution remains isolated through
-Docker workers by default with:
-
-```env
-AGENCY_BACKEND_RUN_MODE=host
-INTEGRATIONS_RUNTIME_ENABLED=true
-EXECUTION_ISOLATION_ENABLED=true
-EXECUTION_RUNTIME_DATABASE_URL=postgresql://postgres:postgres@postgres:5432/agency
-EXECUTION_CONTAINER_NETWORK=agency_default
-CODEX_CLI_CWD=/path/to/agency
-EXECUTION_CODEX_CLI_CWD=/app
-```
-
-Use `CODEX_CLI_CWD` for the host-side main-agent Codex working directory. Use `EXECUTION_CODEX_CLI_CWD` for worker
-containers; it should stay container-visible, usually `/app`.
-
-The local backend runs on the host and isolated execution workers use the built backend image. Normal backend code
-changes are picked up by Uvicorn reload.
-
-On Windows, run `./run-windows.sh start` from Git Bash or WSL.
-
-## LAN Access
-
-For mobile/LAN access, run the start command from this backend repo. It writes the frontend proxy settings into
-`../agency-fe/.env.local` and starts the frontend on `0.0.0.0`:
-
-```bash
-./run.sh start
-```
-
-On Windows Git Bash:
-
-```bash
-./run-windows.sh start
-```
-
-Then open the printed frontend URL on your phone, for example `http://192.168.68.62:3000`. If automatic LAN IP detection
-chooses the wrong adapter, provide it explicitly:
-
-```bash
-LAN_HOST=192.168.68.62 ./run.sh start
-```
-
-The script writes `../agency-fe/.env.local` with backend proxy and local development settings.
-
-If the sibling frontend checkout is not writable, the Windows script keeps the backend running and prints a warning.
-Set `AGENCY_REQUIRE_FRONTEND=true` when you want startup to fail unless the frontend also launches successfully.
-
-Stop the LAN frontend and backend stack with the same script:
-
-```bash
-./run.sh stop
-```
-
-Check whether the backend, frontend port, and generated frontend LAN environment are healthy:
-
-```bash
-./run.sh status
-```
-
-On Windows Git Bash, use `./run-windows.sh stop` and `./run-windows.sh status`.
-
-## Maintenance Commands
-
-Rebuild the Docker backend after dependency, Dockerfile, or Compose changes:
-
-```bash
-docker compose up --build --force-recreate backend
-```
-
-Then, if the backend does not automatically migrate cleanly, run:
-
-```bash
-docker compose exec backend python -m alembic upgrade head
-```
-
-Or:
-
-```bash
-docker compose down -v
-make start
-```
-
-Apply migrations:
-
-```bash
-make migrate
-```
-
-Windows PowerShell equivalent:
-
-```powershell
-.\.venv\Scripts\python.exe -m alembic upgrade head
-```
-
-Equivalent Alembic commands:
-
-```bash
-./.venv/bin/python -m alembic upgrade head
-./.venv/bin/python -m alembic current
-./.venv/bin/python -m alembic downgrade -1
-```
-
-Windows PowerShell equivalents:
-
-```powershell
-.\.venv\Scripts\python.exe -m alembic upgrade head
-.\.venv\Scripts\python.exe -m alembic current
-.\.venv\Scripts\python.exe -m alembic downgrade -1
-```
-
-Database details, schema, and repository guidance are documented in [docs/database.md](./docs/database.md).
-
-## First-Run Main-Agent Setup
-
-First-run main-agent bootstrap, runtime resolution, and operator commands are documented
-in [docs/main-agent.md](./docs/main-agent.md).
-
-Quick commands:
-
-```bash
-make setup-agents
-make sync-main-agent-prompt
-make check-main-agent
-make eval
-```
-
-`make setup-agents` is the normal first-run path. It provisions the main agent plus the Coder, Embedding, and Evaluation
-agents. The evaluation agent is a read-only semantic judge for eval runs. It should use a distinct model profile from
-the main, Coder, and Embedding agents, and its setup is documented in
-[docs/evaluation-agent.md](./docs/evaluation-agent.md).
-The default deterministic eval suite runs with `make eval`; CI-safe case definitions live under `evals/cases`.
-
-## Main Agent Conversations
-
-The backend-native conversation surface, LLM-first architecture, and model-auth recovery contract are documented in
-[docs/main-agent.md](./docs/main-agent.md).
-Native workflow agents can also share durable memory through the same `memory_records` table. Enable shared memory with
-workflow metadata such as `{"shared_memory": {"enabled": true}}` or by setting an agent's `memory.enabled=true` with a
-non-`execution` scope. Prefer `workflow` scope for memory shared by agents in one workflow and `workspace` scope for
-cross-workflow project memory. Operators can use `GET`/`PATCH /workflows/{workflow_id}/shared-memory` for this without
-submitting a full workflow update.
-Document uploads can be ingested through `POST /documents/ingest`; the backend stores the source file, extracts text,
-chunks it into `archive` memory records, embeds the chunks, and retrieves them later through the pgvector-backed memory
-search path.
-
-Canonical routes:
-
-- `POST /conversations`
-- `GET /conversations`
-- `PATCH /conversations/main-agent-profile`
-- `GET /conversations/{conversation_id}`
-- `PATCH /conversations/{conversation_id}`
-- `GET /conversations/{conversation_id}/messages`
-- `POST /conversations/{conversation_id}/messages`
-- `GET /conversations/{conversation_id}/stream`
-- `GET /conversations/main-agent-profile`
-
-Plain user text is planned by the configured main-agent LLM first. The backend exposes policy-visible tools and
-workflows to that model, then validates tool calls and approval-gated side effects. Explicit structured payloads from
-the UI, such as `content.execution_request` or `content.workflow_update_proposal`, may still execute through deterministic
-service paths because they are already app commands.
-
-If the configured model needs re-authentication, conversation APIs should return `200 OK` with an assistant message and
-`assistant_message.metadata.model_auth`, not a generic 500. Frontends should render a re-auth action when
-`model_auth.reauthorization_required` is true and call the provided `model_auth.auth_endpoint`.
-
-## Running The Backend
-
-Start the FastAPI backend:
-
-```bash
-make dev
-```
-
-Equivalent command:
-
-```bash
-SSL_CERT_FILE=certs/local_cloudflare.cert ./.venv/bin/python -m uvicorn app:app --reload
-```
-
-Windows PowerShell equivalent:
-
-```powershell
-$env:SSL_CERT_FILE = "certs/local_cloudflare.cert"
-.\.venv\Scripts\python.exe -m uvicorn app:app --reload
-```
-
-If you are running the backend directly on Windows instead of inside Docker, start Postgres and Redis first:
-
-```powershell
-docker compose up -d postgres redis
-.\.venv\Scripts\python.exe -m alembic upgrade head
-$env:SSL_CERT_FILE = "certs/local_cloudflare.cert"
-.\.venv\Scripts\python.exe -m uvicorn app:app --reload
-```
-
-Once the server is running, you can use the built-in API docs directly without the frontend:
-
-- Swagger UI: `http://localhost:8000/docs`
-- ReDoc: `http://localhost:8000/redoc`
-- OpenAPI schema: `http://localhost:8000/openapi.json`
-
-Swagger UI is the easiest way to exercise endpoints manually because it lets you inspect request and response schemas
-and send requests from the browser.
-
-The canonical app factory is `app.api.main:create_app()`. The root [app.py](./app.py) file is intentionally a thin
-entrypoint.
-
-Container definitions are grouped under:
-
-- [docker/backend/Dockerfile](./docker/backend/Dockerfile)
-- [docker/postgres/Dockerfile](./docker/postgres/Dockerfile)
-- [docker/postgres/initdb/001-extensions.sql](./docker/postgres/initdb/001-extensions.sql)
-- [docker/redis/Dockerfile](./docker/redis/Dockerfile)
-- [docker/redis/redis.conf](./docker/redis/redis.conf)
-- [docker/langfuse/README.md](./docker/langfuse/README.md)
-
-The Agency Postgres image includes pgvector. Durable memory embeddings are persisted to
-`memory_records.embedding_vector` for long-term semantic retrieval; `embedding_json` remains available as a fallback and
-compatibility copy.
-
-The local compose stack also provisions a self-hosted Langfuse stack using the official upstream images:
-
-- `langfuse-web`
-- `langfuse-worker`
-- `langfuse-postgres`
-- `langfuse-redis`
-- `langfuse-clickhouse`
-- `langfuse-minio`
-
-Those services are intentionally separate from the app's own Postgres and Redis so observability infrastructure does not
-share the same database schema or cache instance as workflow execution.
-
-The backend container startup now does three things automatically:
-
-1. waits for Postgres and Redis
-2. runs `alembic upgrade head`
-3. starts `uvicorn app:app`
-
-Postgres itself still runs as a separate service in `docker-compose.yml`. That is intentional: Dockerfiles build images,
-while Compose orchestrates multiple linked services. The Postgres service now also has its own grouped image under
-`docker/postgres/`, so all containerized components live under the same `docker/` tree.
-
-Why there is an `entrypoint.sh` as well as `run.sh` / `run-windows.sh`:
-
-- [run.sh](./run.sh)
-  and [run-windows.sh](./run-windows.sh) run on the host machine.
-  Their job is to start dependencies and supporting services in Docker, run migrations and agent setup, then run the
-  FastAPI main-agent process and frontend on the host.
-- [docker/backend/entrypoint.sh](./docker/backend/entrypoint.sh) runs
-  inside the backend container. Its job is to wait for Postgres and Redis, apply Alembic migrations, and then start the
-  API.
-
-That separation is intentional. If the backend container restarts on its own, or if someone starts the service directly
-with Docker Compose instead of the host scripts, the container still needs a correct self-contained startup sequence.
-
-## Langfuse Observability Stack
-
-The full Docker Compose stack now includes self-hosted Langfuse.
-
-Useful local endpoints:
-
-- backend API: `http://localhost:8000`
-- Langfuse UI/API: `http://localhost:3001`
-- Langfuse MinIO S3 endpoint: `http://localhost:9090`
-- Langfuse MinIO console: `http://localhost:9091`
-
-The backend container is also wired with:
-
-- `LANGFUSE_HOST=http://langfuse-web:3001`
-- `LANGFUSE_PUBLIC_KEY`
-- `LANGFUSE_SECRET_KEY`
-- `OBSERVABILITY_EXPORTERS`
-
-By default the backend still uses `OBSERVABILITY_EXPORTERS=jsonl`. To include Langfuse in local exporter selection,
-update `.env` to:
-
-```env
-OBSERVABILITY_EXPORTERS=jsonl,langfuse
-```
-
-This Compose work provisions the Langfuse infrastructure and backend connectivity settings. Actual event export still
-depends on the app-side Langfuse exporter configuration and valid Langfuse project keys.
-
-## Running Tests
-
-Run the full suite:
-
-```bash
-make test
-```
-
-Windows PowerShell equivalent:
-
-```powershell
-.\.venv\Scripts\python.exe -m unittest
-```
-
-Run architecture checks:
-
-```bash
-make check-architecture
-```
-
-Windows PowerShell equivalent:
-
-```powershell
-.\.venv\Scripts\python.exe -m unittest tests.test_legacy_import_check tests.test_architecture_validation
-```
-
-Run compile and architecture validation:
-
-```bash
-make lint
-```
-
-Windows PowerShell equivalent:
-
-```powershell
-.\.venv\Scripts\python.exe -m compileall app tests
-.\.venv\Scripts\python.exe -m unittest tests.test_legacy_import_check tests.test_architecture_validation
-```
-
-Database-focused tests:
-
-```bash
-./.venv/bin/python -m unittest tests.test_database_foundation tests.test_postgres_schema tests.test_storage_migration
-```
-
-Windows PowerShell equivalent:
-
-```powershell
-.\.venv\Scripts\python.exe -m unittest tests.test_database_foundation tests.test_postgres_schema tests.test_storage_migration
-```
-
-Docker-backed isolated runtime tests:
-
-```bash
-ENABLE_DOCKER_INTEGRATION_TESTS=1 ./.venv/bin/python -m unittest tests.test_docker_worker_integration
-```
-
-Windows PowerShell equivalent:
-
-```powershell
-$env:ENABLE_DOCKER_INTEGRATION_TESTS = "1"
-.\.venv\Scripts\python.exe -m unittest tests.test_docker_worker_integration
-```
-
-## Isolated Runtime Operations
-
-The isolated execution runtime now supports:
-
-- one Docker container per execution for isolated runs
-- runtime revision tracking and replacement
-- worker-owned execution inside the container
-- immediate container-exit reconciliation
-- scheduled runtime reconciliation when `RUNTIME_RECONCILER_ENABLED=true`
-- TTL-based exited-container cleanup and retention-based managed-image cleanup
-- runtime metrics and recent runtime actions
-- execution/container log visibility through the API
-
-Operator endpoints:
-
-- `GET /executions/runtime/metrics`
-- `GET /executions/runtime/containers`
-- `GET /executions/runtime/containers/{container_id}/logs`
-- `POST /executions/runtime/reconcile`
-- `GET /executions/{execution_id}/runtime/logs`
-
-The isolated control-plane path and the direct worker-container path are both covered by
-[tests/test_docker_worker_integration.py](./tests/test_docker_worker_integration.py).
+Copyright 2026 Open Agency contributors.

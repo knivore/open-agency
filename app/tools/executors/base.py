@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from app.domain import ToolDefinition, ToolType
-from app.protocols.mcp import MCPClientRegistry
+from app.protocols.mcp.registry import MCPClientRegistry
 from app.runtime.native.approvals import ApprovalManager
 
 
@@ -12,10 +12,25 @@ from app.runtime.native.approvals import ApprovalManager
 class ToolExecutionContext:
     execution_id: str
     workflow_id: str | None = None
+    task_id: str | None = None
+    agent_id: str | None = None
+    tool_call_id: str | None = None
     runtime_registry: Any | None = None
     approval_manager: ApprovalManager | None = None
     mcp_registry: MCPClientRegistry | None = None
     execution_store: Any | None = None
+    # Connector-backed adapters use this binding to avoid ambiguous credential
+    # selection when several instances of the same provider are configured.
+    connector_binding: dict[str, Any] | None = None
+
+    def safe_metadata(self) -> dict[str, str | None]:
+        return {
+            "execution_id": self.execution_id,
+            "workflow_id": self.workflow_id,
+            "task_id": self.task_id,
+            "agent_id": self.agent_id,
+            "tool_call_id": self.tool_call_id,
+        }
 
 
 class BaseTypedToolExecutor(Protocol):

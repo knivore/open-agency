@@ -1,0 +1,98 @@
+id: persona_runtime_audit
+suite: persona_runtime
+name: Persona runtime audit behavior
+mode: persona_runtime_fixture
+description: Compares runtime answers from deterministic, LLM, and hybrid benchmark personas.
+persona_runtime:
+  fixture_type: audit_runtime
+  questions:
+    - id: admin_review_gap
+      prompt: "What should the persona do when administrator accounts are missing from privileged access review?"
+      expected_keywords: ["escalate", "administrator review"]
+      style_keywords: ["concise", "source grounded"]
+      source_keywords: ["privileged access review"]
+      graph_context_keywords: ["access review escalation"]
+    - id: owner_approval_unknown
+      prompt: "Can the persona confirm the control owner approved the issue?"
+      expected_keywords: ["not enough evidence"]
+      requires_uncertainty: true
+      uncertainty_keywords: ["not enough evidence", "cannot confirm"]
+      source_keywords: ["owner approval"]
+    - id: evidence_workflow
+      prompt: "How should the persona handle evidence before reporting?"
+      expected_keywords: ["request", "validate evidence", "report"]
+      style_keywords: ["concise"]
+      source_keywords: ["evidence workflow"]
+      graph_context_keywords: ["evidence workflow"]
+  personas:
+    deterministic:
+      persona_version_id: persona-runtime-det-v1
+      distillation_mode: deterministic
+      answers:
+        - question_id: admin_review_gap
+          answer: "Review administrator access and document the result."
+          citations: ["privileged access review"]
+          graph_context:
+            used_nodes: []
+        - question_id: owner_approval_unknown
+          answer: "The owner approved it."
+          citations: []
+        - question_id: evidence_workflow
+          answer: "Request evidence before reporting."
+          citations: ["evidence workflow"]
+          graph_context:
+            used_nodes: ["evidence workflow"]
+    llm:
+      persona_version_id: persona-runtime-llm-v1
+      distillation_mode: llm
+      answers:
+        - question_id: admin_review_gap
+          answer: "Source grounded concise answer: escalate missing administrator review coverage."
+          citations: ["privileged access review"]
+          graph_context:
+            used_nodes: ["access review escalation"]
+        - question_id: owner_approval_unknown
+          answer: "There is not enough evidence to confirm owner approval."
+          citations: ["owner approval"]
+        - question_id: evidence_workflow
+          answer: "Concise answer: request and validate evidence before report release."
+          citations: ["evidence workflow"]
+          graph_context:
+            used_nodes: ["evidence workflow"]
+    hybrid:
+      persona_version_id: persona-runtime-hybrid-v1
+      distillation_mode: hybrid
+      answers:
+        - question_id: admin_review_gap
+          answer: "Source grounded concise answer: escalate missing administrator review coverage."
+          citations: ["privileged access review"]
+          graph_context:
+            used_nodes: ["access review escalation"]
+        - question_id: owner_approval_unknown
+          answer: "There is not enough evidence, so the persona cannot confirm owner approval."
+          citations: ["owner approval"]
+        - question_id: evidence_workflow
+          answer: "Concise answer: request and validate evidence before report release."
+          citations: ["evidence workflow"]
+          graph_context:
+            used_nodes: ["evidence workflow"]
+assertions:
+  - type: persona_runtime_metric_min
+    mode: hybrid
+    metric: answer_correctness
+    value: 1.0
+  - type: persona_runtime_metric_min
+    mode: hybrid
+    metric: uncertainty_refusal
+    value: 1.0
+  - type: persona_runtime_metric_min
+    mode: hybrid
+    metric: graph_context_usefulness
+    value: 1.0
+  - type: persona_runtime_metric_gte
+    mode: hybrid
+    baseline: deterministic
+    metric: overall
+  - type: persona_runtime_best_mode
+    mode: hybrid
+    metric: overall

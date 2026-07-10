@@ -1,16 +1,20 @@
+"""Domain contracts for credentials, secret references, and model providers."""
+
 from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from pydantic import field_validator, model_validator
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
-from app.integrations import normalize_connector_provider_key, validate_connector_metadata
+from app.integrations.connectors import normalize_connector_provider_key, validate_connector_metadata
 
 
 class DomainModel(BaseModel):
+    """Base model for strict API/domain contracts with alias-friendly input."""
+
     model_config = ConfigDict(
         extra="forbid",
         populate_by_name=True,
@@ -35,6 +39,24 @@ class CredentialReference(DomainModel):
     source: Optional[str] = None
     key: Optional[str] = None
     description: Optional[str] = None
+
+
+class ConnectorBindingDefinition(DomainModel):
+    provider: str
+    credential_id: str = Field(validation_alias=AliasChoices("credential_id", "ref"),
+                               serialization_alias="credential_id")
+    purpose: Optional[str] = None
+    target_scope: Dict[str, Any] = Field(default_factory=dict)
+    identity_summary: Optional[str] = None
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def _normalize_provider(cls, value: Any) -> Any:
+        if value is None:
+            return value
+        if not isinstance(value, str):
+            return value
+        return normalize_connector_provider_key(value)
 
 
 class CredentialStatus(str, Enum):

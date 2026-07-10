@@ -5,7 +5,7 @@ from typing import Any, Optional
 
 from app.api.context import ApiContext, get_default_api_context
 from app.domain import RuntimeAdapterDefinition
-from app.services import ModelCatalogService
+from app.services.models import ModelCatalogService
 
 
 def create_runtime_adapters_router(context: Optional[ApiContext] = None) -> APIRouter:

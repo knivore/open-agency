@@ -7,7 +7,6 @@ from typing import Any, Mapping, Sequence
 from .runtime_event_models import AGENCY_RUNTIME_EVENT_SCHEMA_VERSION, RuntimeStreamEvent
 from .stream_safety import safe_runtime_event_payload, safe_runtime_events_payload
 
-
 RUNTIME_STREAM_AUTH_ENV = "AGENCY_RUNTIME_STREAM_API_KEY"
 RUNTIME_STREAM_EVENT_NAME = "runtime_event"
 RUNTIME_STREAM_CONNECTED_EVENT_NAME = "runtime_stream.connected"

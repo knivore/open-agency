@@ -1,10 +1,16 @@
+"""Isolated worker process entrypoint for Docker-backed executions.
+
+Workers bootstrap an API context from environment variables, claim one
+execution, emit heartbeats, run the selected adapter, and translate failures
+into stable worker exit codes for the reconciler.
+"""
+
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
 import traceback
-from datetime import datetime
 from typing import TYPE_CHECKING
 
 from app.core.time import utc_now
@@ -35,6 +41,7 @@ def load_worker_environment(env: dict[str, str] | None = None) -> dict[str, str]
     source = env or os.environ
     execution_id = source.get("AGENCY_EXECUTION_ID")
     workflow_id = source.get("AGENCY_WORKFLOW_ID")
+    goal_id = source.get("AGENCY_GOAL_ID") or None
     runtime_revision_id = source.get("AGENCY_RUNTIME_REVISION_ID")
     runtime_adapter_id = source.get("AGENCY_RUNTIME_ADAPTER_ID")
     if not execution_id:
@@ -48,6 +55,7 @@ def load_worker_environment(env: dict[str, str] | None = None) -> dict[str, str]
     return {
         "execution_id": execution_id,
         "workflow_id": workflow_id,
+        "goal_id": goal_id,
         "runtime_revision_id": runtime_revision_id,
         "runtime_adapter_id": runtime_adapter_id,
         "worker_id": source.get("AGENCY_WORKER_ID") or worker_id_for_execution(execution_id),
@@ -70,6 +78,7 @@ async def run_execution_worker(
         runtime_revision_id: str,
         runtime_adapter_id: str,
         worker_id: str,
+        goal_id: str | None = None,
         lock_retry_seconds: float = 5.0,
         lock_retry_interval_seconds: float = 0.2,
         heartbeat_interval_seconds: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
@@ -99,6 +108,9 @@ async def run_execution_worker(
             await _mark_worker_failure(context, execution, "Timed out acquiring execution lock inside worker")
         return WORKER_EXIT_BOOTSTRAP_FAILED
 
+    # Record an initial heartbeat as soon as the isolated worker owns the lock so
+    # stale detection can distinguish a live startup from a dead container.
+    await context.execution_store.heartbeat(execution_id, worker_id)
     stop_heartbeat = asyncio.Event()
     heartbeat_task = asyncio.create_task(
         _heartbeat_loop(
@@ -115,6 +127,18 @@ async def run_execution_worker(
             raise ExecutionNotFoundError(f"Execution '{execution_id}' was not found")
         execution.runtime_revision_id = runtime_revision_id
         execution.runtime_fingerprint = execution.runtime_fingerprint
+        worker_context = dict(execution.metadata.get("worker_context") or {})
+        worker_context.update(
+            {
+                "execution_id": execution_id,
+                "workflow_id": workflow_id,
+                "goal_id": goal_id or execution.goal_id,
+                "runtime_revision_id": runtime_revision_id,
+                "runtime_adapter_id": runtime_adapter_id,
+                "worker_id": worker_id,
+            }
+        )
+        execution.metadata["worker_context"] = worker_context
         await context.execution_store.update_execution(execution)
         execution_coro = context.runtime_registry.start_execution(execution_id)
         if execution_timeout_seconds is not None:
@@ -225,6 +249,7 @@ async def _async_main() -> int:
         context=context,
         execution_id=worker_env["execution_id"],
         workflow_id=worker_env["workflow_id"],
+        goal_id=worker_env["goal_id"],
         runtime_revision_id=worker_env["runtime_revision_id"],
         runtime_adapter_id=worker_env["runtime_adapter_id"],
         worker_id=worker_env["worker_id"],

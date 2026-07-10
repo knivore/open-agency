@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -14,8 +16,24 @@ from app.api.main import create_app
 from app.api.routes.schedules import create_schedules_router
 from app.core.config import reset_settings_cache
 from app.core.time import utc_now
-from app.domain import Execution, ExecutionStatus, UserDefinition, WorkflowDefinition
+from app.domain import Execution, ExecutionStatus, GoalDefinition, GoalStatus, UserDefinition, WorkflowDefinition
+from app.runtime.native.errors import WorkflowNotFoundError
 from app.scheduler.triggers import compute_next_fire
+
+
+@contextmanager
+def assert_logs_with_enabled_logger(test_case: unittest.TestCase, logger_name: str, level: str):
+    logger = logging.getLogger(logger_name)
+    previous_disabled = logger.disabled
+    previous_logging_disable = logging.root.manager.disable
+    logger.disabled = False
+    logging.disable(logging.NOTSET)
+    try:
+        with test_case.assertLogs(logger_name, level=level) as logs:
+            yield logs
+    finally:
+        logger.disabled = previous_disabled
+        logging.disable(previous_logging_disable)
 
 
 class SchedulerApiTests(unittest.IsolatedAsyncioTestCase):
@@ -140,6 +158,229 @@ class SchedulerApiTests(unittest.IsolatedAsyncioTestCase):
         updated = await self.context.schedule_repo.get(schedule.id)
         self.assertGreaterEqual(updated.next_fire_at, now + timedelta(seconds=55))
 
+    async def test_due_schedule_can_create_goal_for_execution(self):
+        now = utc_now()
+        schedule = await self.context.scheduler.create_schedule(
+            self.context.schedule_repo.model_cls.model_validate(
+                {
+                    "id": "schedule-goal-create",
+                    "name": "Create Scheduled Goal",
+                    "workflow_id": self.workflow.id,
+                    "trigger_type": "interval",
+                    "trigger_config": {"interval_seconds": 60},
+                    "input_template": {"topic": "daily summary"},
+                    "timezone": "UTC",
+                    "next_fire_at": (now - timedelta(seconds=1)).isoformat(),
+                    "metadata": {
+                        "goal": {
+                            "mode": "create",
+                            "objective": "Produce the daily summary",
+                            "success_criteria": [
+                                {"kind": "artifact", "description": "Daily summary artifact is attached"}
+                            ],
+                            "priority": "high",
+                            "owner_actor": "scheduler",
+                        }
+                    },
+                }
+            )
+        )
+
+        results = await self.context.scheduler.run_due_schedules()
+
+        self.assertEqual(len(results), 1)
+        goal_id = results[0].metadata["goal_id"]
+        self.assertTrue(goal_id)
+        execution = await self.context.execution_store.get_execution(results[0].execution_id)
+        self.assertIsNotNone(execution)
+        assert execution is not None
+        self.assertEqual(execution.goal_id, goal_id)
+        self.assertEqual(execution.input_payload["goal_id"], goal_id)
+        self.assertEqual(execution.trigger_payload["goal_id"], goal_id)
+        goal = await self.context.goal_repo.get(goal_id)
+        self.assertIsNotNone(goal)
+        assert goal is not None
+        self.assertEqual(goal.status, GoalStatus.ACTIVE)
+        self.assertEqual(goal.objective, "Produce the daily summary")
+        self.assertEqual(goal.priority, "high")
+        self.assertIn(execution.id, goal.execution_ids)
+        updated = await self.context.schedule_repo.get(schedule.id)
+        self.assertEqual(updated.metadata["last_goal_id"], goal_id)
+        self.assertEqual(updated.metadata["last_execution_id"], execution.id)
+
+    async def test_trigger_now_can_continue_existing_goal(self):
+        goal = await self.context.goal_repo.create(
+            GoalDefinition(
+                id="goal-scheduled-continuation",
+                objective="Keep collecting scheduled evidence",
+                status=GoalStatus.ACTIVE,
+                success_criteria=[{"kind": "artifact", "description": "Scheduled evidence exists"}],
+            )
+        )
+        schedule = await self.context.scheduler.create_schedule(
+            self.context.schedule_repo.model_cls.model_validate(
+                {
+                    "id": "schedule-goal-continue",
+                    "name": "Continue Scheduled Goal",
+                    "workflow_id": self.workflow.id,
+                    "trigger_type": "manual",
+                    "trigger_config": {},
+                    "input_template": {},
+                    "timezone": "UTC",
+                    "metadata": {"goal": {"mode": "continue", "goal_id": goal.id}},
+                }
+            )
+        )
+
+        result = await self.context.scheduler.trigger_now(schedule.id)
+
+        execution = await self.context.execution_store.get_execution(result.execution_id)
+        self.assertIsNotNone(execution)
+        assert execution is not None
+        self.assertEqual(result.metadata["goal_id"], goal.id)
+        self.assertEqual(execution.goal_id, goal.id)
+        self.assertEqual(execution.input_payload["goal_id"], goal.id)
+        updated_goal = await self.context.goal_repo.get(goal.id)
+        self.assertEqual(updated_goal.execution_ids, [execution.id])
+        self.assertEqual(len(await self.context.goal_repo.list()), 1)
+
+    async def test_event_schedule_can_create_goal_and_wake_supervisor(self):
+        wake = AsyncMock()
+        self.context.scheduler.goal_supervisor_waker = wake
+        await self.context.scheduler.create_schedule(
+            self.context.schedule_repo.model_cls.model_validate(
+                {
+                    "id": "schedule-event-goal-create",
+                    "name": "Create Goal On Event",
+                    "workflow_id": self.workflow.id,
+                    "trigger_type": "event_match",
+                    "trigger_config": {
+                        "event_type": "deployment.completed",
+                        "payload_matches": {"environment": "prod", "service.name": "api"},
+                    },
+                    "input_template": {"source": "event"},
+                    "timezone": "UTC",
+                    "metadata": {
+                        "goal": {
+                            "mode": "create",
+                            "objective": "Verify production deployment",
+                            "success_criteria": [
+                                {"kind": "artifact", "description": "Deployment verification exists"}
+                            ],
+                        },
+                        "goal_supervisor": {"wake_on_event": True},
+                    },
+                }
+            )
+        )
+        await self.context.scheduler.create_schedule(
+            self.context.schedule_repo.model_cls.model_validate(
+                {
+                    "id": "schedule-event-nonmatch",
+                    "name": "Nonmatching Event",
+                    "workflow_id": self.workflow.id,
+                    "trigger_type": "event_match",
+                    "trigger_config": {"event_type": "deployment.failed"},
+                    "input_template": {},
+                    "timezone": "UTC",
+                }
+            )
+        )
+
+        results = await self.context.scheduler.dispatch_event(
+            event_type="deployment.completed",
+            payload={"environment": "prod", "service": {"name": "api"}},
+            source="test-event",
+        )
+
+        self.assertEqual(len(results), 1)
+        goal_id = results[0].metadata["goal_id"]
+        wake.assert_awaited_once_with(goal_id)
+        execution = await self.context.execution_store.get_execution(results[0].execution_id)
+        assert execution is not None
+        self.assertEqual(execution.goal_id, goal_id)
+        self.assertEqual(execution.trigger_payload["event"]["event_type"], "deployment.completed")
+        self.assertEqual(execution.trigger_payload["event"]["payload"]["service"]["name"], "api")
+        goal = await self.context.goal_repo.get(goal_id)
+        assert goal is not None
+        self.assertEqual(goal.objective, "Verify production deployment")
+        self.assertEqual(goal.execution_ids, [execution.id])
+        metrics = self.context.runtime_operations.snapshot_dict()
+        self.assertEqual(metrics["counters"]["scheduler.event_dispatched"], 1)
+        self.assertEqual(metrics["counters"]["scheduler.goal_supervisor_woken"], 1)
+
+    async def test_event_schedule_default_wake_runs_scoped_goal_monitor(self):
+        await self.context.scheduler.create_schedule(
+            self.context.schedule_repo.model_cls.model_validate(
+                {
+                    "id": "schedule-event-default-wake",
+                    "name": "Default Wake",
+                    "workflow_id": self.workflow.id,
+                    "trigger_type": "event_match",
+                    "trigger_config": {"event_type": "deployment.ready"},
+                    "input_template": {},
+                    "timezone": "UTC",
+                    "metadata": {
+                        "goal": {
+                            "mode": "create",
+                            "objective": "Inspect deployment readiness",
+                            "success_criteria": [{"kind": "artifact", "description": "Readiness evidence exists"}],
+                        },
+                        "goal_supervisor": {"wake_on_event": True},
+                    },
+                }
+            )
+        )
+
+        results = await self.context.scheduler.dispatch_event(event_type="deployment.ready", payload={})
+
+        self.assertEqual(len(results), 1)
+        goal_id = results[0].metadata["goal_id"]
+        metrics = self.context.runtime_operations.snapshot_dict()
+        wake_actions = [
+            action for action in metrics["recent_actions"] if action["action"] == "main_agent_monitor.goal_wake"
+        ]
+        self.assertEqual(len(wake_actions), 1)
+        self.assertEqual(wake_actions[0]["goal_id"], goal_id)
+        self.assertEqual(metrics["counters"]["action.main_agent_monitor.goal_wake"], 1)
+
+    async def test_event_schedule_can_continue_existing_goal(self):
+        goal = await self.context.goal_repo.create(
+            GoalDefinition(
+                id="goal-event-continuation",
+                objective="Track deployment events",
+                status=GoalStatus.ACTIVE,
+                success_criteria=[{"kind": "artifact", "description": "Deployment event evidence exists"}],
+            )
+        )
+        await self.context.scheduler.create_schedule(
+            self.context.schedule_repo.model_cls.model_validate(
+                {
+                    "id": "schedule-event-goal-continue",
+                    "name": "Continue Goal On Event",
+                    "workflow_id": self.workflow.id,
+                    "trigger_type": "event_match",
+                    "trigger_config": {"event_types": ["deployment.completed", "deployment.verified"]},
+                    "input_template": {},
+                    "timezone": "UTC",
+                    "metadata": {"goal": {"mode": "continue", "goal_id": goal.id}},
+                }
+            )
+        )
+
+        results = await self.context.scheduler.dispatch_event(
+            event_type="deployment.verified",
+            payload={"environment": "staging"},
+        )
+
+        self.assertEqual(len(results), 1)
+        execution = await self.context.execution_store.get_execution(results[0].execution_id)
+        assert execution is not None
+        self.assertEqual(results[0].metadata["goal_id"], goal.id)
+        self.assertEqual(execution.goal_id, goal.id)
+        updated_goal = await self.context.goal_repo.get(goal.id)
+        self.assertEqual(updated_goal.execution_ids, [execution.id])
+
     async def test_schedule_fire_claim_prevents_duplicate_fire(self):
         fire_at = utc_now()
         acquired = await self.context.schedule_repo.acquire_schedule_fire_claim(
@@ -198,7 +439,7 @@ class SchedulerApiTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.context.execution_store.save_execution(active_execution)
 
-        with self.assertLogs("app.scheduler.scheduler", level="ERROR") as logs:
+        with assert_logs_with_enabled_logger(self, "app.scheduler.scheduler", level="ERROR") as logs:
             results = await self.context.scheduler.run_due_schedules()
 
         self.assertEqual(results, [])
@@ -206,6 +447,71 @@ class SchedulerApiTests(unittest.IsolatedAsyncioTestCase):
         metrics = self.context.runtime_operations.snapshot_dict()
         self.assertEqual(metrics["counters"]["scheduler.due_fire_failed"], 1)
         self.assertEqual(metrics["counters"]["scheduler.due_fire_failed.ScheduleConcurrencyError"], 1)
+
+    async def test_due_schedule_missing_workflow_is_disabled(self):
+        schedule = await self.context.scheduler.create_schedule(
+            self.context.schedule_repo.model_cls.model_validate(
+                {
+                    "id": "schedule-missing-workflow",
+                    "name": "Missing Workflow",
+                    "workflow_id": self.workflow.id,
+                    "trigger_type": "interval",
+                    "trigger_config": {"interval_seconds": 60},
+                    "input_template": {},
+                    "timezone": "UTC",
+                }
+            )
+        )
+        await self.context.workflow_repo.soft_delete(self.workflow.id)
+        await self.context.scheduler.patch_schedule(
+            schedule.id,
+            {"next_fire_at": (utc_now() - timedelta(seconds=1)).isoformat()},
+        )
+
+        with assert_logs_with_enabled_logger(self, "app.scheduler.scheduler", level="WARNING") as logs:
+            results = await self.context.scheduler.run_due_schedules()
+
+        self.assertEqual(results, [])
+        disabled = await self.context.schedule_repo.get(schedule.id)
+        self.assertIsNotNone(disabled)
+        self.assertFalse(disabled.enabled)
+        self.assertIsNone(disabled.next_fire_at)
+        self.assertTrue(any("Disabled schedule" in message for message in logs.output))
+        metrics = self.context.runtime_operations.snapshot_dict()
+        self.assertEqual(metrics["counters"]["scheduler.schedule_disabled_missing_workflow"], 1)
+        self.assertEqual(metrics["counters"]["scheduler.due_fire_missing_workflow"], 1)
+        self.assertEqual(metrics["counters"]["scheduler.due_fire_missing_workflow.WorkflowNotFoundError"], 1)
+
+    async def test_trigger_now_missing_workflow_disables_schedule(self):
+        schedule = await self.context.scheduler.create_schedule(
+            self.context.schedule_repo.model_cls.model_validate(
+                {
+                    "id": "schedule-trigger-missing-workflow",
+                    "name": "Trigger Missing Workflow",
+                    "workflow_id": self.workflow.id,
+                    "trigger_type": "manual",
+                    "trigger_config": {},
+                    "input_template": {},
+                    "timezone": "UTC",
+                    "metadata": {
+                        "goal": {
+                            "mode": "create",
+                            "objective": "Should not persist without an execution",
+                        }
+                    },
+                }
+            )
+        )
+        await self.context.workflow_repo.soft_delete(self.workflow.id)
+
+        with self.assertRaises(WorkflowNotFoundError):
+            await self.context.scheduler.trigger_now(schedule.id)
+
+        disabled = await self.context.schedule_repo.get(schedule.id)
+        self.assertIsNotNone(disabled)
+        self.assertFalse(disabled.enabled)
+        self.assertIsNone(disabled.next_fire_at)
+        self.assertEqual(await self.context.goal_repo.list(), [])
 
     async def test_enable_disable_and_due_run(self):
         schedule = await self.context.scheduler.create_schedule(
@@ -227,7 +533,7 @@ class SchedulerApiTests(unittest.IsolatedAsyncioTestCase):
         disabled = await self.context.scheduler.disable_schedule(schedule.id)
         self.assertFalse(disabled.enabled)
 
-        due = await self.context.scheduler.patch_schedule(
+        await self.context.scheduler.patch_schedule(
             schedule.id,
             {
                 "enabled": True,
@@ -274,7 +580,6 @@ class SchedulerRouteTests(unittest.TestCase):
         self.context.scheduler.execution_starter = AsyncMock()
         self.context.workflow_repo._items = {} if hasattr(self.context.workflow_repo,
                                                           "_items") else None  # noqa: SLF001
-        import asyncio
 
         asyncio.run(
             self.context.workflow_repo.create(
@@ -326,6 +631,39 @@ class SchedulerRouteTests(unittest.TestCase):
         self.assertEqual(trigger.status_code, 200)
         self.assertTrue(trigger.json()["execution_id"])
 
+    def test_schedule_event_dispatch_route(self):
+        create = self.client.post(
+            "/schedules",
+            json={
+                "id": "schedule-event-api",
+                "name": "API Event Schedule",
+                "workflow_id": "workflow-schedule",
+                "trigger_type": "event_match",
+                "trigger_config": {
+                    "event_type": "ticket.created",
+                    "payload_matches": {"priority": "high"},
+                },
+                "input_template": {},
+                "timezone": "UTC",
+            },
+        )
+        self.assertEqual(create.status_code, 200)
+
+        dispatch = self.client.post(
+            "/schedules/events/dispatch",
+            json={
+                "event_type": "ticket.created",
+                "payload": {"priority": "high", "ticket_id": "T-1"},
+                "source": "test-route",
+            },
+        )
+
+        self.assertEqual(dispatch.status_code, 200)
+        body = dispatch.json()
+        self.assertEqual(body["count"], 1)
+        self.assertTrue(body["items"][0]["execution_id"])
+        self.assertEqual(body["items"][0]["metadata"]["source"], "test-route")
+
 
 class SchedulerLifespanTests(unittest.TestCase):
     def tearDown(self) -> None:
@@ -366,7 +704,7 @@ class SchedulerLifespanTests(unittest.TestCase):
             context = create_test_api_context()
             context.scheduler.fire_claim_support_available = lambda: False
             context.scheduler.run_due_schedules = AsyncMock(return_value=[])
-            with self.assertLogs("app.api.main", level="WARNING") as logs:
+            with assert_logs_with_enabled_logger(self, "app.api.main", level="WARNING") as logs:
                 with TestClient(create_app(context=context)):
                     time.sleep(0.1)
         self.assertTrue(any("fire-claim support is unavailable" in message for message in logs.output))

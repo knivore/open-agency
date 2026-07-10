@@ -14,18 +14,39 @@
       },
       "method": {
         "type": "string",
-        "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "get", "post", "put", "patch", "delete", "head", "options"],
+        "enum": [
+          "GET",
+          "POST",
+          "PUT",
+          "PATCH",
+          "DELETE",
+          "HEAD",
+          "OPTIONS",
+          "get",
+          "post",
+          "put",
+          "patch",
+          "delete",
+          "head",
+          "options"
+        ],
         "description": "HTTP method to use."
       },
       "headers": {
-        "type": ["object", "null"],
+        "type": [
+          "object",
+          "null"
+        ],
         "additionalProperties": {
           "type": "string"
         },
         "description": "Optional HTTP headers."
       },
       "query_params": {
-        "type": ["object", "null"],
+        "type": [
+          "object",
+          "null"
+        ],
         "description": "Optional query-string parameters."
       },
       "body": {
@@ -35,9 +56,21 @@
         "type": "boolean",
         "default": true,
         "description": "Whether TLS certificates should be verified."
+      },
+      "credential_mode": {
+        "type": "string",
+        "enum": [
+          "none",
+          "onecli"
+        ],
+        "default": "none",
+        "description": "Credential handling mode. Use onecli to route through the OneCLI gateway without exposing raw credentials."
       }
     },
-    "required": ["url", "method"],
+    "required": [
+      "url",
+      "method"
+    ],
     "additionalProperties": false
   },
   "outputs": {
@@ -45,13 +78,23 @@
     "properties": {
       "verdict": {
         "type": "string",
-        "enum": ["ok", "warn", "deny"]
+        "enum": [
+          "ok",
+          "warn",
+          "deny"
+        ]
       },
       "policyVerdict": {
-        "type": ["object", "null"]
+        "type": [
+          "object",
+          "null"
+        ]
       },
       "result": {
-        "type": ["object", "null"],
+        "type": [
+          "object",
+          "null"
+        ],
         "properties": {
           "status_code": {
             "type": "integer"
@@ -67,7 +110,10 @@
         "additionalProperties": true
       },
       "patch": {
-        "type": ["string", "null"]
+        "type": [
+          "string",
+          "null"
+        ]
       },
       "filesChanged": {
         "type": "array",
@@ -88,13 +134,23 @@
         "type": "string"
       },
       "actor": {
-        "type": ["string", "null"]
+        "type": [
+          "string",
+          "null"
+        ]
       },
       "signature": {
-        "type": ["string", "null"]
+        "type": [
+          "string",
+          "null"
+        ]
       }
     },
-    "required": ["verdict", "dryRun", "timestamp"],
+    "required": [
+      "verdict",
+      "dryRun",
+      "timestamp"
+    ],
     "additionalProperties": false
   }
 }

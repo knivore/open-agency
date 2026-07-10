@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 import unittest
 
 from app.api.context import create_test_api_context
-from app.domain import AgentDefinition, ModelProfileDefinition, TaskDefinition, WorkflowDefinition, \
+from app.core.time import utc_now
+from app.domain import AgentDefinition, ExecutionStatus, ModelProfileDefinition, TaskDefinition, WorkflowDefinition, \
     WorkflowNodeDefinition
 from app.domain.models import FrameworkHints, MemorySettings
 from app.llm.base import ModelResponse
@@ -14,6 +16,7 @@ from app.runtime.worker import (
     load_worker_environment,
     run_execution_worker,
 )
+from app.services.execution_classification import classify_execution_staleness
 
 
 class _SimpleModelClient:
@@ -93,6 +96,7 @@ class RuntimeWorkerTests(unittest.IsolatedAsyncioTestCase):
             {"topic": "worker"},
             {"created_by": "tester"},
             runtime_adapter_id="native",
+            goal_id="goal-worker",
         )
         execution.runtime_revision_id = "runtime-rev-1"
         execution.runtime_fingerprint = "fp-1"
@@ -105,6 +109,7 @@ class RuntimeWorkerTests(unittest.IsolatedAsyncioTestCase):
             runtime_revision_id="runtime-rev-1",
             runtime_adapter_id="native",
             worker_id="worker-test",
+            goal_id="goal-worker",
         )
 
         current = await self.context.execution_store.get_execution(execution.id)
@@ -114,6 +119,10 @@ class RuntimeWorkerTests(unittest.IsolatedAsyncioTestCase):
         assert current is not None
         self.assertEqual(current.status.value, "completed")
         self.assertIsNone(current.worker_id)
+        self.assertEqual(current.goal_id, "goal-worker")
+        self.assertEqual(current.metadata["worker_context"]["goal_id"], "goal-worker")
+        self.assertEqual(current.metadata["worker_context"]["execution_id"], execution.id)
+        self.assertEqual(current.metadata["worker_context"]["workflow_id"], self.workflow.id)
         self.assertIn("execution.started", [event.event_type.value for event in events])
         self.assertIn("execution.completed", [event.event_type.value for event in events])
 
@@ -122,6 +131,7 @@ class RuntimeWorkerTests(unittest.IsolatedAsyncioTestCase):
             {
                 "AGENCY_EXECUTION_ID": "execution-1",
                 "AGENCY_WORKFLOW_ID": "workflow-1",
+                "AGENCY_GOAL_ID": "goal-1",
                 "AGENCY_RUNTIME_REVISION_ID": "runtime-rev-1",
                 "AGENCY_RUNTIME_ADAPTER_ID": "native",
                 "AGENCY_HEARTBEAT_INTERVAL_SECONDS": "0.5",
@@ -130,6 +140,7 @@ class RuntimeWorkerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(payload["execution_id"], "execution-1")
+        self.assertEqual(payload["goal_id"], "goal-1")
         self.assertEqual(payload["worker_id"], "container-worker-execution-1")
         self.assertEqual(payload["heartbeat_interval_seconds"], 0.5)
         self.assertEqual(payload["execution_timeout_seconds"], 30.0)
@@ -168,6 +179,115 @@ class RuntimeWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(current)
         assert current is not None
         self.assertIsNotNone(current.last_heartbeat_at)
+
+    async def test_runtime_worker_records_initial_heartbeat_before_first_interval(self):
+        execution = await self.context.runtime_registry.create_execution(
+            self.workflow.id,
+            {"topic": "initial-heartbeat"},
+            {"created_by": "tester"},
+            runtime_adapter_id="native",
+        )
+        execution.runtime_revision_id = "runtime-rev-1"
+        execution.runtime_fingerprint = "fp-1"
+        await self.context.execution_store.update_execution(execution)
+
+        exit_code = await run_execution_worker(
+            context=self.context,
+            execution_id=execution.id,
+            workflow_id=execution.workflow_id,
+            runtime_revision_id="runtime-rev-1",
+            runtime_adapter_id="native",
+            worker_id="worker-initial-heartbeat",
+            heartbeat_interval_seconds=60.0,
+        )
+
+        current = await self.context.execution_store.get_execution(execution.id)
+        self.assertEqual(exit_code, WORKER_EXIT_SUCCESS)
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertIsNotNone(current.last_heartbeat_at)
+
+    async def test_long_running_worker_heartbeat_integrates_with_stale_detection(self):
+        execution = await self.context.runtime_registry.create_execution(
+            self.workflow.id,
+            {"topic": "long-running-heartbeat"},
+            {"created_by": "tester", "run_mode": "always_on"},
+            runtime_adapter_id="native",
+        )
+        execution.runtime_revision_id = "runtime-rev-1"
+        execution.runtime_fingerprint = "fp-1"
+        execution.metadata["execution_lifecycle"]["run_mode"] = "always_on"
+        await self.context.execution_store.update_execution(execution)
+
+        finish_execution = asyncio.Event()
+
+        async def long_running_start(execution_id: str):
+            running = await self.context.execution_store.get_execution(execution_id)
+            assert running is not None
+            running.status = ExecutionStatus.RUNNING
+            running.started_at = running.started_at or utc_now()
+            await self.context.execution_store.update_execution(running)
+            await finish_execution.wait()
+            running.status = ExecutionStatus.COMPLETED
+            running.completed_at = utc_now()
+            await self.context.execution_store.update_execution(running)
+            return running
+
+        self.context.runtime_registry.start_execution = long_running_start
+        worker_task = asyncio.create_task(
+            run_execution_worker(
+                context=self.context,
+                execution_id=execution.id,
+                workflow_id=execution.workflow_id,
+                runtime_revision_id="runtime-rev-1",
+                runtime_adapter_id="native",
+                worker_id="worker-long-running",
+                heartbeat_interval_seconds=0.01,
+            )
+        )
+        try:
+            for _ in range(50):
+                current = await self.context.execution_store.get_execution(execution.id)
+                if (
+                        current is not None
+                        and current.status == ExecutionStatus.RUNNING
+                        and current.last_heartbeat_at is not None
+                ):
+                    break
+                await asyncio.sleep(0.01)
+
+            current = await self.context.execution_store.get_execution(execution.id)
+            self.assertIsNotNone(current)
+            assert current is not None
+            live_classification = classify_execution_staleness(
+                current,
+                stale_after_seconds=1,
+                idle_timeout_seconds=600,
+                run_timeout_seconds=1,
+            )
+
+            self.assertFalse(live_classification["is_stale"])
+            self.assertTrue(live_classification["intentionally_long_running"])
+            self.assertIsNotNone(current.last_heartbeat_at)
+
+            current.last_heartbeat_at = utc_now() - timedelta(seconds=5)
+            current.updated_at = current.last_heartbeat_at
+            await self.context.execution_store.update_execution(current)
+            stale_classification = classify_execution_staleness(
+                current,
+                stale_after_seconds=1,
+                idle_timeout_seconds=600,
+                run_timeout_seconds=1,
+            )
+
+            self.assertTrue(stale_classification["is_stale"])
+            self.assertEqual(stale_classification["stale_kind"], "worker_unresponsive")
+            self.assertTrue(stale_classification["intentionally_long_running"])
+        finally:
+            finish_execution.set()
+
+        exit_code = await worker_task
+        self.assertEqual(exit_code, WORKER_EXIT_SUCCESS)
 
     async def test_runtime_worker_times_out_long_running_execution(self):
         execution = await self.context.runtime_registry.create_execution(

@@ -17,11 +17,14 @@ from app.domain import (
     TaskDefinition,
     ToolDefinition,
     ToolImplementationReference,
+    ToolType,
     WorkflowDefinition,
     WorkflowEdgeDefinition,
     WorkflowNodeDefinition,
 )
 from app.llm.base import ModelMessage
+from app.runtime.workspace_paths import default_repo_write_mounts
+from app.tools.module_visibility import tool_definition_visible_with_enabled_modules
 
 
 class WorkflowBuilderTaskDraft(BaseModel):
@@ -59,11 +62,20 @@ class WorkflowBuilderRepairResponse(BaseModel):
     workflow: WorkflowDefinition
 
 
+def _workflow_from_repair_response(response: dict[str, Any]) -> WorkflowDefinition:
+    if "workflow" in response:
+        return WorkflowBuilderRepairResponse.model_validate(response).workflow
+    # Some structured-output providers satisfy the nested WorkflowDefinition schema but omit the
+    # wrapper key. Treat that as a recoverable adapter quirk instead of failing proposal creation.
+    return WorkflowDefinition.model_validate(response)
+
+
 @dataclass(slots=True)
 class WorkflowBuilderService:
     context: ApiContext
     _COMMAND_TOOL_ID = "agency.command.run"
     _COMMAND_TOOL_NAME = "run_command"
+    _MEMORY_LIST_TOOL_ID = "agency.memory.list"
 
     async def build_workflow_definition(
             self,
@@ -75,6 +87,7 @@ class WorkflowBuilderService:
             default_agent_model_profile_id: str | None = None,
             workflow_id: str | None = None,
     ) -> WorkflowDefinition:
+        available_agents = await self.context.agent_repo.list()
         tasks_response = await self.generate_draft(
             "tasks",
             conversation_history=conversation_history,
@@ -86,6 +99,7 @@ class WorkflowBuilderService:
         agents_response = await self.generate_draft(
             "agents",
             tasks=task_drafts,
+            available_agents=available_agents,
             model_profile_id=model_profile_id,
         )
         agent_drafts = agents_response.get("agents") or []
@@ -102,10 +116,83 @@ class WorkflowBuilderService:
             agents=agent_drafts,
             default_agent_model_profile_id=default_agent_model_profile_id or model_profile_id,
             workflow_id=workflow_id,
+            available_catalog_agents=available_agents,
+        )
+        workflow_definition = await self.enrich_with_existing_tools(
+            workflow=workflow_definition,
+            goal=goal,
         )
         return self._ensure_recommendation_to_code_pipeline(
             workflow=workflow_definition,
             goal=goal,
+        )
+
+    async def enrich_with_existing_tools(
+            self,
+            *,
+            workflow: WorkflowDefinition,
+            goal: str,
+    ) -> WorkflowDefinition:
+        available_tools = self._workflow_usable_tools(await self.context.tool_repo.list())
+        if not available_tools or not workflow.task_definitions:
+            return self._workflow_with_tool_planning_metadata(
+                workflow=workflow,
+                available_tool_count=len(available_tools),
+                task_matches=[],
+                missing_requirements=self._missing_tool_requirements(workflow=workflow, goal=goal, available_tools=[]),
+            )
+
+        tasks = list(workflow.task_definitions)
+        agents = list(workflow.agent_definitions)
+        task_matches: list[dict[str, Any]] = []
+        assigned_tool_ids: set[str] = set()
+
+        for index, task in enumerate(tasks):
+            if task.tool_ids:
+                assigned_tool_ids.update(task.tool_ids)
+                task_matches.append(
+                    {
+                        "task_id": task.id,
+                        "task_name": task.name,
+                        "tool_ids": list(task.tool_ids),
+                        "source": "preassigned",
+                    }
+                )
+                continue
+
+            matches = self._matching_tools_for_task(task=task, goal=goal, tools=available_tools)
+            if not matches:
+                continue
+            tool_ids = [tool.id for tool in matches]
+            assigned_tool_ids.update(tool_ids)
+            task_update: dict[str, Any] = {"tool_ids": tool_ids}
+            tasks[index] = task.model_copy(update=task_update)
+            agents = self._ensure_agent_has_tool_ids(
+                agents=agents,
+                agent_id=task.agent_id,
+                tool_ids=tool_ids,
+            )
+            task_matches.append(
+                {
+                    "task_id": task.id,
+                    "task_name": task.name,
+                    "tool_ids": tool_ids,
+                    "source": "existing_tool_match",
+                }
+            )
+
+        updated = workflow.model_copy(update={"task_definitions": tasks, "agent_definitions": agents})
+        missing_requirements = self._missing_tool_requirements(
+            workflow=updated,
+            goal=goal,
+            available_tools=available_tools,
+        )
+        return self._workflow_with_tool_planning_metadata(
+            workflow=updated,
+            available_tool_count=len(available_tools),
+            task_matches=task_matches,
+            missing_requirements=missing_requirements,
+            assigned_tool_ids=assigned_tool_ids,
         )
 
     def assemble_workflow_definition(
@@ -116,6 +203,7 @@ class WorkflowBuilderService:
             agents: list[dict[str, Any]],
             default_agent_model_profile_id: str | None = None,
             workflow_id: str | None = None,
+            available_catalog_agents: list[AgentDefinition] | None = None,
     ) -> WorkflowDefinition:
         if not tasks:
             raise ValueError("Workflow builder did not produce any tasks")
@@ -123,18 +211,12 @@ class WorkflowBuilderService:
             raise ValueError("Workflow builder did not produce any agents")
 
         resolved_workflow_id = workflow_id or f"workflow-{uuid4()}"
-        agent_definitions: list[AgentDefinition] = []
-        for index, agent in enumerate(agents, start=1):
-            agent_definitions.append(
-                AgentDefinition(
-                    id=f"{resolved_workflow_id}-agent-{index}",
-                    name=str(agent.get("name") or f"Agent {index}"),
-                    role=str(agent.get("role") or "Workflow agent"),
-                    instructions=str(agent.get("instructions") or "Execute assigned workflow tasks carefully."),
-                    backstory=str(agent.get("backstory") or "Created by the workflow builder."),
-                    model_profile_id=default_agent_model_profile_id,
-                )
-            )
+        agent_definitions = self._resolved_agent_definitions(
+            agents=agents,
+            resolved_workflow_id=resolved_workflow_id,
+            default_agent_model_profile_id=default_agent_model_profile_id,
+            available_catalog_agents=available_catalog_agents or [],
+        )
 
         task_definitions: list[TaskDefinition] = []
         nodes: list[WorkflowNodeDefinition] = []
@@ -239,7 +321,8 @@ class WorkflowBuilderService:
             schema=WorkflowBuilderRepairResponse.model_json_schema(),
             system=(
                 "You repair invalid workflow definitions for an agentic workflow builder. "
-                "Return a complete workflow definition that preserves the user's intent, "
+                "Return an object with top-level key 'workflow' containing the complete workflow definition. "
+                "Preserve the user's intent, "
                 "keeps existing IDs where possible, avoids unsafe new tool definitions, "
                 "and fixes only the validation problems."
             ),
@@ -252,7 +335,7 @@ class WorkflowBuilderService:
             ),
             model_profile_id=model_profile_id,
         )
-        return WorkflowBuilderRepairResponse.model_validate(response).workflow
+        return _workflow_from_repair_response(response)
 
     async def update_workflow_definition(
             self,
@@ -267,7 +350,8 @@ class WorkflowBuilderService:
             schema=WorkflowBuilderRepairResponse.model_json_schema(),
             system=(
                 "You update existing workflow definitions for an agentic workflow builder. "
-                "Return one complete updated WorkflowDefinition. Preserve the workflow id, "
+                "Return an object with top-level key 'workflow' containing one complete updated WorkflowDefinition. "
+                "Preserve the workflow id, "
                 "existing IDs, visibility/mutability metadata, and unrelated fields unless "
                 "the requested edit requires a change. Do not create unsafe executable tools."
             ),
@@ -280,13 +364,17 @@ class WorkflowBuilderService:
             ),
             model_profile_id=model_profile_id,
         )
-        updated = WorkflowBuilderRepairResponse.model_validate(response).workflow
+        updated = _workflow_from_repair_response(response)
         if not updated.agent_definitions and workflow.agent_definitions:
             updated = updated.model_copy(update={"agent_definitions": workflow.agent_definitions})
         if not updated.task_definitions and workflow.task_definitions:
             updated = updated.model_copy(update={"task_definitions": workflow.task_definitions})
         if not updated.nodes and workflow.nodes:
             updated = updated.model_copy(update={"nodes": workflow.nodes})
+        updated = await self.enrich_with_existing_tools(
+            workflow=updated,
+            goal=goal,
+        )
         return self._ensure_recommendation_to_code_pipeline(
             workflow=updated,
             goal=goal,
@@ -301,6 +389,7 @@ class WorkflowBuilderService:
             latest_tasks: str | None = None,
             tasks: list[dict[str, Any]] | None = None,
             agents: list[dict[str, Any]] | None = None,
+            available_agents: list[AgentDefinition] | None = None,
             model_profile_id: str | None = None,
     ) -> dict[str, Any]:
         if draft_type == "tasks":
@@ -310,8 +399,9 @@ class WorkflowBuilderService:
                 system=(
                     "You are an agentic workflow planner. Break the user's goal into a "
                     "clear, ordered list of text-generation-friendly tasks. Avoid tasks "
-                    "that require external research or human intervention. Return a short "
-                    "assistant_message acknowledging the drafted workflow, then the tasks."
+                    "that require external research or human intervention unless the user "
+                    "explicitly asks for those capabilities. "
+                    "Return a short assistant_message acknowledging the drafted workflow, then the tasks."
                 ),
                 prompt=(
                     "Create a workflow task list from the request below.\n\n"
@@ -325,17 +415,22 @@ class WorkflowBuilderService:
 
         if draft_type == "agents":
             task_names = ", ".join(str(task.get("name", "")) for task in tasks or [])
+            available_agent_summaries = self._builder_available_agent_summaries(available_agents or [])
             response = await self._generate_structured(
                 schema_name="workflow_builder_agent_list",
                 schema=WorkflowBuilderAgentsResponse.model_json_schema(),
                 system=(
                     "You design agent teams for workflows. Generate focused, non-overlapping "
-                    "agents that can execute the provided tasks using only text-based work."
+                    "agents that can execute the provided tasks using only text-based work. "
+                    "Prefer reusing existing catalog agents when they are already a close fit; "
+                    "only describe a brand-new workflow-local agent when no catalog agent is suitable."
                 ),
                 prompt=(
                     "Generate agents for the following tasks.\n\n"
                     f"Task names: {task_names}\n\n"
-                    f"Task details: {tasks or []}\n"
+                    f"Task details: {tasks or []}\n\n"
+                    "Available catalog agents to reuse first:\n"
+                    f"{available_agent_summaries}\n"
                 ),
                 model_profile_id=model_profile_id,
             )
@@ -416,6 +511,475 @@ class WorkflowBuilderService:
         title = " ".join(words[:5]) or "Generated Workflow"
         return f"{title.title()} Workflow" if not title.lower().endswith("workflow") else title.title()
 
+    def _workflow_usable_tools(self, tools: list[ToolDefinition]) -> list[ToolDefinition]:
+        blocked_prefixes = (
+            "agency.workflow.",
+            "agency.tool.",
+            "agency.agent.",
+            "agency.execution.",
+        )
+        blocked_ids = {
+            "agency.human.ask",
+        }
+        usable: list[ToolDefinition] = []
+        for tool in tools:
+            if not tool_definition_visible_with_enabled_modules(tool):
+                continue
+            if tool.id in blocked_ids:
+                continue
+            if tool.id.startswith(blocked_prefixes):
+                continue
+            usable.append(tool)
+        return usable
+
+    def _matching_tools_for_task(
+            self,
+            *,
+            task: TaskDefinition,
+            goal: str,
+            tools: list[ToolDefinition],
+            max_matches: int = 2,
+    ) -> list[ToolDefinition]:
+        candidate_tools = self._workflow_tools_for_task_intent(task=task, goal=goal, tools=tools)
+        scored = sorted(
+            (
+                (self._tool_task_match_score(task=task, goal=goal, tool=tool), tool)
+                for tool in candidate_tools
+            ),
+            key=lambda item: (item[0], item[1].name),
+            reverse=True,
+        )
+        selected = [tool for score, tool in scored[:max_matches] if score >= 3]
+        return selected
+
+    def _workflow_tools_for_task_intent(
+            self,
+            *,
+            task: TaskDefinition,
+            goal: str,
+            tools: list[ToolDefinition],
+    ) -> list[ToolDefinition]:
+        return tools
+
+    def _tool_task_match_score(self, *, task: TaskDefinition, goal: str, tool: ToolDefinition) -> int:
+        task_tokens = self._task_intent_tokens(task=task, goal=goal)
+        tool_tokens = self._expanded_intent_tokens(
+            " ".join(
+                [
+                    tool.id,
+                    tool.name,
+                    tool.display_name or "",
+                    tool.description or "",
+                    " ".join(tool.tags),
+                    tool.implementation.implementation_type,
+                    tool.implementation.target,
+                    tool.implementation.callable_name or "",
+                ]
+            )
+        )
+        overlap = task_tokens.intersection(tool_tokens)
+        score = len(overlap)
+        if tool.id == self._COMMAND_TOOL_ID and any(
+                token in task_tokens for token in {"code", "coding", "repo", "repository", "patch", "test", "lint"}
+        ):
+            score += 3
+        if tool.id == "agency.http.request" and any(
+                token in task_tokens for token in {"api", "webhook", "http", "url", "send", "post"}
+        ):
+            score += 4
+        if tool.id == "agency.speech.speak" and any(
+                token in task_tokens for token in
+                {"voice", "speech", "announce", "announcement", "speaker", "say", "tts"}
+        ):
+            score += 4
+        if tool.id == "agency.speech.continue" and any(
+                token in task_tokens for token in
+                {"voice", "speech", "respond", "response", "followup", "follow", "continue"}
+        ):
+            score += 4
+        if tool.id == "agency.voice.generate" and any(
+                token in task_tokens for token in
+                {"voice", "speech", "audio", "tts", "generate", "generation", "synthesize", "synthesis"}
+        ):
+            score += 5
+        if tool.id == "agency.media.send" and any(
+                token in task_tokens for token in {"send", "post", "upload", "deliver", "message"}
+        ) and any(
+                token in task_tokens
+                for token in {
+                    "media",
+                    "image",
+                    "audio",
+                    "voice",
+                    "video",
+                    "document",
+                    "attachment",
+                    "telegram",
+                    "discord",
+                    "slack",
+                    "teams",
+                    "whatsapp",
+                }
+        ):
+            score += 6
+        if tool.tool_type == ToolType.HTTP_REQUEST and any(
+                token in task_tokens for token in {"api", "webhook", "http", "url", "send"}
+        ):
+            score += 3
+        if "browser" in tool_tokens and any(
+                token in task_tokens for token in {"browser", "web", "webpage", "site", "screenshot", "click"}
+        ):
+            score += 3
+        return score
+
+    def _task_intent_tokens(self, *, task: TaskDefinition, goal: str) -> set[str]:
+        return self._expanded_intent_tokens(
+            " ".join(
+                [
+                    goal,
+                    task.name or "",
+                    task.description or "",
+                    task.instructions or "",
+                    task.expected_output or "",
+                ]
+            )
+        )
+
+    def _expanded_intent_tokens(self, text: str) -> set[str]:
+        raw_tokens = {
+            token
+            for token in re.findall(r"[a-z0-9][a-z0-9_.-]{2,}", text.lower())
+            if token
+        }
+        tokens: set[str] = set()
+        for token in raw_tokens:
+            tokens.add(token)
+            tokens.update(part for part in re.split(r"[-_.]", token) if len(part) >= 3)
+        synonym_groups = [
+            {"webhook", "channel", "message", "send", "post"},
+            {"news", "research", "search", "web", "browser", "fetch", "source", "link"},
+            {"email", "mail", "smtp", "send", "message"},
+            # Keep `voice` as an intent synonym so older workflow drafts and user
+            # prompts still map onto the canonical Agency speech capability.
+            {"voice", "speech", "announce", "announcement", "speaker", "say", "tts"},
+            {"voice", "speech", "audio", "tts", "generate", "generation", "synthesize", "synthesis"},
+            {"voice", "speech", "continue", "continuation", "followup", "respond", "response"},
+            {"media", "image", "audio", "voice", "video", "document", "attachment", "upload"},
+            {"telegram", "discord", "slack", "teams", "microsoft-teams", "whatsapp", "channel", "app", "application"},
+            {"spreadsheet", "excel", "sheet", "csv", "table"},
+            {"document", "docx", "word", "markdown", "file"},
+            {"code", "coding", "repo", "repository", "patch", "command", "shell", "test", "lint"},
+            {"api", "http", "request", "webhook", "url"},
+            # Agent reuse should treat planning-oriented roles as equivalent
+            # when the catalog has a close strategic/planning agent already.
+            {"plan", "planner", "planning", "strategist", "strategy", "strategic"},
+        ]
+        for group in synonym_groups:
+            if tokens.intersection(group):
+                tokens.update(group)
+        return tokens
+
+    def _ensure_agent_has_tool_ids(
+            self,
+            *,
+            agents: list[AgentDefinition],
+            agent_id: str | None,
+            tool_ids: list[str],
+    ) -> list[AgentDefinition]:
+        if not agent_id:
+            return agents
+        updated_agents: list[AgentDefinition] = []
+        for agent in agents:
+            if agent.id != agent_id:
+                updated_agents.append(agent)
+                continue
+            merged = list(dict.fromkeys([*agent.tool_ids, *tool_ids]))
+            updated_agents.append(agent.model_copy(update={"tool_ids": merged}))
+        return updated_agents
+
+    def _resolved_agent_definitions(
+            self,
+            *,
+            agents: list[dict[str, Any]],
+            resolved_workflow_id: str,
+            default_agent_model_profile_id: str | None,
+            available_catalog_agents: list[AgentDefinition],
+    ) -> list[AgentDefinition]:
+        used_catalog_agent_ids: set[str] = set()
+        resolved: list[AgentDefinition] = []
+        for index, agent in enumerate(agents, start=1):
+            matched_catalog_agent = self._closest_catalog_agent_match(
+                agent_draft=agent,
+                available_catalog_agents=available_catalog_agents,
+                used_catalog_agent_ids=used_catalog_agent_ids,
+            )
+            if matched_catalog_agent is not None:
+                used_catalog_agent_ids.add(matched_catalog_agent.id)
+                resolved.append(self._workflow_embedded_catalog_agent(matched_catalog_agent))
+                continue
+            resolved.append(
+                AgentDefinition(
+                    id=f"{resolved_workflow_id}-agent-{index}",
+                    name=str(agent.get("name") or f"Agent {index}"),
+                    role=str(agent.get("role") or "Workflow agent"),
+                    instructions=str(agent.get("instructions") or "Execute assigned workflow tasks carefully."),
+                    backstory=str(agent.get("backstory") or "Created by the workflow builder."),
+                    model_profile_id=default_agent_model_profile_id,
+                )
+            )
+        return resolved
+
+    def _closest_catalog_agent_match(
+            self,
+            *,
+            agent_draft: dict[str, Any],
+            available_catalog_agents: list[AgentDefinition],
+            used_catalog_agent_ids: set[str],
+    ) -> AgentDefinition | None:
+        best_match: AgentDefinition | None = None
+        best_score = 0
+        draft_name = str(agent_draft.get("name") or "").strip().lower()
+        draft_role = str(agent_draft.get("role") or "").strip().lower()
+        draft_tokens = self._expanded_intent_tokens(
+            " ".join(
+                [
+                    str(agent_draft.get("name") or ""),
+                    str(agent_draft.get("role") or ""),
+                    str(agent_draft.get("instructions") or ""),
+                    str(agent_draft.get("backstory") or ""),
+                ]
+            )
+        )
+        for candidate in available_catalog_agents:
+            if candidate.id in used_catalog_agent_ids:
+                continue
+            candidate_name = (candidate.display_name or candidate.name or "").strip().lower()
+            candidate_role = (candidate.role or "").strip().lower()
+            score = 0
+            if draft_name and draft_name == candidate_name:
+                score += 10
+            elif draft_name and draft_name in candidate_name:
+                score += 6
+            if draft_role and candidate_role:
+                if draft_role == candidate_role:
+                    score += 6
+                elif draft_role in candidate_role or candidate_role in draft_role:
+                    score += 3
+            candidate_tokens = self._expanded_intent_tokens(
+                " ".join(
+                    [
+                        candidate.name,
+                        candidate.display_name or "",
+                        candidate.role or "",
+                        candidate.description or "",
+                        candidate.instructions or "",
+                        candidate.backstory or "",
+                    ]
+                )
+            )
+            overlap = draft_tokens.intersection(candidate_tokens)
+            score += min(len(overlap), 6)
+            planning_tokens = {"plan", "planner", "planning", "strategist", "strategy", "strategic"}
+            if overlap and draft_tokens.intersection(planning_tokens) and candidate_tokens.intersection(
+                    planning_tokens):
+                score += 2
+            if score > best_score:
+                best_score = score
+                best_match = candidate
+        return best_match if best_score >= 8 else None
+
+    def _workflow_embedded_catalog_agent(self, agent: AgentDefinition) -> AgentDefinition:
+        metadata = dict(agent.metadata)
+        # Preserve that this workflow agent intentionally came from the global
+        # catalog so downstream review can distinguish reuse from local drafts.
+        metadata["workflow_builder_reused_global_agent_id"] = agent.id
+        return agent.model_copy(update={"metadata": metadata})
+
+    def _builder_available_agent_summaries(self, agents: list[AgentDefinition]) -> str:
+        if not agents:
+            return "- None"
+        lines = []
+        for agent in agents[:25]:
+            lines.append(
+                f"- id={agent.id}; name={agent.display_name or agent.name}; role={agent.role or ''}; "
+                f"description={agent.description or ''}"
+            )
+        return "\n".join(lines)
+
+    def _missing_tool_requirements(
+            self,
+            *,
+            workflow: WorkflowDefinition,
+            goal: str,
+            available_tools: list[ToolDefinition],
+    ) -> list[dict[str, Any]]:
+        requirements: list[dict[str, Any]] = []
+        available_text = " ".join(
+            [
+                " ".join([tool.id, tool.name, tool.display_name or "", tool.description or "", " ".join(tool.tags)])
+                for tool in available_tools
+            ]
+        )
+        available_tokens = self._expanded_intent_tokens(available_text)
+        for task in workflow.task_definitions:
+            if task.tool_ids:
+                continue
+            task_text = " ".join(
+                [goal, task.name or "", task.description or "", task.instructions or "", task.expected_output or ""]
+            )
+            task_tokens = self._expanded_intent_tokens(task_text)
+            if not self._task_appears_tool_dependent(task_tokens):
+                continue
+            capability_tokens = sorted(
+                token
+                for token in task_tokens
+                if token in {
+                    "discord",
+                    "telegram",
+                    "slack",
+                    "teams",
+                    "microsoft-teams",
+                    "whatsapp",
+                    "webhook",
+                    "email",
+                    "api",
+                    "http",
+                    "media",
+                    "image",
+                    "audio",
+                    "video",
+                    "attachment",
+                    "voice",
+                    "speech",
+                    "announce",
+                    "speaker",
+                    "browser",
+                    "web",
+                    "news",
+                    "spreadsheet",
+                    "document",
+                    "file",
+                    "database",
+                    "sql",
+                    "send",
+                    "post",
+                }
+                and token not in available_tokens
+            )
+            requirements.append(
+                {
+                    "task_id": task.id,
+                    "task_name": task.name,
+                    "capability": self._suggest_capability_label(task_tokens),
+                    "evidence_tokens": capability_tokens[:12],
+                    "suggested_tool_name": self._suggest_tool_name(task_tokens),
+                    "recommended_agent": "Coder Agent",
+                    "recommended_existing_tool_id": self._COMMAND_TOOL_ID,
+                }
+            )
+        return requirements
+
+    def _task_appears_tool_dependent(self, task_tokens: set[str]) -> bool:
+        tool_dependent_tokens = {
+            "api",
+            "browser",
+            "click",
+            "database",
+            "discord",
+            "telegram",
+            "docx",
+            "email",
+            "excel",
+            "fetch",
+            "file",
+            "http",
+            "news",
+            "post",
+            "request",
+            "respond",
+            "scrape",
+            "search",
+            "send",
+            "sheet",
+            "slack",
+            "teams",
+            "whatsapp",
+            "sql",
+            "speaker",
+            "speech",
+            "smart",
+            "upload",
+            "voice",
+            "web",
+            "webhook",
+            "write",
+        }
+        return bool(task_tokens.intersection(tool_dependent_tokens))
+
+    def _suggest_capability_label(self, task_tokens: set[str]) -> str:
+        if "discord" in task_tokens:
+            return "Discord delivery"
+        if task_tokens.intersection({"telegram", "slack", "teams", "microsoft-teams", "whatsapp"}):
+            return "media delivery"
+        if "news" in task_tokens or "search" in task_tokens:
+            return "news research"
+        if "email" in task_tokens:
+            return "email delivery"
+        if "voice" in task_tokens or "speech" in task_tokens or "speaker" in task_tokens:
+            return "speech interaction"
+        if "spreadsheet" in task_tokens or "excel" in task_tokens:
+            return "spreadsheet operation"
+        if "document" in task_tokens or "docx" in task_tokens:
+            return "document operation"
+        if "api" in task_tokens or "http" in task_tokens or "webhook" in task_tokens:
+            return "external API call"
+        return "tool-assisted execution"
+
+    def _suggest_tool_name(self, task_tokens: set[str]) -> str:
+        label = self._suggest_capability_label(task_tokens)
+        slug = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
+        return f"{slug or 'custom'}_tool"
+
+    def _workflow_with_tool_planning_metadata(
+            self,
+            *,
+            workflow: WorkflowDefinition,
+            available_tool_count: int,
+            task_matches: list[dict[str, Any]],
+            missing_requirements: list[dict[str, Any]],
+            assigned_tool_ids: set[str] | None = None,
+    ) -> WorkflowDefinition:
+        assigned = sorted(
+            assigned_tool_ids or {tool_id for match in task_matches for tool_id in match.get("tool_ids", [])})
+        metadata = dict(workflow.metadata)
+        metadata["tool_planning"] = {
+            "strategy": "prefer_existing_agency_tools",
+            "available_tool_count": available_tool_count,
+            "assigned_tool_ids": assigned,
+            "task_tool_matches": task_matches,
+            "missing_tool_requirements": missing_requirements,
+        }
+        if missing_requirements and not assigned:
+            metadata["tool_creation_required"] = True
+            metadata["tool_creation_prompt"] = (
+                "No existing Agency tool matched the required capability. Ask the user to create a dedicated tool "
+                "before approving this workflow, or use the Coder Agent with the command tool to implement and "
+                "propose the missing ToolDefinition."
+            )
+            metadata["tool_creation_recommendation"] = {
+                "recommended_agent": "Coder Agent",
+                "recommended_existing_tool_id": self._COMMAND_TOOL_ID,
+                "suggested_tools": [
+                    {
+                        "name": item["suggested_tool_name"],
+                        "capability": item["capability"],
+                        "task_id": item["task_id"],
+                    }
+                    for item in missing_requirements
+                ],
+            }
+        return workflow.model_copy(update={"metadata": metadata})
+
     def _ensure_recommendation_to_code_pipeline(
             self,
             *,
@@ -441,7 +1005,7 @@ class WorkflowBuilderService:
                 tool
                 for tool in tools
                 if tool.id == self._COMMAND_TOOL_ID
-                or tool.implementation.implementation_type == "shell_command"
+                   or tool.implementation.implementation_type == "shell_command"
             ),
             None,
         )
@@ -645,7 +1209,29 @@ class WorkflowBuilderService:
                         )
 
         metadata = dict(workflow.metadata)
+        metadata.pop("tool_creation_required", None)
+        metadata.pop("tool_creation_prompt", None)
+        metadata.pop("tool_creation_recommendation", None)
+        tool_planning = metadata.get("tool_planning")
+        if isinstance(tool_planning, dict):
+            assigned_tool_ids = set(tool_planning.get("assigned_tool_ids") or [])
+            assigned_tool_ids.add(command_tool.id)
+            metadata["tool_planning"] = {
+                **tool_planning,
+                "assigned_tool_ids": sorted(str(tool_id) for tool_id in assigned_tool_ids if str(tool_id).strip()),
+            }
         metadata["workflow_builder_enhancement"] = "recommendation_to_code_pipeline"
+        repo_write_mounts = default_repo_write_mounts()
+        metadata["repo_write_permission"] = {
+            "approval_required": True,
+            "status": "pending_human_approval",
+            "permission_type": "repo_write",
+            "reason": (
+                "This workflow uses the command tool to inspect, edit, and verify repository files. "
+                "Human approval is required before worker containers receive read-write repo access."
+            ),
+            "mounts": repo_write_mounts,
+        }
         if qa_collaboration_requested:
             metadata["workflow_builder_collaboration"] = "coder_qa"
         return workflow.model_copy(
@@ -701,9 +1287,9 @@ class WorkflowBuilderService:
         # Support direct phrasing like:
         # "i want to have the coder agent to work on the workflow to perform the todo"
         direct_coder_todo_request = (
-            "coder" in lowered
-            and "workflow" in lowered
-            and any(token in lowered for token in ("todo", "to-do", "action item"))
+                "coder" in lowered
+                and "workflow" in lowered
+                and any(token in lowered for token in ("todo", "to-do", "action item"))
         )
         if direct_coder_todo_request:
             return True
@@ -720,7 +1306,8 @@ class WorkflowBuilderService:
         if workflow is not None:
             parts: list[str] = [workflow.name or "", workflow.description or ""]
             for task in workflow.task_definitions:
-                parts.extend([task.name or "", task.description or "", task.instructions or "", task.expected_output or ""])
+                parts.extend(
+                    [task.name or "", task.description or "", task.instructions or "", task.expected_output or ""])
             for agent in workflow.agent_definitions:
                 parts.extend([agent.name or "", agent.role or "", agent.instructions or "", agent.description or ""])
             workflow_text = " ".join(parts).lower()
@@ -1039,7 +1626,7 @@ class WorkflowBuilderService:
                 ]
             ).lower()
             if ("qa" in haystack or "verify" in haystack) and any(
-                token in haystack for token in ("recheck", "re-verify", "reverify", "after fix")
+                    token in haystack for token in ("recheck", "re-verify", "reverify", "after fix")
             ):
                 return True
         return False

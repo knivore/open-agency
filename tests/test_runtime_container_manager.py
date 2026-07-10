@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from app.core.config import reset_settings_cache
 from app.runtime.containers import (
+    ContainerRuntimeError,
     DockerRuntimeManager,
     RuntimeContainerConfig,
     RuntimeContainerSpec,
@@ -71,6 +74,7 @@ class _FakeContainersAPI:
         return self._container
 
     def list(self, all: bool = True, filters: dict | None = None):
+        _ = filters
         return [self._container]
 
 
@@ -110,12 +114,14 @@ class RuntimeContainerManagerTests(unittest.TestCase):
             execution_id="exec-1",
             workflow_id="workflow-1",
             runtime_revision_id="rev-1",
+            goal_id="goal-1",
             extra={"agency.extra": "yes"},
         )
 
         self.assertEqual(labels["agency.managed"], "true")
         self.assertEqual(labels["agency.execution_id"], "exec-1")
         self.assertEqual(labels["agency.workflow_id"], "workflow-1")
+        self.assertEqual(labels["agency.goal_id"], "goal-1")
         self.assertEqual(labels["agency.runtime_revision_id"], "rev-1")
         self.assertEqual(labels["agency.extra"], "yes")
 
@@ -146,6 +152,7 @@ class RuntimeContainerManagerTests(unittest.TestCase):
             execution_id="exec-1",
             workflow_id="workflow-1",
             runtime_revision_id="rev-1",
+            goal_id="goal-1",
             image="agency-runtime:rev-1",
             command=["python", "-m", "worker"],
             env={"DATABASE_URL": "sqlite://"},
@@ -163,6 +170,41 @@ class RuntimeContainerManagerTests(unittest.TestCase):
         self.assertEqual(kwargs["nano_cpus"], 1_500_000_000)
         self.assertEqual(kwargs["volumes"]["/tmp/source"]["mode"], "ro")
         self.assertEqual(kwargs["labels"]["agency.execution_id"], "exec-1")
+        self.assertEqual(kwargs["labels"]["agency.goal_id"], "goal-1")
+        self.assertEqual(state.labels["agency.goal_id"], "goal-1")
+
+    def test_container_spec_can_override_network(self) -> None:
+        spec = RuntimeContainerSpec(
+            execution_id="exec-egress",
+            workflow_id="workflow-1",
+            runtime_revision_id="rev-1",
+            image="agency-runtime:rev-1",
+            network_name="agency_onecli_worker_egress",
+        )
+
+        self.manager.create_execution_container(spec)
+        kwargs = self.fake_client.containers.created_kwargs
+
+        self.assertEqual(kwargs["network"], "agency_onecli_worker_egress")
+
+    def test_create_execution_container_checks_explicit_read_write_mounts(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            spec = RuntimeContainerSpec(
+                execution_id="exec-rw",
+                workflow_id="workflow-1",
+                runtime_revision_id="rev-1",
+                image="agency-runtime:rev-1",
+                mounts=[
+                    RuntimeMount(source=workspace, target="/workspace/other-repo", read_only=False)
+                ],
+            )
+
+            with patch("app.runtime.containers._is_path_writable", return_value=False):
+                with self.assertRaises(ContainerRuntimeError) as exc:
+                    self.manager.create_execution_container(spec)
+
+        self.assertIn("Workflow mount", str(exc.exception))
+        self.assertIn("EXECUTION_CONTAINER_EXTRA_MOUNTS", str(exc.exception))
 
     def test_lifecycle_methods_delegate_to_client(self) -> None:
         spec = RuntimeContainerSpec(
@@ -208,6 +250,24 @@ class RuntimeContainerManagerTests(unittest.TestCase):
         mount_by_target = {mount.target: mount for mount in mounts}
         self.assertEqual(mount_by_target["/workspace/agency"].source, "/host/agency")
         self.assertEqual(mount_by_target["/workspace/agency-fe"].source, "/host/agency-fe")
+        self.assertFalse(mount_by_target["/workspace/agency"].read_only)
+        self.assertFalse(mount_by_target["/workspace/agency-fe"].read_only)
+
+    def test_default_workspace_mounts_fail_fast_when_visible_source_is_not_writable(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            with patch.dict(
+                    os.environ,
+                    {
+                        "AGENCY_BACKEND_HOST_WORKSPACE": workspace,
+                        "AGENCY_BACKEND_WORKSPACE": "/workspace/agency",
+                    },
+                    clear=False,
+            ), patch("app.runtime.containers._is_path_writable", return_value=False):
+                with self.assertRaises(ContainerRuntimeError) as exc:
+                    self.manager.default_mounts()
+
+        self.assertIn("configured read-write", str(exc.exception))
+        self.assertIn("Ask the user to approve filesystem write access", str(exc.exception))
 
     def test_default_mounts_include_writable_codex_home_volume(self) -> None:
         with patch.dict(os.environ, {"CODEX_HOME_VOLUME": "agency_codex_home", "CODEX_HOME": "/codex"}, clear=False):
@@ -216,3 +276,79 @@ class RuntimeContainerManagerTests(unittest.TestCase):
         codex_mount = next(mount for mount in mounts if mount.target == "/codex")
         self.assertEqual(codex_mount.source, "agency_codex_home")
         self.assertFalse(codex_mount.read_only)
+
+    def test_default_mounts_default_codex_home_target_for_workers(self) -> None:
+        with patch.dict(os.environ, {"CODEX_HOME_VOLUME": "agency_codex_home"}, clear=False):
+            os.environ.pop("CODEX_HOME", None)
+            os.environ.pop("EXECUTION_CODEX_HOME", None)
+            mounts = self.manager.default_mounts()
+
+        codex_mount = next(mount for mount in mounts if mount.target == "/codex")
+        self.assertEqual(codex_mount.source, "agency_codex_home")
+        self.assertFalse(codex_mount.read_only)
+
+    def test_default_mounts_include_onecli_ca_bundle_when_worker_enforced(self) -> None:
+        with patch.dict(
+                os.environ,
+                {
+                    "ONECLI_ENABLED": "true",
+                    "ONECLI_FORCE_FOR_ISOLATED_WORKERS": "true",
+                    "EXECUTION_ISOLATION_ENABLED": "true",
+                    "ONECLI_GATEWAY_CA_BUNDLE_PATH": "/tmp/onecli-ca.pem",
+                    "ONECLI_GATEWAY_CA_BUNDLE_CONTAINER_PATH": "/etc/agency/onecli/ca.pem",
+                },
+                clear=False,
+        ):
+            reset_settings_cache()
+            mounts = self.manager.default_mounts()
+        reset_settings_cache()
+
+        ca_mount = next(mount for mount in mounts if mount.target == "/etc/agency/onecli/ca.pem")
+        self.assertEqual(ca_mount.source, str(Path("/tmp/onecli-ca.pem").resolve()))
+        self.assertTrue(ca_mount.read_only)
+
+    def test_default_mounts_skip_workspace_and_codex_home_when_onecli_worker_enforced(self) -> None:
+        with patch.dict(
+                os.environ,
+                {
+                    "AGENCY_BACKEND_HOST_WORKSPACE": "/host/agency",
+                    "AGENCY_BACKEND_WORKSPACE": "/workspace/agency",
+                    "AGENCY_FRONTEND_HOST_WORKSPACE": "/host/agency-fe",
+                    "AGENCY_FRONTEND_WORKSPACE": "/workspace/agency-fe",
+                    "CODEX_HOME_VOLUME": "agency_codex_home",
+                    "CODEX_HOME": "/codex",
+                    "ONECLI_ENABLED": "true",
+                    "ONECLI_FORCE_FOR_ISOLATED_WORKERS": "true",
+                    "EXECUTION_ISOLATION_ENABLED": "true",
+                },
+                clear=False,
+        ):
+            reset_settings_cache()
+            mounts = self.manager.default_mounts()
+        reset_settings_cache()
+
+        targets = {mount.target for mount in mounts}
+        self.assertNotIn("/workspace/agency", targets)
+        self.assertNotIn("/workspace/agency-fe", targets)
+        self.assertNotIn("/codex", targets)
+        self.assertIn("/app/integrations", targets)
+
+    def test_default_mounts_reject_sensitive_extra_mounts_when_onecli_worker_enforced(self) -> None:
+        with patch.dict(
+                os.environ,
+                {
+                    "ONECLI_ENABLED": "true",
+                    "ONECLI_FORCE_FOR_ISOLATED_WORKERS": "true",
+                    "EXECUTION_ISOLATION_ENABLED": "true",
+                    "EXECUTION_CONTAINER_EXTRA_MOUNTS": (
+                        '[{"source": "/host/agency/.env", "target": "/run/secrets/agency.env", "read_only": true}]'
+                    ),
+                },
+                clear=False,
+        ):
+            reset_settings_cache()
+            with self.assertRaises(ContainerRuntimeError) as exc:
+                self.manager.default_mounts()
+        reset_settings_cache()
+
+        self.assertIn("Sensitive execution container extra mount", str(exc.exception))

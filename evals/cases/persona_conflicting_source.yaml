@@ -1,0 +1,84 @@
+id: persona_conflicting_source
+suite: persona_distillation
+name: Persona conflicting-source extraction
+mode: persona_distillation_fixture
+description: Checks conflict detection when sources disagree.
+persona_distillation:
+  source_memories:
+    - id: conflicting-admin-policy
+      title: Conflicting administrator policy notes
+      content: |
+        Current draft says include administrators in privileged access review testing.
+        Older exception note says do not include administrators in privileged access review testing.
+        Treat the administrator inclusion rule as a conflict that requires reviewer decision before publishing.
+      tags: ["persona-live-eval", "conflict", "policy"]
+  expected_items:
+    - id: include_admins
+      item_type: decision_pattern
+      memory_layer: procedural
+      content_keywords: ["include administrators", "access reviews"]
+      evidence: "Administrators must be included in privileged access reviews"
+      conflict_expected: true
+    - id: exclude_admins
+      item_type: decision_pattern
+      memory_layer: procedural
+      content_keywords: ["do not include administrators", "access reviews"]
+      evidence: "Administrators must not be included in privileged access reviews"
+      conflict_expected: true
+  results:
+    deterministic:
+      items:
+        - title: Include administrators
+          content: "Include administrators in access reviews."
+          item_type: decision_pattern
+          memory_layer: procedural
+          source_evidence: "Administrators must be included in privileged access reviews"
+          evidence_verified: true
+      metrics: {latency_ms: 8, cost_usd: 0.0}
+    llm:
+      items:
+        - title: Include administrators
+          content: "Include administrators in access reviews."
+          item_type: decision_pattern
+          memory_layer: procedural
+          source_evidence: "Administrators must be included in privileged access reviews"
+          evidence_verified: true
+          review_flags: ["material_conflict"]
+          conflict_group_id: conflict-admins
+        - title: Do not include administrators
+          content: "Do not include administrators in access reviews."
+          item_type: decision_pattern
+          memory_layer: procedural
+          source_evidence: "Administrators must not be included in privileged access reviews"
+          evidence_verified: true
+          review_flags: ["material_conflict"]
+          conflict_group_id: conflict-admins
+      metrics: {latency_ms: 132, cost_usd: 0.02}
+    hybrid:
+      items:
+        - title: Include administrators
+          content: "Include administrators in access reviews."
+          item_type: decision_pattern
+          memory_layer: procedural
+          source_evidence: "Administrators must be included in privileged access reviews"
+          evidence_verified: true
+          review_flags: ["material_conflict"]
+          conflict_group_id: conflict-admins
+        - title: Do not include administrators
+          content: "Do not include administrators in access reviews."
+          item_type: decision_pattern
+          memory_layer: procedural
+          source_evidence: "Administrators must not be included in privileged access reviews"
+          evidence_verified: true
+          review_flags: ["material_conflict"]
+          conflict_group_id: conflict-admins
+      metrics: {latency_ms: 140, cost_usd: 0.02}
+assertions:
+  - type: persona_metric_min
+    mode: hybrid
+    metric: conflict_detection_quality
+    value: 1.0
+  - type: persona_metric_gte
+    mode: hybrid
+    baseline: deterministic
+    metric: recall

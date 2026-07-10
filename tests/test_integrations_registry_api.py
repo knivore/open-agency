@@ -15,6 +15,10 @@ class IntegrationsRegistryApiTests(unittest.TestCase):
             "x-agency-user-id": "user-integrations",
             "x-agency-user-email": "integrations@example.com",
         }
+        self.client.post(
+            "/users/sync",
+            json={"id": "user-integrations", "email": "integrations@example.com", "display_name": "Integrations User"},
+        )
 
     def test_list_integration_categories_returns_canonical_payload(self) -> None:
         response = self.client.get("/integrations/categories", headers=self.owner_headers)
@@ -38,6 +42,7 @@ class IntegrationsRegistryApiTests(unittest.TestCase):
             communications["providers"]["WhatsApp Cloud API"]["launchPriority"],
             "now",
         )
+        self.assertNotIn("home-tools", {item["id"] for item in payload["categories"]})
 
     def test_list_connector_capabilities_returns_operational_contract(self) -> None:
         response = self.client.get("/integrations/connectors/capabilities", headers=self.owner_headers)
@@ -52,20 +57,50 @@ class IntegrationsRegistryApiTests(unittest.TestCase):
         telegram = payload["connectors"]["telegram-bot"]
         self.assertEqual(telegram["displayName"], "Telegram")
         self.assertEqual(telegram["authModel"], "bot token")
+        self.assertEqual(telegram["capabilitySurface"], "connector")
+        self.assertEqual(telegram["moduleCapabilities"], [])
+        self.assertEqual(telegram["dependsOnAgencyCapabilities"], [])
+        self.assertEqual(telegram["onecliTransportMode"], "direct")
         self.assertTrue(telegram["healthSupported"])
         self.assertEqual(telegram["supportedSecretRefSchemes"], ["onecli://", "env://", "env:"])
+        self.assertIn("bot_user_id", [item["key"] for item in telegram["instanceIdentityMetadata"]])
+        self.assertIn("chat_id", [item["key"] for item in telegram["targetScopeMetadata"]])
         self.assertEqual(
             telegram["onecliSetupGuide"]["storagePath"],
-            "onecli://users/{agency_user_id}/telegram-bot/default",
+            "onecli://users/{agency_user_id}/telegram-bot/{agency_installation_id}",
         )
         self.assertEqual(telegram["onecliSetupGuide"]["fields"][0]["key"], "bot_token")
         self.assertTrue(telegram["onecliSetupGuide"]["fields"][0]["secret"])
+        self.assertIn("bot_user_id", [item["key"] for item in telegram["onecliSetupGuide"]["fields"]])
         self.assertIn("installation status", telegram["onecliSetupGuide"]["agencyStores"])
+        self.assertTrue(telegram["onecliSetupGuide"]["notes"])
+        self.assertTrue(any("URL path" in note for note in telegram["onecliSetupGuide"]["notes"]))
+        self.assertTrue(any("agency-generated id" in note.lower() for note in telegram["onecliSetupGuide"]["notes"]))
+
+        discord = payload["connectors"]["discord-bot"]
+        self.assertEqual(discord["onecliTransportMode"], "direct")
+        self.assertTrue(
+            any("interactions webhook endpoint" in note.lower() for note in discord["onecliSetupGuide"]["notes"])
+        )
+        self.assertTrue(
+            any("public key" in note.lower() and "different values" in note.lower()
+                for note in discord["onecliSetupGuide"]["notes"])
+        )
 
         whatsapp = payload["connectors"]["whatsapp-cloud-api"]
         self.assertEqual(whatsapp["requiredMetadata"][0]["key"], "phone_number_id")
         self.assertIn("phone_number_id", whatsapp["requiredMetadata"][0]["description"])
-        self.assertIn("active", whatsapp["onecliSetupGuide"]["completionSignal"])
+        self.assertIn(
+            "active",
+            whatsapp["onecliSetupGuide"]["completionSignal"],
+        )
+        github = payload["connectors"]["github"]
+        self.assertEqual(github["requiredMetadata"], [])
+        self.assertIn("owner", [item["key"] for item in github["instanceIdentityMetadata"]])
+        self.assertIn("repo", [item["key"] for item in github["targetScopeMetadata"]])
+        self.assertIn("owner", [item["key"] for item in github["onecliSetupGuide"]["fields"]])
+
+        self.assertNotIn("home-assistant", payload["connectors"])
 
 
 if __name__ == "__main__":

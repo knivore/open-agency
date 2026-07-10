@@ -1,3 +1,10 @@
+"""FastAPI application factory and startup orchestration.
+
+This module owns process-level concerns: middleware, route registration, seed
+data, background loops, and graceful task cancellation. Business behavior is
+delegated to services hanging off `ApiContext`.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -11,35 +18,45 @@ from fastapi.responses import JSONResponse
 from app.api.context import ApiContext, get_default_api_context
 from app.api.routes import create_api_router
 from app.core.config import get_settings
+from app.core.time import utc_now
+from app.modules.registry import validate_expected_optional_modules
+from app.services.connector_installations import ConnectorInstallationService
+from app.services.connector_retention import ConnectorRetentionService
 from app.services.conversation_daily_summary import (
     ConversationDailySummaryService,
     DailySummaryScheduleCoordinator,
 )
-from app.services.main_agent_setup import (
+from app.services.conversations.discord_gateway import DiscordGatewayListenerService
+from app.services.goals import GoalStartupReconciler
+from app.services.main_agent_setup.prompt_doc import extract_prompt_from_doc
+from app.services.main_agent_setup.service import (
     MainAgentModelProfileRequiredError,
     MainAgentSetupInvalidError,
     MainAgentSetupRequiredError,
     MainAgentSetupService,
 )
-from app.services.main_agent_setup.prompt_doc import extract_prompt_from_doc
 from app.services.main_agent_workflow_monitor import MainAgentWorkflowMonitorService
-
 
 logger = logging.getLogger(__name__)
 
 
 def create_app(context: ApiContext | None = None) -> FastAPI:
+    """Build the API app and attach lifecycle tasks for the supplied context."""
     settings = get_settings()
     explicit_context_supplied = context is not None
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):  # noqa: ARG001
         settings.ensure_runtime_requirements()
+        _ensure_expected_optional_modules(settings.parsed_agency_expected_optional_modules)
+        logger.info("OneCLI credential gateway diagnostics: %s", settings.sanitized_onecli_diagnostics)
         runtime_context = context
         workflow_scheduler_task: asyncio.Task | None = None
         reconcile_task: asyncio.Task | None = None
+        connector_retention_task: asyncio.Task | None = None
         daily_summary_task: asyncio.Task | None = None
         main_agent_monitor_task: asyncio.Task | None = None
+        discord_gateway_listener_task: asyncio.Task | None = None
         runtime_context = runtime_context or getattr(app.state, "api_context", None)
         if runtime_context is not None:
             app.state.api_context = runtime_context
@@ -60,7 +77,7 @@ def create_app(context: ApiContext | None = None) -> FastAPI:
                         MainAgentSetupInvalidError,
                 ) as exc:
                     raise RuntimeError(setup_service.startup_guidance(exc)) from exc
-            for server_id in runtime_context.builtin_computer_use_server_ids_for_host():
+            for server_id in runtime_context.builtin_mcp_server_ids_for_startup_discovery():
                 try:
                     await runtime_context.sync_mcp_catalog(server_id=server_id)
                 except Exception:
@@ -69,6 +86,14 @@ def create_app(context: ApiContext | None = None) -> FastAPI:
                 await MainAgentSetupService(runtime_context).sync_main_agent_tool_access()
             except Exception:
                 pass
+            try:
+                await ConnectorInstallationService(runtime_context).reconcile_startup_integrations()
+            except Exception:
+                logger.exception("Startup connector reconciliation failed")
+            try:
+                await GoalStartupReconciler(runtime_context).reconcile_once()
+            except Exception:
+                logger.exception("Startup goal reconciliation failed")
         if settings.workflow_scheduler_enabled:
             runtime_context = runtime_context or getattr(app.state, "api_context", None) or get_default_api_context()
             app.state.api_context = runtime_context
@@ -95,8 +120,21 @@ def create_app(context: ApiContext | None = None) -> FastAPI:
             async def main_agent_monitor_loop() -> None:
                 while True:
                     try:
-                        await monitor_service.run_once()
-                    except Exception:
+                        result = await monitor_service.run_once()
+                        runtime_context.runtime_operations.record_action(
+                            "main_agent_monitor.tick",
+                            occurred_at=utc_now().isoformat(),
+                            finding_count=result.get("finding_count", 0),
+                            proposal_count=result.get("proposal_count", 0),
+                            approval_request_count=result.get("approval_request_count", 0),
+                            steering_request_count=result.get("steering_request_count", 0),
+                        )
+                    except Exception as exc:
+                        runtime_context.runtime_operations.record_action(
+                            "main_agent_monitor.tick_failed",
+                            occurred_at=utc_now().isoformat(),
+                            error=str(exc),
+                        )
                         logger.exception("Main-agent workflow monitor loop failed")
                     await asyncio.sleep(settings.main_agent_workflow_monitor_interval_seconds)
 
@@ -114,6 +152,20 @@ def create_app(context: ApiContext | None = None) -> FastAPI:
                     await asyncio.sleep(settings.runtime_reconciler_interval_seconds)
 
             reconcile_task = asyncio.create_task(reconcile_loop())
+        if settings.connector_health_history_retention_enabled:
+            runtime_context = runtime_context or getattr(app.state, "api_context", None) or get_default_api_context()
+            app.state.api_context = runtime_context
+            connector_retention_service = ConnectorRetentionService(runtime_context)
+
+            async def connector_retention_loop() -> None:
+                while True:
+                    try:
+                        await connector_retention_service.run_once(settings)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(settings.connector_health_history_retention_interval_seconds)
+
+            connector_retention_task = asyncio.create_task(connector_retention_loop())
         if settings.memory_daily_summary_enabled:
             runtime_context = runtime_context or getattr(app.state, "api_context", None) or get_default_api_context()
             app.state.api_context = runtime_context
@@ -143,6 +195,14 @@ def create_app(context: ApiContext | None = None) -> FastAPI:
                     await asyncio.sleep(settings.memory_daily_summary_interval_seconds)
 
             daily_summary_task = asyncio.create_task(daily_summary_loop())
+        runtime_context = runtime_context or getattr(app.state, "api_context", None) or get_default_api_context()
+        app.state.api_context = runtime_context
+        # Discord ordinary chat is backend-owned transport behavior, so the
+        # listener should follow active integrations instead of a separate env
+        # toggle. The service self-discovers credentials and idles when none are
+        # installed.
+        discord_gateway_listener = DiscordGatewayListenerService(runtime_context, settings=settings)
+        discord_gateway_listener_task = asyncio.create_task(discord_gateway_listener.run_forever())
         try:
             yield
         finally:
@@ -158,6 +218,12 @@ def create_app(context: ApiContext | None = None) -> FastAPI:
                     await reconcile_task
                 except asyncio.CancelledError:
                     pass
+            if connector_retention_task is not None:
+                connector_retention_task.cancel()
+                try:
+                    await connector_retention_task
+                except asyncio.CancelledError:
+                    pass
             if daily_summary_task is not None:
                 daily_summary_task.cancel()
                 try:
@@ -168,6 +234,12 @@ def create_app(context: ApiContext | None = None) -> FastAPI:
                 main_agent_monitor_task.cancel()
                 try:
                     await main_agent_monitor_task
+                except asyncio.CancelledError:
+                    pass
+            if discord_gateway_listener_task is not None:
+                discord_gateway_listener_task.cancel()
+                try:
+                    await discord_gateway_listener_task
                 except asyncio.CancelledError:
                     pass
 
@@ -189,8 +261,8 @@ def create_app(context: ApiContext | None = None) -> FastAPI:
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
+        allow_origins=settings.cors_allowed_origins,
+        allow_credentials=settings.agency_cors_allow_credentials,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -201,3 +273,11 @@ def create_app(context: ApiContext | None = None) -> FastAPI:
 
     app.include_router(create_api_router(context))
     return app
+
+
+def _ensure_expected_optional_modules(expected_modules: list[str]) -> None:
+    if not expected_modules:
+        return
+    errors = validate_expected_optional_modules(expected_modules)
+    if errors:
+        raise RuntimeError("Optional module expectation check failed: " + "; ".join(errors))

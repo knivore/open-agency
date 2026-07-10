@@ -13,6 +13,7 @@ SCAN_ROOTS = [
 ]
 DISALLOWED_ROOTS = {"models", "routers", "tools_directory", "util", "utils"}
 DISALLOWED_LEGACY_APP_ROOTS = {"models", "routers", "tools_directory", "database"}
+OPTIONAL_MODULE_IMPORT_ROOTS: tuple[str, ...] = ()
 
 
 def iter_python_files() -> list[Path]:
@@ -79,5 +80,24 @@ def find_legacy_tool_import_violations() -> list[tuple[Path, int, str]]:
             for name in import_names(node):
                 root = name.split(".", 1)[0]
                 if root in DISALLOWED_LEGACY_APP_ROOTS:
+                    violations.append((path.relative_to(REPO_ROOT), node.lineno, name))
+    return violations
+
+
+def find_optional_module_top_level_import_violations() -> list[tuple[Path, int, str]]:
+    """Detect eager core imports that would make disabled module packs break startup."""
+
+    violations: list[tuple[Path, int, str]] = []
+    for path in iter_app_python_files():
+        if path.is_relative_to(APP_ROOT / "modules"):
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in tree.body:
+            if not isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            for name in import_names(node):
+                if name in OPTIONAL_MODULE_IMPORT_ROOTS or any(
+                    name.startswith(f"{root}.") for root in OPTIONAL_MODULE_IMPORT_ROOTS
+                ):
                     violations.append((path.relative_to(REPO_ROOT), node.lineno, name))
     return violations

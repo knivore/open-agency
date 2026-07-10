@@ -7,45 +7,171 @@
   "inputs": {
     "type": "object",
     "properties": {
-      "url": { "type": ["string", "null"], "description": "Absolute http or https URL to navigate to." },
-      "http_credentials_username": { "type": ["string", "null"] },
-      "http_credentials_password": { "type": ["string", "null"] },
-      "user_agent": { "type": ["string", "null"] },
-      "browser_type": { "type": ["string", "null"] },
-      "mobile": { "type": "boolean", "default": false },
-      "locale": { "type": ["string", "null"] },
-      "timezone_id": { "type": ["string", "null"] },
-      "storage_state_path": { "type": ["string", "null"] },
-      "record_video": { "type": "boolean", "default": false },
-      "trace_mode": { "type": ["string", "null"] },
-      "extra_http_headers": { "type": ["object", "null"], "additionalProperties": { "type": "string" } }
+      "url": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Absolute http or https URL to navigate to."
+      },
+      "http_credentials_username": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "http_credentials_password": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "user_agent": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "browser_type": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "mobile": {
+        "type": "boolean",
+        "default": false
+      },
+      "locale": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "timezone_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "storage_state_path": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "record_video": {
+        "type": "boolean",
+        "default": false
+      },
+      "trace_mode": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "extra_http_headers": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "additionalProperties": {
+          "type": "string"
+        }
+      }
     },
     "additionalProperties": false
   },
   "outputs": {
     "type": "object",
     "properties": {
-      "verdict": { "type": "string", "enum": ["ok", "warn", "deny"] },
-      "policyVerdict": { "type": ["object", "null"] },
+      "verdict": {
+        "type": "string",
+        "enum": [
+          "ok",
+          "warn",
+          "deny"
+        ]
+      },
+      "policyVerdict": {
+        "type": [
+          "object",
+          "null"
+        ]
+      },
       "result": {
-        "type": ["object", "null"],
+        "type": [
+          "object",
+          "null"
+        ],
         "properties": {
-          "status": { "type": "string", "enum": ["ok", "error"] },
-          "tool": { "type": "string", "const": "agency.browser.open" },
-          "output": { "type": ["object", "string", "null"], "additionalProperties": true },
-          "error": { "type": "string" }
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "error"
+            ]
+          },
+          "tool": {
+            "type": "string",
+            "const": "agency.browser.open"
+          },
+          "output": {
+            "type": [
+              "object",
+              "string",
+              "null"
+            ],
+            "additionalProperties": true
+          },
+          "error": {
+            "type": "string"
+          }
         },
         "additionalProperties": true
       },
-      "patch": { "type": ["string", "null"] },
-      "filesChanged": { "type": "array", "items": { "type": "object" } },
-      "errors": { "type": "array", "items": { "type": "string" } },
-      "dryRun": { "type": "boolean" },
-      "timestamp": { "type": "string" },
-      "actor": { "type": ["string", "null"] },
-      "signature": { "type": ["string", "null"] }
+      "patch": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "filesChanged": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      },
+      "errors": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "dryRun": {
+        "type": "boolean"
+      },
+      "timestamp": {
+        "type": "string"
+      },
+      "actor": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "signature": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
     },
-    "required": ["verdict", "dryRun", "timestamp"],
+    "required": [
+      "verdict",
+      "dryRun",
+      "timestamp"
+    ],
     "additionalProperties": false
   }
 }

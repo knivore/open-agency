@@ -1,0 +1,57 @@
+id: persona_sparse_source
+suite: persona_distillation
+name: Persona sparse-source extraction
+mode: persona_distillation_fixture
+description: Checks sparse source behavior and review burden.
+persona_distillation:
+  source_memories:
+    - id: sparse-evidence-note
+      title: Sparse evidence note
+      content: |
+        Evidence review: compare the observation to the workpaper before drafting a conclusion.
+      tags: ["persona-live-eval", "sparse"]
+  expected_items:
+    - id: sparse_knowledge
+      item_type: domain_knowledge
+      memory_layer: semantic
+      content_keywords: ["compare the observation", "workpaper", "drafting a conclusion"]
+      evidence: "compare the observation to the workpaper before drafting a conclusion"
+  results:
+    deterministic:
+      items:
+        - title: Evidence review
+          content: "Compare the observation to the workpaper before drafting a conclusion."
+          item_type: domain_knowledge
+          memory_layer: semantic
+          source_evidence: "compare the observation to the workpaper before drafting a conclusion"
+          evidence_verified: true
+      metrics: {latency_ms: 4, cost_usd: 0.0}
+    llm:
+      items:
+        - title: Evidence review
+          content: "Compare the observation to the workpaper before drafting a conclusion."
+          item_type: domain_knowledge
+          memory_layer: semantic
+          source_evidence: "compare the observation to the workpaper before drafting a conclusion"
+          evidence_verified: true
+          needs_review: true
+      metrics: {latency_ms: 64, cost_usd: 0.007}
+    hybrid:
+      items:
+        - title: Evidence review
+          content: "Compare the observation to the workpaper before drafting a conclusion."
+          item_type: domain_knowledge
+          memory_layer: semantic
+          source_evidence: "compare the observation to the workpaper before drafting a conclusion"
+          evidence_verified: true
+          needs_review: true
+      metrics: {latency_ms: 68, cost_usd: 0.007}
+assertions:
+  - type: persona_metric_min
+    mode: deterministic
+    metric: precision
+    value: 1.0
+  - type: persona_metric_min
+    mode: hybrid
+    metric: evidence_grounding
+    value: 1.0

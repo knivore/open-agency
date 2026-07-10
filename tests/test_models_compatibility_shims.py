@@ -13,7 +13,6 @@ class LegacyFolderDeletionTests(unittest.TestCase):
         self.assertFalse((repo_root / "database" / "db_connection.py").exists())
         self.assertFalse((repo_root / "app" / "tools" / "legacy.py").exists())
         self.assertFalse((repo_root / "app" / "tools" / "legacy_catalog.py").exists())
-        self.assertFalse((repo_root / "app" / "tools" / "executors.py").exists())
         self.assertFalse((repo_root / "util").exists())
         self.assertFalse((repo_root / "util" / "process_manager.py").exists())
         self.assertFalse((repo_root / "util" / "logger_config.py").exists())

@@ -1,15 +1,23 @@
+"""Execution control plane for local and isolated workflow runs.
+
+The control plane coordinates execution records, runtime adapter dispatch,
+Docker worker creation, lifecycle events, cancellation, replacement of stale
+active runs, and operator-facing repair actions. Route handlers should stay thin
+and call this boundary for runtime state transitions.
+"""
+
 from __future__ import annotations
 
 import asyncio
 import os
-from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 from uuid import uuid4
 
 from app.core.config import get_settings
 from app.core.time import ensure_utc, utc_now
 from app.domain import ExecutionEventType
 from app.runtime.containers import ContainerRuntimeError, RuntimeContainerSpec
+from app.runtime.execution_lifecycle import resolve_execution_runtime_policy
 from app.runtime.lifecycle import RuntimeLifecycleEventEmitter, RuntimeContainerState
 from app.runtime.native.approvals import ApprovalManager
 from app.runtime.native.errors import ExecutionNotFoundError
@@ -22,6 +30,147 @@ STALE_REPAIR_STATUSES = {"queued", "running", "paused", "cancelling"}
 LIVE_CONTAINER_STATUSES = {"created", "running", "restarting", "paused"}
 EXITED_CONTAINER_STATUSES = {"exited", "dead"}
 TERMINAL_EXECUTION_STATUSES = {"completed", "failed", "cancelled"}
+ONECLI_PROXY_ENV_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+ONECLI_CA_ENV_NAMES = ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO", "NODE_EXTRA_CA_CERTS")
+DIRECT_EXTERNAL_CREDENTIAL_ENV_NAMES = frozenset(
+    {
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GOOGLE_API_KEY",
+        "AZURE_API_KEY",
+        "AZURE_OPENAI_API_KEY",
+        "LOCAL_OPENAI_API_KEY",
+    }
+)
+
+
+def onecli_worker_environment(settings) -> dict[str, str]:
+    if not (settings.onecli_enabled and settings.onecli_force_for_isolated_workers):
+        return {}
+
+    node_options = os.getenv("NODE_OPTIONS", "").strip()
+    node_bootstrap_path = settings.onecli_node_proxy_bootstrap_path.strip()
+    env = {
+        "HTTP_PROXY": settings.onecli_gateway_url,
+        "HTTPS_PROXY": settings.onecli_gateway_url,
+        "http_proxy": settings.onecli_gateway_url,
+        "https_proxy": settings.onecli_gateway_url,
+        "NO_PROXY": settings.onecli_worker_no_proxy,
+        "no_proxy": settings.onecli_worker_no_proxy,
+        "ONECLI_ENABLED": "true",
+        "ONECLI_GATEWAY_URL": settings.onecli_gateway_url,
+        "ONECLI_FORCE_FOR_ISOLATED_WORKERS": "true",
+        "ONECLI_AGENT_TOKEN_SECRET_REF_CONFIGURED": str(bool(settings.onecli_agent_token_secret_ref)).lower(),
+    }
+    if node_bootstrap_path:
+        env["NODE_OPTIONS"] = f"{node_options} --require {node_bootstrap_path}".strip()
+        env["ONECLI_NODE_PROXY_BOOTSTRAP_PATH"] = node_bootstrap_path
+    if settings.onecli_gateway_ca_bundle_path:
+        ca_path = settings.onecli_gateway_ca_bundle_container_path
+        env.update(
+            {
+                "REQUESTS_CA_BUNDLE": ca_path,
+                "SSL_CERT_FILE": ca_path,
+                "CURL_CA_BUNDLE": ca_path,
+                "GIT_SSL_CAINFO": ca_path,
+                "NODE_EXTRA_CA_CERTS": ca_path,
+            }
+        )
+    return env
+
+
+def onecli_runtime_metadata(settings) -> dict[str, object]:
+    return {
+        "enabled": settings.onecli_enabled,
+        "force_for_isolated_workers": settings.onecli_force_for_isolated_workers,
+        "gateway_url": settings.onecli_gateway_url if settings.onecli_enabled else None,
+        "gateway_ca_bundle_configured": bool(settings.onecli_gateway_ca_bundle_path),
+        "gateway_ca_bundle_container_path": (
+            settings.onecli_gateway_ca_bundle_container_path
+            if settings.onecli_gateway_ca_bundle_path
+            else None
+        ),
+        "agent_token_secret_ref_configured": bool(settings.onecli_agent_token_secret_ref),
+        "worker_egress_mode": settings.onecli_worker_egress_mode,
+        "worker_egress_network": (
+            settings.onecli_worker_egress_network
+            if settings.onecli_worker_egress_mode == "docker_internal_network"
+            else None
+        ),
+        "node_proxy_bootstrap_configured": bool(settings.onecli_node_proxy_bootstrap_path.strip()),
+    }
+
+
+def onecli_worker_network_name(settings) -> str | None:
+    if (
+            settings.onecli_enabled
+            and settings.onecli_force_for_isolated_workers
+            and settings.onecli_worker_egress_mode == "docker_internal_network"
+    ):
+        return settings.onecli_worker_egress_network
+    return None
+
+
+def onecli_worker_enforcement_diagnostics(
+        settings,
+        env: dict[str, str],
+        *,
+        network_name: str | None = None,
+) -> dict[str, object]:
+    proxy_env_required = settings.onecli_enabled and settings.onecli_force_for_isolated_workers
+    ca_bundle_required = bool(proxy_env_required and settings.onecli_gateway_ca_bundle_path)
+    proxy_env_present = sorted(name for name in ONECLI_PROXY_ENV_NAMES if env.get(name))
+    ca_env_present = sorted(name for name in ONECLI_CA_ENV_NAMES if env.get(name))
+    missing_proxy_env = sorted(name for name in ONECLI_PROXY_ENV_NAMES if proxy_env_required and not env.get(name))
+    missing_ca_env = sorted(name for name in ONECLI_CA_ENV_NAMES if ca_bundle_required and not env.get(name))
+    forbidden_env_present = sorted(name for name in DIRECT_EXTERNAL_CREDENTIAL_ENV_NAMES if env.get(name))
+    node_proxy_bootstrap_path = env.get("ONECLI_NODE_PROXY_BOOTSTRAP_PATH")
+    enforcement_mode = (
+        settings.onecli_worker_egress_mode
+        if proxy_env_required
+        else "not_enforced"
+    )
+    container_level_egress_controls = (
+        "docker_internal_network"
+        if enforcement_mode == "docker_internal_network" and network_name
+        else "pending"
+    )
+
+    return {
+        "enabled": settings.onecli_enabled,
+        "force_for_isolated_workers": settings.onecli_force_for_isolated_workers,
+        "enforcement_mode": enforcement_mode,
+        "proxy_env_required": proxy_env_required,
+        "proxy_env_present": proxy_env_present,
+        "missing_proxy_env": missing_proxy_env,
+        "no_proxy_configured": bool(env.get("NO_PROXY") or env.get("no_proxy")),
+        "ca_bundle_required": ca_bundle_required,
+        "ca_bundle_configured": bool(settings.onecli_gateway_ca_bundle_path),
+        "ca_bundle_container_path": (
+            settings.onecli_gateway_ca_bundle_container_path
+            if settings.onecli_gateway_ca_bundle_path
+            else None
+        ),
+        "ca_env_present": ca_env_present,
+        "missing_ca_env": missing_ca_env,
+        "agent_token_secret_ref_configured": bool(settings.onecli_agent_token_secret_ref),
+        "node_proxy_bootstrap_configured": bool(node_proxy_bootstrap_path),
+        "node_proxy_bootstrap_path": node_proxy_bootstrap_path,
+        "direct_external_credentials_blocked": not forbidden_env_present,
+        "forbidden_env_present": forbidden_env_present,
+        "container_level_egress_controls": container_level_egress_controls,
+        "worker_network": network_name,
+        "direct_network_bypass_detection": "configured" if proxy_env_required else "not_enforced",
+    }
+
+
+def default_worker_codex_sandbox() -> str:
+    configured = os.getenv("CODEX_CLI_SANDBOX", "").strip()
+    if configured:
+        return configured
+    # Isolated workers often need write access for repo tasks, but they should
+    # not silently escalate to full host access outside an explicit local-dev override.
+    return "workspace-write"
 
 
 class ExecutionControlPlane:
@@ -94,10 +243,42 @@ class ExecutionControlPlane:
             execution.worker_id = self.worker_id
             execution.last_heartbeat_at = utc_now()
             await self.execution_store.update_execution(execution)
-            await self.runtime_registry.start_execution(execution_id)
+            stop_heartbeat = asyncio.Event()
+            heartbeat_task = asyncio.create_task(
+                self._heartbeat_while_local_execution_runs(
+                    execution_id=execution_id,
+                    worker_id=self.worker_id,
+                    stop_signal=stop_heartbeat,
+                )
+            )
+            try:
+                await self.runtime_registry.start_execution(execution_id)
+            finally:
+                stop_heartbeat.set()
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
         finally:
             await self.execution_store.release_lock(execution_id, self.worker_id)
             self._tasks.pop(execution_id, None)
+
+    async def _heartbeat_while_local_execution_runs(
+            self,
+            *,
+            execution_id: str,
+            worker_id: str,
+            stop_signal: asyncio.Event,
+    ) -> None:
+        # Local runs execute in-process, so a long model/tool call can otherwise leave
+        # the run looking dead even though the event loop is still healthy.
+        interval_seconds = max(1.0, float(self.stale_after_seconds) / 3.0)
+        while not stop_signal.is_set():
+            await asyncio.sleep(interval_seconds)
+            if stop_signal.is_set():
+                break
+            await self.execution_store.heartbeat(execution_id, worker_id)
 
     def _execution_host_for(self, execution) -> str:
         metadata = execution.metadata if isinstance(execution.metadata, dict) else {}
@@ -123,9 +304,20 @@ class ExecutionControlPlane:
             raise ExecutionNotFoundError(f"Execution '{execution_id}' was not found")
         if execution.status.value in TERMINAL_EXECUTION_STATUSES or execution.status.value == "cancelling":
             return execution
+        preservation = await self._partial_result_preservation_snapshot(execution, reason="cancel_requested")
+        if preservation:
+            metadata = dict(execution.metadata or {})
+            metadata["partial_result_preservation"] = preservation
+            execution.metadata = metadata
         execution.status = execution.status.__class__.CANCELLING
         await self.execution_store.update_execution(execution)
-        return await self.runtime_registry.cancel_execution(execution_id)
+        cancelled = await self.runtime_registry.cancel_execution(execution_id)
+        if preservation:
+            metadata = dict(cancelled.metadata or {})
+            metadata["partial_result_preservation"] = preservation
+            cancelled.metadata = metadata
+            cancelled = await self.execution_store.update_execution(cancelled)
+        return cancelled
 
     async def approve(self, execution_id: str, tool_id: str, reason: str | None = None) -> bool:
         return await self.approval_manager.approve(execution_id=execution_id, tool_id=tool_id, reason=reason)
@@ -140,10 +332,17 @@ class ExecutionControlPlane:
         repaired = await self.repair_stale_executions(workflow_id=workflow_id)
         return [item["execution_id"] for item in repaired]
 
-    async def repair_stale_executions(self, *, workflow_id: str | None = None) -> list[dict[str, object]]:
+    async def repair_stale_executions(
+            self,
+            *,
+            workflow_id: str | None = None,
+            execution_id: str | None = None,
+    ) -> list[dict[str, object]]:
         recovered = []
         active = await self.execution_store.list_active_executions()
         for execution in active:
+            if execution_id is not None and execution.id != execution_id:
+                continue
             if workflow_id is not None and execution.workflow_id != workflow_id:
                 continue
             if execution.status.value not in STALE_REPAIR_STATUSES:
@@ -152,7 +351,14 @@ class ExecutionControlPlane:
             if not classification["is_stale"]:
                 continue
             previous_status = execution.status.value
-            if previous_status == "cancelling":
+            completed_checkpoint = await self._has_completed_workflow_checkpoint(execution)
+            if completed_checkpoint and previous_status != "cancelling":
+                repair_action = "marked_completed"
+                execution.status = execution.status.__class__.COMPLETED
+                execution.completed_at = execution.completed_at or utc_now()
+                execution.error = None
+                event_type = ExecutionEventType.EXECUTION_COMPLETED
+            elif previous_status == "cancelling":
                 repair_action = "marked_cancelled"
                 execution.status = execution.status.__class__.CANCELLED
                 execution.completed_at = execution.completed_at or utc_now()
@@ -162,20 +368,38 @@ class ExecutionControlPlane:
                 repair_action = "requeued"
                 execution.status = execution.status.__class__.QUEUED
                 event_type = ExecutionEventType.EXECUTION_REPAIRED
+            preservation = None
+            if repair_action != "marked_completed":
+                preservation = await self._partial_result_preservation_snapshot(
+                    execution,
+                    reason=f"stale_execution_{repair_action}",
+                )
+            state = await self._event_state_for(execution.id, execution.workflow_id)
+            container_repair = None
+            if repair_action in {"requeued", "marked_completed"}:
+                container_repair = await self._cleanup_stale_execution_container(
+                    execution,
+                    state=state,
+                    reason=f"stale_execution_{repair_action}",
+                )
             execution.worker_id = None
             execution.last_heartbeat_at = None
             metadata = dict(execution.metadata or {})
-            metadata["stale_repair"] = {
+            if preservation:
+                metadata["partial_result_preservation"] = preservation
+            stale_repair = {
                 "repaired_at": utc_now().isoformat(),
                 "previous_status": previous_status,
                 "repair_action": repair_action,
                 "stale_after_seconds": self.stale_after_seconds,
                 "age_seconds": classification["age_seconds"],
             }
+            if container_repair:
+                stale_repair["container_repair"] = container_repair
+            metadata["stale_repair"] = stale_repair
             execution.metadata = metadata
             execution.updated_at = utc_now()
             await self.execution_store.update_execution(execution)
-            state = await self._event_state_for(execution.id, execution.workflow_id)
             await self.emitter.emit(
                 state,
                 event_type,
@@ -186,6 +410,9 @@ class ExecutionControlPlane:
                     "repair_action": repair_action,
                     "reason": classification["reason"],
                     "stale_classification": classification,
+                    **({"output": execution.output_payload} if repair_action == "marked_completed" else {}),
+                    **({"partial_result_preservation": preservation} if preservation else {}),
+                    **({"container_repair": container_repair} if container_repair else {}),
                 },
             )
             if self.runtime_operations is not None:
@@ -211,6 +438,61 @@ class ExecutionControlPlane:
             )
         return recovered
 
+    async def _has_completed_workflow_checkpoint(self, execution) -> bool:
+        output_payload = execution.output_payload
+        if not isinstance(output_payload, dict) or "final_output" not in output_payload:
+            return False
+        checkpoint = output_payload.get("checkpoint")
+        if not isinstance(checkpoint, dict):
+            return False
+        completed_node_ids = {
+            item
+            for item in checkpoint.get("completed_node_ids", [])
+            if isinstance(item, str) and item
+        }
+        if not completed_node_ids:
+            return False
+        checkpoint_terminal_node_ids = {
+            item
+            for item in checkpoint.get("terminal_node_ids", [])
+            if isinstance(item, str) and item
+        }
+        if checkpoint_terminal_node_ids:
+            return checkpoint_terminal_node_ids.issubset(completed_node_ids)
+        workflow = await self.runtime_registry.workflow_repository.get_workflow(execution.workflow_id)
+        if workflow is None or not workflow.nodes:
+            return False
+        task_node_ids = {
+            node.id
+            for node in workflow.nodes
+            if node.node_type == "task"
+        }
+        outgoing: dict[str, list[str]] = {}
+        for edge in workflow.edges:
+            outgoing.setdefault(edge.source_node_id, []).append(edge.target_node_id)
+        terminal_node_ids = set()
+        for node_id in task_node_ids:
+            pending = list(outgoing.get(node_id, []))
+            seen: set[str] = set()
+            reaches_later_task = False
+            while pending:
+                target_id = pending.pop()
+                if target_id in seen:
+                    continue
+                seen.add(target_id)
+                if target_id in task_node_ids:
+                    reaches_later_task = True
+                    break
+                pending.extend(outgoing.get(target_id, []))
+            if not reaches_later_task:
+                terminal_node_ids.add(node_id)
+        if not terminal_node_ids:
+            return False
+        # A stale worker can die after the final node side effect has persisted
+        # but before the engine flips the execution row to completed. In that
+        # case, requeueing would repeat external effects such as notifications.
+        return terminal_node_ids.issubset(completed_node_ids)
+
     def _classify_stale_execution(self, execution) -> dict[str, object]:
         reference = execution.last_heartbeat_at or execution.updated_at or execution.started_at or execution.created_at
         reference_at = ensure_utc(reference)
@@ -231,6 +513,53 @@ class ExecutionControlPlane:
             "reason": reason,
         }
 
+    async def _cleanup_stale_execution_container(
+            self,
+            execution,
+            *,
+            state: NativeExecutionState,
+            reason: str,
+    ) -> dict[str, object] | None:
+        if not execution.container_id or self.runtime_container_manager is None:
+            return None
+        result: dict[str, object] = {
+            "container_id": execution.container_id,
+            "previous_container_status": execution.container_status,
+            "action": "none",
+        }
+        try:
+            container = self.runtime_container_manager.inspect_container(execution.container_id)
+            result["inspected_status"] = container.status
+            if container.status in LIVE_CONTAINER_STATUSES:
+                container = self.runtime_container_manager.stop_container(execution.container_id)
+                result["action"] = "stopped_and_removed"
+            elif container.status in EXITED_CONTAINER_STATUSES:
+                result["action"] = "removed"
+            else:
+                result["action"] = "removed"
+            self.runtime_container_manager.remove_container(
+                execution.container_id,
+                force=container.status in EXITED_CONTAINER_STATUSES,
+            )
+            execution.container_status = "removed"
+            execution.container_ended_at = container.finished_at or execution.container_ended_at or utc_now()
+            execution.container_exit_code = container.exit_code
+            await self.lifecycle_emitter.emit_container_stopped(
+                state,
+                container,
+                runtime_revision_id=execution.runtime_revision_id,
+                reason=reason,
+            )
+            result.update(
+                {
+                    "new_container_status": execution.container_status,
+                    "exit_code": container.exit_code,
+                }
+            )
+        except Exception as exc:
+            result.update({"action": "cleanup_failed", "error": str(exc)})
+        return result
+
     async def _prepare_isolated_runtime(self, execution):
         if self.runtime_revision_service is None or self.runtime_container_manager is None:
             raise RuntimeError("Execution isolation requires runtime revision and container manager services")
@@ -245,6 +574,7 @@ class ExecutionControlPlane:
                     "execution_id": execution.id,
                     "workflow_id": execution.workflow_id,
                     "requested_adapter": execution.runtime_adapter_id,
+                    "onecli": onecli_runtime_metadata(settings),
                 }
             )
             execution.runtime_revision_id = revision.id
@@ -262,6 +592,18 @@ class ExecutionControlPlane:
                     reason=invalidated_revision.invalidation_reason,
                 )
             execution = await self._handle_outdated_executions(execution, revision.id)
+            workflow = await self.runtime_registry.workflow_repository.get_workflow(execution.workflow_id)
+            runtime_policy = resolve_execution_runtime_policy(
+                settings=settings,
+                workflow=workflow,
+                execution=execution,
+                include_workflow_member_maxima=True,
+            )
+            execution.metadata = {
+                **(execution.metadata if isinstance(execution.metadata, dict) else {}),
+                "runtime_policy": runtime_policy.model_dump(),
+            }
+            await self.execution_store.update_execution(execution)
 
             image = (
                 f"{revision.image_name}:{revision.image_tag}"
@@ -274,25 +616,64 @@ class ExecutionControlPlane:
                     worker_codex_cwd = settings.execution_container_workdir
                 else:
                     worker_codex_cwd = os.getenv("CODEX_CLI_CWD", settings.execution_container_workdir)
+            container_env = {
+                "AGENCY_EXECUTION_ID": execution.id,
+                "AGENCY_WORKFLOW_ID": execution.workflow_id,
+                "AGENCY_RUNTIME_REVISION_ID": revision.id,
+                "AGENCY_RUNTIME_ADAPTER_ID": execution.runtime_adapter_id,
+                "AGENCY_WORKER_ID": f"container-worker-{execution.id}",
+                "AGENCY_HEARTBEAT_INTERVAL_SECONDS": str(runtime_policy.heartbeat_interval_seconds),
+                "APP_ENV": settings.app_env,
+                "CODEX_HOME": os.getenv("EXECUTION_CODEX_HOME") or "/codex",
+                "CODEX_CLI_CWD": worker_codex_cwd,
+                "CODEX_CLI_SANDBOX": default_worker_codex_sandbox(),
+                "CODEX_CLI_TIMEOUT_SECONDS": str(runtime_policy.codex_cli_timeout_seconds),
+                "LLM_REQUEST_TIMEOUT_SECONDS": f"{runtime_policy.llm_request_timeout_seconds:g}",
+                **onecli_worker_environment(settings),
+                **({"DATABASE_URL": settings.container_database_url} if settings.container_database_url else {}),
+            }
+            if runtime_policy.worker_hard_timeout_seconds is not None:
+                container_env["AGENCY_EXECUTION_TIMEOUT_SECONDS"] = str(runtime_policy.worker_hard_timeout_seconds)
+            if execution.goal_id:
+                container_env["AGENCY_GOAL_ID"] = execution.goal_id
+            worker_network_name = onecli_worker_network_name(settings)
+            onecli_diagnostics = onecli_worker_enforcement_diagnostics(
+                settings,
+                container_env,
+                network_name=worker_network_name,
+            )
+            execution.metadata = {
+                **(execution.metadata if isinstance(execution.metadata, dict) else {}),
+                "worker_context": {
+                    "execution_id": execution.id,
+                    "workflow_id": execution.workflow_id,
+                    "goal_id": execution.goal_id,
+                    "runtime_revision_id": revision.id,
+                    "runtime_adapter_id": execution.runtime_adapter_id,
+                    "worker_id": container_env["AGENCY_WORKER_ID"],
+                },
+                "onecli_worker_enforcement": onecli_diagnostics,
+            }
+            await self.execution_store.update_execution(execution)
+            await self.emitter.emit(
+                state,
+                ExecutionEventType.ONECLI_WORKER_ENFORCEMENT_RECORDED,
+                payload=onecli_diagnostics,
+            )
             container_spec = RuntimeContainerSpec(
                 execution_id=execution.id,
                 workflow_id=execution.workflow_id,
                 runtime_revision_id=revision.id,
                 image=image,
+                goal_id=execution.goal_id,
                 command=["python", "-m", "app.runtime.worker"],
-                env={
-                    "AGENCY_EXECUTION_ID": execution.id,
-                    "AGENCY_WORKFLOW_ID": execution.workflow_id,
-                    "AGENCY_RUNTIME_REVISION_ID": revision.id,
-                    "AGENCY_RUNTIME_ADAPTER_ID": execution.runtime_adapter_id,
-                    "AGENCY_WORKER_ID": f"container-worker-{execution.id}",
-                    "AGENCY_HEARTBEAT_INTERVAL_SECONDS": "1.0",
-                    "APP_ENV": settings.app_env,
-                    "CODEX_HOME": os.getenv("CODEX_HOME", "/codex"),
-                    "CODEX_CLI_CWD": worker_codex_cwd,
-                    "CODEX_CLI_SANDBOX": os.getenv("CODEX_CLI_SANDBOX", "danger-full-access"),
-                    **({"DATABASE_URL": settings.container_database_url} if settings.container_database_url else {}),
+                env=container_env,
+                labels={
+                    "agency.onecli.enabled": str(settings.onecli_enabled).lower(),
+                    "agency.onecli.isolated_workers": str(settings.onecli_force_for_isolated_workers).lower(),
+                    "agency.onecli.egress_mode": settings.onecli_worker_egress_mode,
                 },
+                network_name=worker_network_name,
             )
             created = self.runtime_container_manager.create_execution_container(container_spec)
             execution.container_id = created.container_id
@@ -480,9 +861,19 @@ class ExecutionControlPlane:
                     "replacement_workflow_revision": replacement_revision,
                 },
                 runtime_adapter_id=execution.runtime_adapter_id,
+                goal_id=execution.goal_id,
             )
             replacement.replacement_of_execution_id = execution.id
             replacement.restart_reason = "workflow_revision_superseded"
+            preservation = await self._partial_result_preservation_snapshot(
+                execution,
+                reason="workflow_revision_superseded",
+            )
+            if preservation:
+                replacement.metadata = {
+                    **(replacement.metadata or {}),
+                    "source_partial_result_preservation": preservation,
+                }
             await self.execution_store.update_execution(replacement)
             await self.queue_start(replacement.id)
             await self._replace_outdated_execution(
@@ -490,6 +881,7 @@ class ExecutionControlPlane:
                 replacement_execution=replacement,
                 runtime_revision_id=execution.runtime_revision_id or replacement.runtime_revision_id or "",
                 reason="workflow_revision_superseded",
+                preservation=preservation,
                 extra={
                     "replacement_workflow_revision": replacement_revision,
                     "previous_workflow_revision": previous_revision,
@@ -505,15 +897,27 @@ class ExecutionControlPlane:
             replacement_execution,
             runtime_revision_id: str,
             reason: str,
+            preservation: dict[str, Any] | None = None,
             extra: dict | None = None,
     ) -> None:
         state = await self._event_state_for(execution.id, execution.workflow_id)
+        preservation = preservation or await self._partial_result_preservation_snapshot(execution, reason=reason)
         execution.restart_reason = reason
+        if preservation:
+            execution.metadata = {
+                **(execution.metadata or {}),
+                "partial_result_preservation": preservation,
+            }
         try:
             execution = await self.runtime_registry.cancel_execution(execution.id)
         except Exception:
             execution.status = execution.status.__class__.CANCELLED
             execution.completed_at = execution.completed_at or utc_now()
+            if preservation:
+                execution.metadata = {
+                    **(execution.metadata or {}),
+                    "partial_result_preservation": preservation,
+                }
             await self.execution_store.update_execution(execution)
             await self.emitter.emit(
                 state,
@@ -522,8 +926,16 @@ class ExecutionControlPlane:
                     "execution_id": execution.id,
                     "reason": reason,
                     "replacement_execution_id": replacement_execution.id,
+                    **({"partial_result_preservation": preservation} if preservation else {}),
                 },
             )
+        else:
+            if preservation:
+                execution.metadata = {
+                    **(execution.metadata or {}),
+                    "partial_result_preservation": preservation,
+                }
+                await self.execution_store.update_execution(execution)
 
         execution.restart_reason = reason
         if not execution.container_id:
@@ -536,10 +948,28 @@ class ExecutionControlPlane:
             execution.container_id,
             force=container.status in EXITED_CONTAINER_STATUSES,
         )
+        finalized_cancellation = False
+        # Replacement owns the isolated worker shutdown, so finalize cooperative
+        # cancellation here instead of waiting for a worker that was just removed.
+        if execution.status.value == "cancelling":
+            execution.status = execution.status.__class__.CANCELLED
+            execution.completed_at = execution.completed_at or utc_now()
+            finalized_cancellation = True
         execution.container_status = "removed"
         execution.container_ended_at = container.finished_at or execution.container_ended_at or utc_now()
         execution.container_exit_code = container.exit_code
         await self.execution_store.update_execution(execution)
+        if finalized_cancellation:
+            await self.emitter.emit(
+                state,
+                ExecutionEventType.EXECUTION_CANCELLED,
+                payload={
+                    "execution_id": execution.id,
+                    "reason": reason,
+                    "replacement_execution_id": replacement_execution.id,
+                    **({"partial_result_preservation": preservation} if preservation else {}),
+                },
+            )
         await self.lifecycle_emitter.emit_container_replaced(
             state,
             container,
@@ -548,9 +978,44 @@ class ExecutionControlPlane:
             extra={
                 "replacement_execution_id": replacement_execution.id,
                 "replacement_runtime_revision_id": runtime_revision_id,
+                **({"partial_result_preservation": preservation} if preservation else {}),
                 **(extra or {}),
             },
         )
+
+    async def _partial_result_preservation_snapshot(self, execution, *, reason: str) -> dict[str, Any] | None:
+        artifacts = await self.execution_store.list_artifacts(execution.id)
+        output_payload = execution.output_payload if isinstance(execution.output_payload, dict) else None
+        node_outputs = output_payload.get("node_outputs") if output_payload is not None else {}
+        if not isinstance(node_outputs, dict):
+            node_outputs = {}
+        has_output = execution.output_payload is not None
+        if not has_output and not artifacts:
+            return None
+        snapshot: dict[str, Any] = {
+            "recorded_at": utc_now().isoformat(),
+            "reason": reason,
+            "execution_id": execution.id,
+            "workflow_id": execution.workflow_id,
+            "goal_id": execution.goal_id,
+            "output_payload_present": has_output,
+            "output_payload_keys": sorted(output_payload.keys()) if output_payload is not None else [],
+            "node_output_ids": sorted(str(node_id) for node_id in node_outputs),
+            "artifact_count": len(artifacts),
+            "artifacts": [
+                {
+                    "artifact_id": artifact.id,
+                    "event_id": artifact.event_id,
+                    "name": artifact.name,
+                    "artifact_type": artifact.artifact_type,
+                    "uri": artifact.uri,
+                    "media_type": artifact.media_type,
+                    "size_bytes": artifact.size_bytes,
+                }
+                for artifact in artifacts
+            ],
+        }
+        return snapshot
 
     async def _event_state_for(self, execution_id: str, workflow_id: str) -> NativeExecutionState:
         existing_events = await self.execution_store.list_events(execution_id)

@@ -1,3 +1,5 @@
+"""Shared runtime adapter protocol and status types."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,6 +10,8 @@ from app.domain import Execution, WorkflowDefinition
 
 
 class BaseRuntimeAdapter(Protocol):
+    """Protocol implemented by native, CrewAI, and future runtime adapters."""
+
     adapter_name: str
 
     def get_status(self) -> "RuntimeAdapterStatus": ...
@@ -28,6 +32,8 @@ class BaseRuntimeAdapter(Protocol):
 
 
 class RuntimeAdapterCapability(str, Enum):
+    """Lifecycle operations a runtime adapter can expose to the API."""
+
     START = "start"
     OBSERVE = "observe"
     PAUSE = "pause"
@@ -37,6 +43,8 @@ class RuntimeAdapterCapability(str, Enum):
 
 @dataclass(frozen=True)
 class RuntimeAdapterStatus:
+    """Health and capability snapshot returned by runtime adapters."""
+
     adapter_name: str
     available: bool
     detail: str | None = None

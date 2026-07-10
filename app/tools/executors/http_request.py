@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import httpx
 import json
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 
 from app.domain import ToolDefinition, ToolType
 from app.runtime.native.errors import ToolExecutionError
@@ -18,6 +18,8 @@ class HttpRequestToolExecutor:
         method = str(arguments.get("method") or tool.implementation.config.get("method") or "GET").upper()
         parsed = urlparse(str(url))
         allowlisted_domains = set(tool.security.allowlisted_domains)
+        if parsed.scheme not in {"http", "https"}:
+            raise ToolExecutionError(f"URL scheme '{parsed.scheme or '<missing>'}' is not allowed for tool '{tool.id}'")
         if not parsed.hostname or parsed.hostname not in allowlisted_domains:
             raise ToolExecutionError(f"Domain '{parsed.hostname}' is not allowlisted for tool '{tool.id}'")
 
@@ -28,10 +30,14 @@ class HttpRequestToolExecutor:
             **tool.implementation.config.get("headers", {}),
             **dict(arguments.get("headers", {})),
         }
-        request = Request(url=str(url), method=method, data=data, headers=headers)
-        with urlopen(request, timeout=tool.implementation.config.get("timeout", 30)) as response:  # noqa: S310
-            payload = response.read().decode("utf-8")
-            content_type = response.headers.get("Content-Type", "")
-            if "application/json" in content_type:
-                return {"status_code": response.status, "body": json.loads(payload)}
-            return {"status_code": response.status, "body": payload}
+        response = httpx.request(
+            method,
+            str(url),
+            content=data,
+            headers=headers,
+            timeout=tool.implementation.config.get("timeout", 30),
+        )
+        content_type = response.headers.get("Content-Type", "")
+        if "application/json" in content_type:
+            return {"status_code": response.status_code, "body": response.json()}
+        return {"status_code": response.status_code, "body": response.text}

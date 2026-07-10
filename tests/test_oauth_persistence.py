@@ -1,7 +1,6 @@
 import unittest
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, patch
 import time
-import asyncio
 
 from app.llm.openai_codex import OpenAICodexModelClient
 from app.llm.google import GoogleModelClient
@@ -29,7 +28,7 @@ class TestOAuthPersistence(unittest.IsolatedAsyncioTestCase):
 
     @patch("app.utils.oauth_pkce.OAuthPKCEHandler.refresh_token")
     @patch("app.llm.openai_codex.OpenAI")
-    async def test_codex_persistence(self, mock_openai, mock_refresh):
+    async def test_codex_persistence(self, _mock_openai, mock_refresh):
         mock_refresh.return_value = {
             "access_token": "new-token",
             "refresh_token": "new-refresh-token",
@@ -65,7 +64,7 @@ class TestOAuthPersistence(unittest.IsolatedAsyncioTestCase):
 
     @patch("app.utils.oauth_pkce.OAuthPKCEHandler.refresh_token")
     @patch("app.llm.azure.AzureOpenAI")
-    async def test_azure_persistence(self, mock_azure, mock_refresh):
+    async def test_azure_persistence(self, _mock_azure, mock_refresh):
         mock_refresh.return_value = {
             "access_token": "new-azure-token",
             "refresh_token": "new-azure-refresh",

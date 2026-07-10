@@ -2,6 +2,9 @@
 setlocal
 
 set "SCRIPT_DIR=%~dp0"
+set "RUN_LOG=%TEMP%\agency-run-windows.log"
+if not defined AGENCY_FE_DIR set "AGENCY_FE_DIR=%SCRIPT_DIR%..\open-agency-fe"
+if not defined AGENCY_FRONTEND_HOST_WORKSPACE set "AGENCY_FRONTEND_HOST_WORKSPACE=%AGENCY_FE_DIR%"
 set "GIT_BASH=%ProgramFiles%\Git\bin\bash.exe"
 
 if not exist "%GIT_BASH%" (
@@ -10,14 +13,13 @@ if not exist "%GIT_BASH%" (
 
 if not exist "%GIT_BASH%" (
   echo Git Bash was not found.
-  echo Install Git for Windows or run: bash ./run-windows.sh start
+  echo Install Git for Windows, then run this command again.
   pause
   exit /b 1
 )
 
 pushd "%SCRIPT_DIR%" >nul
-set "RUN_LOG=%TEMP%\open-agency-run-windows.log"
-"%GIT_BASH%" "%SCRIPT_DIR%run-windows.sh" %* > "%RUN_LOG%" 2>&1
+"%GIT_BASH%" "%SCRIPT_DIR%scripts/launcher/run-windows.sh" %* > "%RUN_LOG%" 2>&1
 set "EXIT_CODE=%ERRORLEVEL%"
 popd >nul
 

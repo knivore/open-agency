@@ -20,6 +20,7 @@ from app.db.models import (
 )
 from app.db.mongo import get_mongodb_db_name, mongo_db_connect
 from app.domain import Execution, ExecutionArtifact, ExecutionEvent
+from app.services.execution_activity import activity_payload_for_event
 from .sql import SQLAlchemyRepository
 
 
@@ -336,6 +337,12 @@ class MongoExecutionEventRepository:
         if counter is None:
             raise ValueError(f"Execution '{event.execution_id}' was not found for event append")
         event.sequence = int(counter["_next_event_sequence"])
+        activity = activity_payload_for_event(event)
+        if activity is not None:
+            await self.execution_repository.collection.update_one(
+                {"id": event.execution_id},
+                {"$set": {"metadata.runtime_activity": activity, "updated_at": event.timestamp.isoformat()}},
+            )
         await self.collection.insert_one(_serialize_event(event))
         return event
 

@@ -4,7 +4,6 @@ from typing import Any
 from urllib.parse import urlparse
 
 from app.tools.contracts.models import PolicyRuleResult, PolicyVerdict
-
 from .http import BLOCKED_HOSTS
 
 BROWSER_MUTATION_TOOLS = {

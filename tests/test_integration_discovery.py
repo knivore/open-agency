@@ -7,6 +7,7 @@ from pathlib import Path
 from app.tools.discovery import (
     discover_allowed_python_tool_modules,
     discover_builtin_tool_modules,
+    discover_generated_tool_modules,
     discover_integration_tool_modules,
     discover_integrations,
 )
@@ -20,6 +21,10 @@ class IntegrationDiscoveryTests(unittest.TestCase):
         self.assertTrue(any(item.manifest.id == "sample-integration" for item in discovered))
         modules = discover_integration_tool_modules(strict=True)
         self.assertIn("integrations.sample_integration.tools", modules)
+
+    def test_repo_sample_generated_tool_is_discovered(self) -> None:
+        modules = discover_generated_tool_modules(strict=True)
+        self.assertIn("generated_tools.sample_generated_tool.tools", modules)
 
     def test_invalid_manifest_is_skipped_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -66,5 +71,6 @@ class IntegrationDiscoveryTests(unittest.TestCase):
         registry = ToolRegistry()
 
         self.assertIn("integrations.sample_integration.tools", registry.default_python_allowlist)
+        self.assertIn("generated_tools.sample_generated_tool.tools", registry.default_python_allowlist)
         self.assertTrue(set(discover_builtin_tool_modules()).issubset(registry.default_python_allowlist))
         self.assertTrue(set(discover_allowed_python_tool_modules()).issubset(registry.default_python_allowlist))

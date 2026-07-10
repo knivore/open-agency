@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from app.tools.risk import risk_labels_for_contract_run
 from .builtins import generated_builtin_contracts
 from .loader import load_contracts
 from .models import ToolContract
@@ -14,6 +15,8 @@ class ToolContractRegistry:
             self.register(contract)
 
     def register(self, contract: ToolContract) -> None:
+        if not contract.risk_labels:
+            contract.risk_labels = risk_labels_for_contract_run(contract.name)
         self._contracts[contract.name] = contract
 
     def list_contracts(self) -> list[ToolContract]:

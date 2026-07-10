@@ -1,3 +1,5 @@
+"""Validation rules for user-defined and built-in tool contracts."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -21,6 +23,8 @@ class ToolValidationResult:
 
 
 class ToolValidationService:
+    """Apply security and shape checks before a tool definition is accepted."""
+
     def validate(self, tool: ToolDefinition) -> ToolValidationResult:
         errors: list[ToolValidationIssue] = []
         warnings: list[ToolValidationIssue] = []

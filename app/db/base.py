@@ -1,3 +1,5 @@
+"""SQLAlchemy declarative base shared by all ORM mappings."""
+
 from sqlalchemy import MetaData
 from sqlalchemy.orm import DeclarativeBase
 
@@ -11,4 +13,6 @@ NAMING_CONVENTION = {
 
 
 class Base(DeclarativeBase):
+    """Declarative base using stable naming conventions for Alembic diffs."""
+
     metadata = MetaData(naming_convention=NAMING_CONVENTION)

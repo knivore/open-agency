@@ -1,3 +1,5 @@
+"""CrewAI tool wrappers for app-owned tool implementations."""
+
 from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict

@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterator, List, Optional
 
 from app.domain import ModelProfileDefinition
 from app.llm.base import ModelMessage, ModelResponse, ModelToolCall
+from app.llm.openai_helpers import sanitize_openai_message_name
 from app.llm.registry import LLMEnvironmentConfig
 
 
@@ -17,9 +18,34 @@ class OpenAICompatibleModelClient:
     def __init__(self, profile: ModelProfileDefinition, env_config: LLMEnvironmentConfig):
         self.profile = profile
         self.env_config = env_config
-        self.base_url = profile.base_url or env_config.local_openai_base_url
-        self.api_key = profile.api_key_ref or env_config.openai_api_key or env_config.local_openai_api_key or "not-required"
+        self.base_url = profile.base_url or self._provider_env_base_url() or env_config.local_openai_base_url
+        # Provider-specific keys keep OpenAI-compatible services from accidentally using OPENAI_API_KEY.
+        self.api_key = (
+                profile.api_key_ref
+                or self._provider_env_api_key()
+                or env_config.local_openai_api_key
+                or "not-required"
+        )
         self.client = OpenAI(base_url=self.base_url, api_key=self.api_key)
+
+    def _provider_env_base_url(self) -> Optional[str]:
+        provider = self.profile.provider.strip().lower().replace("-", "_")
+        if provider == "deepseek":
+            return self.env_config.deepseek_base_url or "https://api.deepseek.com"
+        if provider == "qwen":
+            return (
+                    self.env_config.qwen_base_url
+                    or "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+            )
+        return None
+
+    def _provider_env_api_key(self) -> Optional[str]:
+        provider = self.profile.provider.strip().lower().replace("-", "_")
+        if provider == "deepseek":
+            return self.env_config.deepseek_api_key
+        if provider == "qwen":
+            return self.env_config.qwen_api_key
+        return self.env_config.openai_api_key
 
     def _to_openai_messages(self, messages: List[ModelMessage]) -> List[Dict[str, Any]]:
         payload = []
@@ -28,8 +54,22 @@ class OpenAICompatibleModelClient:
                 "role": message.role,
                 "content": message.content,
             }
+            if message.tool_calls:
+                item["tool_calls"] = [
+                    {
+                        "id": tool_call.id,
+                        "type": "function",
+                        "function": {
+                            "name": sanitize_openai_message_name(tool_call.name) or tool_call.name,
+                            "arguments": json.dumps(tool_call.arguments or {}),
+                        },
+                    }
+                    for tool_call in message.tool_calls
+                ]
             if message.name:
-                item["name"] = message.name
+                sanitized_name = sanitize_openai_message_name(message.name)
+                if sanitized_name:
+                    item["name"] = sanitized_name
             if message.tool_call_id:
                 item["tool_call_id"] = message.tool_call_id
             payload.append(item)

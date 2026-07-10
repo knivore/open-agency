@@ -1,3 +1,5 @@
+"""Runtime stream rate limiting, batching, and payload safety helpers."""
+
 from __future__ import annotations
 
 import asyncio
@@ -8,7 +10,6 @@ from typing import Any
 
 from .runtime_event_models import RuntimeEventLevel, RuntimeEventType, RuntimeStreamEvent
 
-
 DEFAULT_RUNTIME_STREAM_MAX_EVENT_BYTES = 64 * 1024
 DEFAULT_RUNTIME_STREAM_MAX_LOG_CHARS = 4_000
 DEFAULT_RUNTIME_STREAM_MAX_EVENTS_PER_SECOND = 30
@@ -16,6 +17,8 @@ DEFAULT_RUNTIME_STREAM_MAX_BATCH_SIZE = 25
 
 
 class RuntimeStreamRateLimiter:
+    """Simple async limiter that spaces outbound stream events."""
+
     def __init__(self, max_events_per_second: int = DEFAULT_RUNTIME_STREAM_MAX_EVENTS_PER_SECOND) -> None:
         self.min_interval = 1 / max(1, max_events_per_second)
         self._next_allowed_at = 0.0

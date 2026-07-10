@@ -14,6 +14,127 @@ The active runtime areas are:
 - `app/runtime/reconcile.py`
 - `app/runtime/containers.py`
 
+The preferred local mode is to run the backend and main-agent process on the host and keep execution workers in Docker:
+
+```bash
+./run.sh start
+```
+
+This keeps main-agent chat on the host Codex CLI and host `~/.codex`, while native workflow and tool execution can
+remain isolated through worker containers when `EXECUTION_ISOLATION_ENABLED=true`.
+
+Relevant local mode settings:
+
+- `AGENCY_BACKEND_RUN_MODE=host` keeps the backend and main-agent process on the host while isolated workers stay in Docker
+- `EXECUTION_ISOLATION_ENABLED=true` enables Docker-backed isolated execution for workflow and tool runs
+
+Runtime event and notification features:
+
+- [Outbound Runtime Webhooks](./runtime/outbound-webhooks.md)
+- [Internal Sub-Agent Callbacks](./runtime/subagent-callbacks.md)
+
+Outbound runtime webhooks are backend service-side notifications from Agency to registered external targets. Internal
+sub-agent callbacks are service calls that write `subagent.*` execution events and checkpoint metadata for supervisor or
+main-agent continuation. Neither feature exposes public third-party runtime webhook triggers.
+
+Workflow executions can also be linked to a durable goal. Launch callers should pass `goal_id` in the execution
+creation payload, trigger metadata, or runtime input when the run is an attempt under a long-running objective. The
+runtime keeps execution events as the source of truth for activity; the goal layer uses those events, artifacts,
+approval records, and evidence/evaluation payloads to decide whether the objective is progressing or complete.
+
+## Backend Process And Container Startup
+
+Start the FastAPI backend directly:
+
+```bash
+make dev
+```
+
+Equivalent host command:
+
+```bash
+SSL_CERT_FILE=certs/local_cloudflare.cert ./.venv/bin/python -m uvicorn app:app --reload
+```
+
+Windows PowerShell equivalent:
+
+```powershell
+$env:SSL_CERT_FILE = "certs/local_cloudflare.cert"
+.\.venv\Scripts\python.exe -m uvicorn app:app --reload
+```
+
+If you are running the backend directly on Windows instead of through the launcher, start Postgres and Redis first:
+
+```powershell
+docker compose up -d postgres redis
+.\.venv\Scripts\python.exe -m alembic upgrade head
+$env:SSL_CERT_FILE = "certs/local_cloudflare.cert"
+.\.venv\Scripts\python.exe -m uvicorn app:app --reload
+```
+
+Once the server is running, the built-in API docs are available at:
+
+- `http://localhost:8000/docs`
+- `http://localhost:8000/redoc`
+- `http://localhost:8000/openapi.json`
+
+The canonical app factory is `app.api.main:create_app()`. The root [`app.py`](../app.py) file is intentionally a thin
+entrypoint.
+
+Container definitions are grouped under:
+
+- [`docker/backend/Dockerfile`](../docker/backend/Dockerfile)
+- [`docker/postgres/Dockerfile`](../docker/postgres/Dockerfile)
+- [`docker/postgres/initdb/001-extensions.sql`](../docker/postgres/initdb/001-extensions.sql)
+- [`docker/redis/Dockerfile`](../docker/redis/Dockerfile)
+- [`docker/redis/redis.conf`](../docker/redis/redis.conf)
+- [`docker/langfuse/README.md`](../docker/langfuse/README.md)
+
+The backend image is built from [`docker/backend/Dockerfile`](../docker/backend/Dockerfile). Backend container startup
+waits for Postgres and Redis, runs `alembic upgrade head`, and then starts `uvicorn app:app`.
+
+This is why the repo has both host launch scripts and a container `entrypoint.sh`:
+
+- `run.sh` and `run-windows.sh` manage the host dev stack
+- `docker/backend/entrypoint.sh` owns self-contained backend-container startup
+
+That separation lets the backend container restart correctly even when the host scripts are not involved.
+
+## Observability Stack
+
+The full Docker Compose stack includes self-hosted Langfuse.
+
+Useful local endpoints:
+
+- backend API: `http://localhost:8000`
+- Langfuse UI/API: `http://localhost:3001`
+- Langfuse MinIO S3 endpoint: `http://localhost:9090`
+- Langfuse MinIO console: `http://localhost:9091`
+
+The backend container is wired with:
+
+- `LANGFUSE_BASE_URL=http://langfuse-web:3001`
+- `LANGFUSE_HOST=http://langfuse-web:3001` for older SDK compatibility
+- `LANGFUSE_PUBLIC_KEY`
+- `LANGFUSE_SECRET_KEY`
+- `OBSERVABILITY_EXPORTERS`
+- `OBSERVABILITY_REDACT_SECRETS=true`
+- `OBSERVABILITY_JSONL_PATH=logs/observability.jsonl`
+
+By default, local backend runs still use `OBSERVABILITY_EXPORTERS=jsonl`. To include Langfuse in local exporter
+selection:
+
+```env
+OBSERVABILITY_EXPORTERS=jsonl,langfuse
+LANGFUSE_BASE_URL=http://localhost:3001
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+```
+
+JSONL remains the append-only local audit trail. The Langfuse exporter maps LLM responses to `generation`
+observations, tool calls to `tool` observations, and approvals/actions/runtime events to spans with execution, agent,
+tool-call, sequence, risk-label, and redaction metadata.
+
 ## Native Runtime
 
 The native runtime is the preferred execution path for the app-centric architecture.
@@ -38,10 +159,296 @@ The internal source of truth is the execution event stream, not framework-specif
 
 For isolated execution today, the native runtime is also the only adapter that runs inside the managed worker container.
 
+### Runtime Timeout Policy
+
+Before an execution starts, Agency resolves timeout configuration into `execution.metadata.runtime_policy`. The same
+resolved policy is used by the control plane, isolated worker environment, and main-agent workflow monitor so worker hard
+timeouts, stale-run detection, Codex CLI timeouts, and LLM request timeouts do not drift apart.
+
+Default values come from:
+
+- `AGENT_RUN_TIMEOUT_SECONDS`
+- `AGENT_ACTIVITY_IDLE_TIMEOUT_SECONDS`
+- `CODEX_CLI_TIMEOUT_SECONDS`
+- `LLM_REQUEST_TIMEOUT_SECONDS`
+
+Workflow, task, agent, trigger, or input metadata can override those defaults with `runtime_policy`; existing
+`timeout_policy` metadata is still accepted for compatibility. Isolated worker startup resolves the longest task or
+agent timeout in the workflow before creating the container, which lets long-running agents extend the actual worker
+lifetime before any task activity event has been emitted.
+
 Shared memory is retrieved before each native task when workflow metadata has `shared_memory.enabled=true` or the assigned
 agent has `memory.enabled=true` with a non-`execution` scope. Retrieval uses the canonical memory service and can draw
 from relevant workflow, workspace, user, global, and agent-attributed records. Operators can update the setting through
 `PATCH /workflows/{workflow_id}/shared-memory`.
+
+### Agency Graph Runtime Context
+
+The native runtime can retrieve read-only Agency Graph context at runtime trigger points when graph context is enabled
+for the assigned agent and the global graph-context feature flags allow it. The graph is not a replacement for durable
+memory: durable memory supplies reusable semantic facts and context packs, while Agency Graph context supplies bounded
+relationship, lineage, prior-attempt, failure, decision, and next-action context around the current run.
+
+Runtime graph context can be retrieved before sub-agent start, before coding-agent resume work, after execution failure,
+after context compaction, and before proposal tools. Retrieved entries are appended to native execution state under
+`graph_context_entries`, capped to the recent working set, and surfaced to the next task prompt as a synthetic
+`runtime_graph_context` message. Each successful retrieval can also create or update an in-memory graph working set so a
+later tool call can summarize, curate, or persist that working set as a `memory_type=context_pack` memory.
+
+Runtime graph retrieval is intentionally bounded:
+
+- `AGENCY_GRAPH_CONTEXT_TOOLS_ENABLED` controls graph tool discovery and setup defaults.
+- `GRAPH_CONTEXT_AUTO_RETRIEVAL_ENABLED` controls automatic runtime retrieval.
+- `GRAPH_CONTEXT_SUBAGENT_STEERING_ENABLED` controls sub-agent steering retrieval.
+- `GRAPH_CONTEXT_CODING_AGENT_RESUME_ENABLED` controls coding-agent resume retrieval.
+- `GRAPH_CONTEXT_LOOP_GUARD_ENABLED` prevents repeated retrieval when no runtime progress has happened since the last
+  similar graph context request.
+- graph queries also honor `AGENCY_GRAPH_CONTEXT_QUERY_TIMEOUT_SECONDS`,
+  `AGENCY_GRAPH_CONTEXT_RATE_LIMIT_WINDOW_SECONDS`, and `AGENCY_GRAPH_CONTEXT_RATE_LIMIT_MAX_UNITS`.
+
+Graph context emits runtime events and runtime-operation counters for calls, failures, output sizes, context-pack
+creation, and auto-retrieval injections. These counters are intended for diagnosing graph-context behavior without
+dumping raw graph data into prompts or logs.
+
+### Runtime Governance
+
+Native executions now record runtime-governance telemetry around each model call.
+
+Before every native LLM request, the runtime estimates context health from the assembled `ModelMessage` list, the model
+profile context window, and reserved completion tokens. It emits `context.health.recorded` and includes context fields on
+the following `llm.request.created` metrics:
+
+- `estimated_prompt_tokens`
+- `reserved_completion_tokens`
+- `estimated_total_context_tokens`
+- `context_window`
+- `context_usage_ratio`
+- `context_status`
+
+After every native LLM response, provider usage is normalized into canonical token fields and emitted as
+`token.usage.recorded`. The runtime also keeps backward-compatible `input_tokens` and `output_tokens` metrics for older
+observability consumers. Canonical fields are:
+
+- `prompt_tokens`
+- `completion_tokens`
+- `total_tokens`
+- `estimated_cost`
+- `token_usage_estimated`
+
+Token cost is estimated only from model-profile parameters, such as `input_token_cost_per_1m`,
+`output_token_cost_per_1m`, `cached_input_token_cost_per_1m`, and `currency`. The backend does not hard-code public model
+pricing.
+
+When a model profile has fallback enabled, the runtime may switch from the primary model to a backup model for allowed
+retryable failures. Successful switches emit `model.fallback.used` before `llm.response.created`; exhausted fallback
+chains emit `model.fallback.failed` before the model error propagates. The canonical event payloads include:
+
+- `model_request_id`
+- `model_profile_id`
+- `primary_provider`
+- `primary_model`
+- `fallback_provider` and `fallback_model` for successful switches
+- `fallback_index`
+- `attempts` with provider, model, error type, retryable flag, and category
+- `error` for exhausted fallback chains
+
+Successful fallback metadata is also copied into normalized token usage at
+`usage.provider_usage.model_fallback`, so run usage snapshots and model usage aggregation can show fallback rate and
+primary models that commonly fall back.
+
+Executions expose the latest aggregate snapshot under `execution.metadata.runtime_governance`, which is also returned by
+`GET /executions/{execution_id}` under `state.runtime_governance`. The snapshot may include:
+
+- `token_usage.total`
+- `token_usage.by_agent`
+- `token_usage.by_task`
+- `token_usage.by_model`
+- `context_health.last`
+- `context_compaction.last`
+- `budget_warnings_emitted`
+
+For SQL-backed deployments this snapshot is persisted on `executions.metadata_json`, not only inside the execution
+trigger payload. `SQLExecutionStore.save_execution()` writes `metadata_json` on both create and update paths, so context
+health and token usage snapshots survive later status, output, error, heartbeat, and terminal completion saves.
+
+Narrow read APIs are available when a UI or API client does not need the full execution detail payload:
+
+- `GET /executions/{execution_id}/usage`
+- `GET /executions/{execution_id}/context-usage`
+- `GET /executions/{execution_id}/approvals`
+
+The runtime governance source-of-truth model is:
+
+- detailed immutable history in `ExecutionEvent.payload`, `ExecutionEvent.metrics`, and `ExecutionEvent.metadata`
+- current read snapshot in `Execution.metadata.runtime_governance`, backed by `executions.metadata_json` for SQL stores
+- compacted summaries in `memory_records` with `memory_type=context_pack`
+- persisted native approval rows in `approval_requests`
+
+`GET /executions/{execution_id}/usage` returns a token-focused projection. It intentionally omits the internal
+`processed_event_ids` idempotency list. Run Detail uses this response for run-level summary cards plus per-agent,
+per-task, per-model, and budget-warning breakdown rows.
+
+```json
+{
+  "execution_id": "execution-1",
+  "workflow_id": "workflow-1",
+  "source": "execution.metadata.runtime_governance",
+  "token_usage": {
+    "total": {
+      "prompt_tokens": 1200,
+      "completion_tokens": 300,
+      "total_tokens": 1500,
+      "estimated_cost": 0.0123,
+      "currency": "USD"
+    },
+    "by_agent": {"agent-1": {"total_tokens": 1500}},
+    "by_task": {"task-1": {"total_tokens": 1500}},
+    "by_model": {"openai:gpt-4.1-mini": {"total_tokens": 1500}},
+    "fallback_count": 1,
+    "model_fallbacks": [
+      {
+        "primary_provider": "openai",
+        "primary_model": "gpt-4.1",
+        "fallback_provider": "openai",
+        "fallback_model": "gpt-4.1-mini",
+        "fallback_index": 1
+      }
+    ]
+  },
+  "budget_warnings": [],
+  "updated_at": "2026-05-25T06:00:00Z"
+}
+```
+
+`GET /executions/{execution_id}/context-usage` returns latest context pressure and compaction state:
+
+```json
+{
+  "execution_id": "execution-1",
+  "workflow_id": "workflow-1",
+  "source": "execution.metadata.runtime_governance",
+  "latest_context_health": {
+    "status": "warning",
+    "estimated_total_context_tokens": 9000,
+    "context_window": 128000
+  },
+  "latest_compaction": {
+    "compacted": true,
+    "reason": "context_health_threshold",
+    "estimated_tokens_saved": 1200,
+    "memory_id": "memory-compact"
+  },
+  "compaction_records": [],
+  "protected_context": {
+    "retained": true,
+    "protected_message_count": 3,
+    "protected_message_roles": ["system", "user", "tool"],
+    "protected_message_reasons": {
+      "0": "system_message",
+      "1": "user_message",
+      "3": "pending_human_decision"
+    }
+  }
+}
+```
+
+`GET /executions/{execution_id}/approvals` returns persisted native approval rows. Use this endpoint for durable
+request/response payload history and `responded_by`; use `approval.*` execution events for timeline order and audit
+details.
+
+Token budgets can be supplied by convention through `runtime_governance.token_budget` or `token_budget` on workflow,
+agent, task, execution input, or execution trigger payloads. When no explicit budget is supplied, the resolver can use
+global defaults from `AGENT_RUN_TOTAL_TOKEN_BUDGET`, `AGENT_TOKEN_BUDGET_WARN_RATIO`,
+`AGENT_TOKEN_BUDGET_HARD_RATIO`, and `AGENT_TOKEN_BUDGET_ACTION`. Explicit workflow, agent, task, input, and trigger
+settings override global defaults. The runtime emits `token.budget.warning` or `token.budget.exceeded` when configured
+thresholds are crossed. Native execution currently enforces hard-limit actions:
+
+- `warn_only`: emit budget events and continue.
+- `compact_context`: best-effort compact prompt context before the next model iteration when a compactor is available.
+- `pause_execution`: pause the execution through the native execution state path.
+- `fail_execution`: fail the execution after recording the exceeded event.
+
+When native context health reaches `critical` or `overflow`, or when a model provider raises a recognizable
+context-length error, the runtime can compact older or oversized assistant/tool context before retrying the model
+request. Compaction emits:
+
+- `context.compaction.started`
+- `context.compaction.completed`
+- `context.compaction.failed`
+
+The deterministic compactor preserves system/task instructions and latest user input as raw prompt context, explicitly
+retains prompt messages marked as pending approvals, pending human input, unresolved tool errors, or
+`protected_from_compaction`, summarizes older assistant/tool context into a synthetic system message, leaves execution
+events unchanged for audit, and stores compaction metadata under `runtime_governance.context_compaction`. The synthetic
+summary includes a `Protected Context Retained` section and the compaction record includes protected-message counts,
+roles, and reasons for operator inspection. Runtime compaction always updates execution metadata and events; persisting
+the compacted summary as workflow-scoped `context_pack` memory is opt-in via
+`workflow.metadata.runtime_governance.context_compaction.persist_context_pack=true`. Deployments can change the fallback
+default with `AGENT_CONTEXT_COMPACTION_PERSIST_CONTEXT_PACK_DEFAULT`, which defaults to `false`. Runtime context packs
+carry `agent_id`, `task_id`, `execution_id`, `source_model_request_id`, compaction status, compaction reason, estimated
+token savings, and the audit sequence range covered by the compacted source context in metadata. The synthetic prompt
+block also starts with `Runtime Context Compaction State`, including `context_compacted=true`, `compaction_reason`,
+`context_pack_memory_id`, `source_model_request_id`, and `estimated_tokens_saved`, so the agent can inspect that
+compaction happened before continuing.
+
+During native execution, `NativeExecutionState.context_compaction` mirrors the latest in-run compaction records and
+`NativeExecutionState.compacted_context_packs` lists persisted context-pack ids when persistence is enabled. This is a
+runtime convenience for steering and follow-up logic; execution events and `Execution.metadata.runtime_governance` remain
+the durable audit/read model.
+
+Conversation direct-reply model calls and conversation compaction LLM calls also use the same governance services. Events
+are persisted on the conversation audit execution id `conversation-audit-{conversation_id}` with
+`workflow_id=conversation-main-agent` and `runtime_adapter_id=conversation`. Each model call emits:
+
+- `context.health.recorded`
+- `llm.request.created`
+- `llm.response.created`
+- `token.usage.recorded`
+
+The conversation audit execution also receives `runtime_governance.context_health` and
+`runtime_governance.token_usage` snapshots, so existing execution usage/context endpoints can inspect that audit run.
+Conversation events include `call_kind=direct_reply` or `call_kind=conversation_compaction` so operator UIs can separate
+chat responses from compaction calls.
+
+CrewAI bridge calls through `AgencyModelClientLLM` also use the same governance services when the CrewAI adapter has an
+Agency execution store. Events are emitted with `call_kind=crewai_bridge`, `runtime_adapter_id=crewai`, and best-effort
+agent/task attribution from the mapped CrewAI agent and task. Framework-native CrewAI log replay can still emit
+lower-fidelity `llm.*` events with `metadata.source=crewai_log`, so consumers should prefer `crewai_llm_bridge` events
+when both are present.
+
+Developer extension rules:
+
+1. Add or reuse a typed domain model in `app/domain/runtime_governance.py`.
+2. Emit a canonical `ExecutionEvent` with enough payload or metrics to audit the decision.
+3. Update `Execution.metadata.runtime_governance` only with the current read snapshot; do not rely on event replay to
+   reconstruct the operator-facing current state.
+4. Add a narrow read API only when UI/API consumers need a stable projection.
+5. Add execution-service log text and runtime-stream mapping if operators need live visibility.
+6. Add focused tests for the recorder, route, persistence update path, and UI rendering path.
+
+## Isolated Runtime Operations
+
+The isolated execution runtime supports:
+
+- one Docker container per execution for isolated runs
+- runtime revision tracking and replacement
+- worker-owned execution inside the container
+- immediate container-exit reconciliation
+- scheduled runtime reconciliation when `RUNTIME_RECONCILER_ENABLED=true`
+- TTL-based exited-container cleanup and retention-based managed-image cleanup
+- runtime metrics and recent runtime actions
+- execution/container log visibility through the API
+
+Operator endpoints:
+
+- `GET /executions/runtime/metrics`
+- `GET /executions/runtime/containers`
+- `GET /executions/runtime/containers/{container_id}/logs`
+- `POST /executions/runtime/reconcile`
+- `GET /executions/{execution_id}/runtime/logs`
+
+The isolated control-plane path and the direct worker-container path are both covered by
+[`tests/test_docker_worker_integration.py`](../tests/test_docker_worker_integration.py).
 
 ## CrewAI Adapter
 
@@ -254,6 +661,13 @@ Behavior:
 That fallback exists so canonical HITL execution routes can be exercised without requiring a separate Redis daemon for
 every local validation run.
 
+Native runtime tool approvals are coordinated by `app/runtime/native/approvals.py`. Workflows that set
+`metadata.main_agent_monitoring.delegate_hitl_to_main_agent=true` can delegate low-risk approval-gated tool checkpoints
+to the main agent. The delegate provider is wired from `app/api/context.py` and only auto-approves requests without
+shell, filesystem, browser, network, MCP, credential, dangerous, mutation, or local privileged risk labels. Delegated
+decisions are recorded in approval request rows with `responded_by=main_agent` where SQL approval persistence is
+available, and in `approval.granted` event payloads under `decision_metadata`.
+
 ### Logs And Operator Endpoints
 
 Operator-facing runtime endpoints currently include:
@@ -304,15 +718,79 @@ Important settings:
 - `WORKFLOW_SCHEDULER_ENABLED`
 - `WORKFLOW_SCHEDULER_INTERVAL_SECONDS`
 - `WORKFLOW_RESTART_ACTIVE_EXECUTIONS_ON_REVISION_CHANGE`
+- `CANCEL_OUTDATED_EXECUTIONS`
+- `RUNTIME_REVISION_SHADOW_MODE`
 - `EXECUTION_RUNTIME_DATABASE_URL`
+- `EXECUTION_RUNTIME_BASE_IMAGE`
 - `EXECUTION_CONTAINER_NETWORK`
 - `EXECUTION_CONTAINER_WORKDIR`
+- `EXECUTION_CONTAINER_MEMORY_LIMIT_MB`
+- `EXECUTION_CONTAINER_CPU_LIMIT`
+- `EXECUTION_CONTAINER_AUTO_REMOVE`
 - `EXECUTION_CODEX_CLI_CWD`
 - `EXECUTION_CONTAINER_EXTRA_MOUNTS`
 - `EXECUTION_CONTAINER_BIND_INTEGRATIONS_READ_ONLY`
 - `RUNTIME_CONTAINER_TTL_SECONDS`
 - `RUNTIME_IMAGE_RETENTION_COUNT`
+- `RUNTIME_MAX_CONCURRENT_BUILDS`
 - `RUNTIME_RECONCILER_INTERVAL_SECONDS`
+
+For trusted local Docker development, the default backend and frontend workspace mounts are read-write so coding
+workflows can edit repos inside worker containers. Agency probes visible read-write mount paths before container launch;
+if the backend user cannot write, the launch fails with a permission prompt instead of surfacing a later `Errno 30`
+read-only filesystem error from the agent. Keep production isolation locked down and use read-only mounts unless a
+workflow explicitly needs repo edits.
+
+Read-write repo access checklist:
+
+1. Mount trusted local repos with `:rw` in `docker-compose.yml` or `EXECUTION_CONTAINER_EXTRA_MOUNTS`.
+2. Use stable worker targets, such as the values configured in `AGENCY_BACKEND_WORKSPACE` / `AGENCY_FRONTEND_WORKSPACE`
+   or another dedicated container path like `/repo/other-repo`.
+3. Confirm the host user running Docker can write to the source directory.
+4. Recreate the backend container after changing bind mounts or monitor env vars.
+5. Let workflow proposals request repo write permission before launch; do not grant repo writes implicitly for
+   high-risk or privileged workflows.
+
+Example extra mount for a second repo:
+
+```json
+[
+  {
+    "source": "/Users/example/Documents/other-repo",
+    "target": "/repo/other-repo",
+    "read_only": false
+  }
+]
+```
+
+Troubleshooting a read-only worker:
+
+- If the agent reports `OSError: [Errno 30] Read-only file system`, inspect the worker mount mode first.
+- If the mount is `:ro`, change it to `:rw` only for trusted local development or an explicitly approved coding
+  workflow.
+- If the mount is already `:rw`, check host filesystem ownership/ACLs and Docker Desktop file-sharing permissions.
+- Recreate the backend after the fix so new workers inherit the updated mount configuration.
+
+After changing compose mount mode or monitor environment settings in a running local stack, recreate the backend
+container so Docker applies the new bind mounts and environment:
+
+```bash
+docker compose up -d --force-recreate backend
+```
+
+Production and operator deployments should also configure `AGENCY_INTERNAL_API_KEY` so trusted identity headers cannot
+be spoofed by untrusted callers. When paired with `open-agency-fe`, set the matching frontend server-side value as
+`AGENCY_FE_BFF_IDENTITY_KEY`; this key is scoped to explicit BFF session delegation and is not a direct operator token.
+
+Remote browser clients such as `open-agency-fe` must be listed in `AGENCY_ALLOWED_ORIGINS` using exact origins. Production
+deployments should not use wildcard CORS origins, especially while `AGENCY_CORS_ALLOW_CREDENTIALS=true`.
+
+Connector health retention is controlled by:
+
+- `CONNECTOR_HEALTH_HISTORY_RETENTION_ENABLED`
+- `CONNECTOR_HEALTH_HISTORY_RETENTION_INTERVAL_SECONDS`
+- `CONNECTOR_HEALTH_HISTORY_RETENTION_DAYS`
+- `CONNECTOR_HEALTH_HISTORY_RETENTION_MAX_PER_CREDENTIAL`
 
 ## Deferred Scope
 

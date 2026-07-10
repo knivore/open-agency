@@ -1,3 +1,5 @@
+"""Convert discovered MCP tool descriptors into Agency tool definitions."""
+
 from __future__ import annotations
 
 import re

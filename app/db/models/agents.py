@@ -1,3 +1,5 @@
+"""ORM mapping for persisted agent definitions."""
+
 from __future__ import annotations
 
 from sqlalchemy import Boolean, ForeignKey, Index, String, Text
@@ -24,6 +26,7 @@ class AgentORM(TimestampMixin, Base):
     guardrails_json: Mapped[list] = mapped_column(JSON_VARIANT, default=list)
     memory_json: Mapped[dict] = mapped_column(JSON_VARIANT, default=dict)
     framework_hints_json: Mapped[dict] = mapped_column(JSON_VARIANT, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON_VARIANT, default=dict)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     model_profile = relationship("ModelProfileORM", back_populates="agents")

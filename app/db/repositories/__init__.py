@@ -1,9 +1,14 @@
+"""Repository exports for Agency persistence adapters."""
+
 from .agents import AgentRepository, InMemoryAgentRepository, MongoAgentRepository
+from .ambient_actions import AmbientActionRepository, InMemoryAmbientActionRepository, SQLAmbientActionRepository
+from .api_tokens import InMemoryApiTokenRepository
 from .catalog import (
     BaseCatalogRepository,
     BUILTIN_RUNTIME_ADAPTERS,
     InMemoryCatalogRepository,
     InMemoryModelProfileCatalogRepository,
+    InMemoryRuntimeRevisionRepository,
     InMemoryWorkflowCatalogRepository,
     ModelProfileCatalogRepository,
     MongoCatalogRepository,
@@ -24,6 +29,8 @@ from .credentials import (
     ModelProviderRepository,
     MongoModelProviderRepository,
 )
+from .documents import InMemoryUploadedDocumentRepository, SQLUploadedDocumentRepository
+from .domain_sql import SQLGoalRepository
 from .executions import (
     ApprovalRequestRepository,
     ExecutionArtifactRepository,
@@ -40,7 +47,20 @@ from .executions import (
     SQLExecutionRepository,
     ToolInvocationRepository,
 )
+from .graph_projection import InMemoryGraphProjectionEventRepository, SQLGraphProjectionEventRepository
 from .memory import InMemoryMemoryRepository, SQLMemoryRepository
+from .personas import (
+    InMemoryPersonaDistillationItemRepository,
+    InMemoryPersonaDistillationRunRepository,
+    InMemoryPersonaRepository,
+    InMemoryPersonaSourceRepository,
+    InMemoryPersonaVersionRepository,
+    SQLPersonaDistillationItemRepository,
+    SQLPersonaDistillationRunRepository,
+    SQLPersonaRepository,
+    SQLPersonaSourceRepository,
+    SQLPersonaVersionRepository,
+)
 from .protocols import (
     A2AAgentRepository,
     InMemoryMCPServerRepository,
@@ -50,15 +70,18 @@ from .protocols import (
     MongoRuntimeAdapterRepository,
     RuntimeAdapterRepository,
 )
+from .public_endpoints import InMemoryPublicEndpointRepository
 from .schedules import InMemoryScheduleRepository, MongoScheduleRepository, ScheduleRepository
 from .sql import SQLAlchemyRepository
 from .tools import InMemoryToolRepository, MongoToolRepository, ToolRepository
 from .users import InMemoryUserRepository
+from .webhooks import InMemoryOutboundWebhookAttemptRepository, SQLOutboundWebhookAttemptRepository
 from .workflows import WorkflowRepository, WorkflowVersionRepository
 
 __all__ = [
     "A2AAgentRepository",
     "AgentRepository",
+    "AmbientActionRepository",
     "ApprovalRequestRepository",
     "BaseCatalogRepository",
     "BUILTIN_RUNTIME_ADAPTERS",
@@ -69,6 +92,8 @@ __all__ = [
     "ExecutionEventRepository",
     "ExecutionRepository",
     "InMemoryAgentRepository",
+    "InMemoryAmbientActionRepository",
+    "InMemoryApiTokenRepository",
     "InMemoryCatalogRepository",
     "InMemoryConversationApprovalRequestRepository",
     "InMemoryConversationMessageRepository",
@@ -76,13 +101,23 @@ __all__ = [
     "InMemoryExecutionArtifactRepository",
     "InMemoryExecutionEventRepository",
     "InMemoryExecutionRepository",
+    "InMemoryGraphProjectionEventRepository",
     "InMemoryMCPServerRepository",
     "InMemoryMemoryRepository",
     "InMemoryModelProfileCatalogRepository",
     "InMemoryModelProviderRepository",
+    "InMemoryOutboundWebhookAttemptRepository",
     "InMemoryRuntimeAdapterRepository",
+    "InMemoryRuntimeRevisionRepository",
     "InMemoryScheduleRepository",
+    "InMemoryPersonaDistillationItemRepository",
+    "InMemoryPersonaDistillationRunRepository",
+    "InMemoryPersonaRepository",
+    "InMemoryPersonaSourceRepository",
+    "InMemoryPersonaVersionRepository",
+    "InMemoryPublicEndpointRepository",
     "InMemoryToolRepository",
+    "InMemoryUploadedDocumentRepository",
     "InMemoryUserRepository",
     "InMemoryWorkflowCatalogRepository",
     "MCPServerRepository",
@@ -100,11 +135,21 @@ __all__ = [
     "MongoScheduleRepository",
     "MongoToolRepository",
     "RuntimeAdapterRepository",
+    "SQLAmbientActionRepository",
     "SQLAlchemyRepository",
     "SQLExecutionArtifactRepository",
     "SQLExecutionEventRepository",
     "SQLExecutionRepository",
+    "SQLGraphProjectionEventRepository",
+    "SQLGoalRepository",
     "SQLMemoryRepository",
+    "SQLOutboundWebhookAttemptRepository",
+    "SQLPersonaDistillationItemRepository",
+    "SQLPersonaDistillationRunRepository",
+    "SQLPersonaRepository",
+    "SQLPersonaSourceRepository",
+    "SQLPersonaVersionRepository",
+    "SQLUploadedDocumentRepository",
     "ScheduleRepository",
     "ToolInvocationRepository",
     "ToolRepository",

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from pydantic import ValidationError
 
-from app.runtime.streaming import (
+from app.runtime.streaming.runtime_event_models import (
     AGENCY_RUNTIME_EVENT_SCHEMA_VERSION,
     RuntimeEventActor,
     RuntimeEventLevel,

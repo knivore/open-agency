@@ -4,7 +4,6 @@ import re
 
 from app.domain import ToolDefinition
 
-
 TOOL_CALL_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$")
 ACRONYM_WORDS = {
     "a2a",

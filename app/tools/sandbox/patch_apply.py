@@ -35,7 +35,8 @@ def build_combined_patch(changes: list[dict[str, Any]]) -> str:
 
 
 def summarize_files_changed(changes: list[dict[str, Any]]) -> list[FileChanged]:
-    return [FileChanged(path=str(change.get("path")), op=_infer_op(str(change.get("patch") or ""))) for change in changes]
+    return [FileChanged(path=str(change.get("path")), op=_infer_op(str(change.get("patch") or ""))) for change in
+            changes]
 
 
 def _infer_op(patch: str) -> str:

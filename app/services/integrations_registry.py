@@ -1,3 +1,5 @@
+"""Service that exposes the static integration and connector capability registry."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,16 +11,25 @@ from app.domain import (
     ConnectorMetadataRequirementDefinition,
     ConnectorSetupGuideDefinition,
     ConnectorSetupGuideFieldDefinition,
+    ConnectorSetupGuideOptionDefinition,
     IntegrationRegistryCategoryDefinition,
     IntegrationRegistryPayload,
     PlannedIntegrationDefinition,
 )
-from app.integrations import get_connector_definition
+from app.integrations.connectors import ConnectorRequirement, connector_target_scope_metadata, get_connector_definition
 
 REGISTRY_UPDATED_AT = datetime(2026, 5, 7, 0, 0, tzinfo=UTC)
 
 
-def _setup_guide(provider: str, auth_model: str) -> ConnectorSetupGuideDefinition:
+def _metadata_label(key: str) -> str:
+    return key.replace("_", " ").capitalize()
+
+
+def _setup_guide(
+        provider: str,
+        auth_model: str,
+        identity_metadata: tuple[ConnectorRequirement, ...] = (),
+) -> ConnectorSetupGuideDefinition:
     fields_by_provider: dict[str, list[ConnectorSetupGuideFieldDefinition]] = {
         "telegram-bot": [
             ConnectorSetupGuideFieldDefinition(
@@ -27,6 +38,15 @@ def _setup_guide(provider: str, auth_model: str) -> ConnectorSetupGuideDefinitio
                 secret=True,
                 description="Paste the Telegram Bot API token from BotFather into OneCLI.",
             ),
+            ConnectorSetupGuideFieldDefinition(
+                key="webhook_secret_ref",
+                label="Webhook secret ref",
+                secret=False,
+                description=(
+                    "Store the secret reference used to verify Telegram production webhooks "
+                    "as Agency metadata."
+                ),
+            ),
         ],
         "discord-bot": [
             ConnectorSetupGuideFieldDefinition(
@@ -34,6 +54,12 @@ def _setup_guide(provider: str, auth_model: str) -> ConnectorSetupGuideDefinitio
                 label="Bot token",
                 secret=True,
                 description="Paste the Discord bot token from the application bot settings into OneCLI.",
+            ),
+            ConnectorSetupGuideFieldDefinition(
+                key="webhook_public_key",
+                label="Webhook public key",
+                secret=False,
+                description="Store the Discord application public key as Agency metadata for interaction verification.",
             ),
         ],
         "whatsapp-cloud-api": [
@@ -48,6 +74,26 @@ def _setup_guide(provider: str, auth_model: str) -> ConnectorSetupGuideDefinitio
                 label="Phone number id",
                 secret=False,
                 description="Store the delivery phone number id as Agency metadata.",
+            ),
+            ConnectorSetupGuideFieldDefinition(
+                key="app_secret_ref",
+                label="App secret ref",
+                secret=False,
+                description=(
+                    "Store the app secret reference used to verify WhatsApp "
+                    "production webhooks as Agency metadata."
+                ),
+            ),
+        ],
+        "microsoft-teams": [
+            ConnectorSetupGuideFieldDefinition(
+                key="webhook_secret_ref",
+                label="Webhook secret ref",
+                secret=False,
+                description=(
+                    "Store the Teams webhook secret reference used to verify production "
+                    "callbacks as Agency metadata."
+                ),
             ),
         ],
     }
@@ -69,9 +115,43 @@ def _setup_guide(provider: str, auth_model: str) -> ConnectorSetupGuideDefinitio
             )
         ],
     )
+    field_keys = {field.key for field in fields}
+    fields = [
+        *fields,
+        *[
+            ConnectorSetupGuideFieldDefinition(
+                key=requirement.metadata_key,
+                label=_metadata_label(requirement.metadata_key),
+                secret=False,
+                description=requirement.description,
+            )
+            for requirement in identity_metadata
+            if requirement.metadata_key not in field_keys
+        ],
+    ]
+    notes: list[str] = [
+        "Each connector installation gets its own Agency-generated id, so multiple bots or workspaces can coexist under separate OneCLI refs."]
+    if provider == "telegram-bot":
+        # Telegram can store the bot token in OneCLI, but delivery still has to stay direct
+        # because the provider token is embedded in the request path rather than a header.
+        notes.append(
+            "Store the Telegram bot token in OneCLI, but keep delivery and health checks direct because the token is embedded in the URL path. Agency mirrors the same secret into a runtime secret record at completion time, so OneCLI stays the setup/storage layer for direct transport."
+        )
+    elif provider == "discord-bot":
+        notes.append(
+            "Register the Discord interactions webhook endpoint in the Discord Developer Portal and point it at the Agency public URL ending in /integrations/conversations/adapters/discord/webhook."
+        )
+        notes.append(
+            "The Discord application public key and the interactions webhook URL are different values; Agency stores the public key as metadata, but Discord still requires a manual endpoint registration step."
+        )
+    elif provider in {"whatsapp-cloud-api", "slack-app", "microsoft-teams", "twilio-sms"}:
+        notes.append(
+            "OneCLI can stay in the setup flow for this connector because the provider token is header-based or otherwise proxy-compatible."
+        )
     return ConnectorSetupGuideDefinition(
-        storagePath=f"onecli://users/{{agency_user_id}}/{provider}/default",
+        storagePath=f"onecli://users/{{agency_user_id}}/{provider}/{{agency_installation_id}}",
         fields=fields,
+        options=_setup_guide_options(provider),
         agencyStores=[
             "installation id",
             "provider key",
@@ -84,11 +164,34 @@ def _setup_guide(provider: str, auth_model: str) -> ConnectorSetupGuideDefinitio
             "OneCLI completes the Agency installation with only the onecli:// credential ref "
             "and non-secret metadata; Agency then marks the installation active."
         ),
+        notes=notes,
     )
+
+
+def _setup_guide_options(provider: str) -> list[ConnectorSetupGuideOptionDefinition]:
+    return []
+
+
+def _capability_surface(backend_key: str) -> str:
+    return "connector"
+
+
+def _module_capabilities(backend_key: str) -> list[str]:
+    return []
+
+
+def _agency_capability_dependencies(backend_key: str) -> list[str]:
+    return []
+
+
+def _ownership_notes(backend_key: str) -> list[str]:
+    return []
 
 
 @dataclass(slots=True)
 class IntegrationsRegistryService:
+    """Build registry payloads consumed by frontend integration settings screens."""
+
     def list_categories(self) -> IntegrationRegistryPayload:
         return IntegrationRegistryPayload(
             categories=[
@@ -359,11 +462,17 @@ class IntegrationsRegistryService:
         for category in self.list_categories().categories:
             for display_name, planned in category.providers.items():
                 definition = get_connector_definition(planned.backendKey)
+                target_scope_metadata = connector_target_scope_metadata(planned.backendKey)
                 connectors[planned.backendKey] = ConnectorCapabilityDefinition(
                     backendKey=planned.backendKey,
                     displayName=display_name,
                     authModel=planned.authModel,
                     providerAliases=list(planned.providerAliases),
+                    capabilitySurface=_capability_surface(planned.backendKey),
+                    moduleCapabilities=_module_capabilities(planned.backendKey),
+                    dependsOnAgencyCapabilities=_agency_capability_dependencies(planned.backendKey),
+                    ownershipNotes=_ownership_notes(planned.backendKey),
+                    onecliTransportMode="direct" if planned.backendKey in {"telegram-bot", "discord-bot"} else "proxy",
                     healthSupported=bool(definition and definition.health_check is not None),
                     requiredMetadata=[
                         ConnectorMetadataRequirementDefinition(
@@ -371,8 +480,27 @@ class IntegrationsRegistryService:
                             description=requirement.description,
                         )
                         for requirement in (definition.required_metadata if definition else ())
+                        if requirement.required_for_credential
+                    ],
+                    instanceIdentityMetadata=[
+                        ConnectorMetadataRequirementDefinition(
+                            key=requirement.metadata_key,
+                            description=requirement.description,
+                        )
+                        for requirement in (definition.instance_identity_metadata if definition else ())
+                    ],
+                    targetScopeMetadata=[
+                        ConnectorMetadataRequirementDefinition(
+                            key=requirement.metadata_key,
+                            description=requirement.description,
+                        )
+                        for requirement in target_scope_metadata
                     ],
                     supportedSecretRefSchemes=["onecli://", "env://", "env:"],
-                    onecliSetupGuide=_setup_guide(planned.backendKey, planned.authModel),
+                    onecliSetupGuide=_setup_guide(
+                        planned.backendKey,
+                        planned.authModel,
+                        definition.instance_identity_metadata if definition else (),
+                    ),
                 )
         return ConnectorCapabilitiesPayload(connectors=connectors, updated_at=REGISTRY_UPDATED_AT)

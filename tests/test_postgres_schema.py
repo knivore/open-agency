@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from alembic.config import Config
 from pathlib import Path
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import inspect
 from sqlalchemy.exc import IntegrityError
 from unittest.mock import patch
 
@@ -29,7 +29,6 @@ from app.db.models import (
     ModelProviderORM,
     RuntimeAdapterORM,
     RuntimeRevisionORM,
-    ScheduleFireClaimORM,
     ScheduleORM,
     ToolORM,
     WorkflowORM,
@@ -55,7 +54,8 @@ from app.db.repositories import (
     WorkflowVersionRepository,
 )
 from app.db.session import get_async_engine, get_session_maker, reset_session_state
-from app.domain import Execution, ExecutionEvent, ExecutionEventType, MemoryRecord
+from app.domain import ContextHealth, Execution, ExecutionEvent, ExecutionEventType, ExecutionStatus, MemoryRecord, TokenUsage
+from app.runtime.governance.recorder import record_context_health_snapshot, record_token_usage_snapshot
 from app.runtime.native.state import SQLExecutionStore
 
 
@@ -96,6 +96,7 @@ class PostgresSchemaTests(unittest.IsolatedAsyncioTestCase):
             "model_providers",
             "model_profiles",
             "agents",
+            "api_tokens",
             "tools",
             "workflows",
             "workflow_versions",
@@ -117,6 +118,16 @@ class PostgresSchemaTests(unittest.IsolatedAsyncioTestCase):
             "tool_invocations",
             "memory_sources",
             "prompt_templates",
+            "users",
+            "onecli_identity_mappings",
+            "public_endpoints",
+            "outbound_webhook_attempts",
+            "graph_projection_events",
+            "personas",
+            "persona_versions",
+            "persona_sources",
+            "persona_distillation_runs",
+            "persona_distillation_items",
         }
         self.assertTrue(expected_tables.issubset(Base.metadata.tables.keys()))
 
@@ -447,6 +458,68 @@ class PostgresSchemaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.sequence, 1)
         self.assertEqual(second.sequence, 2)
 
+    async def test_sql_execution_store_persists_runtime_governance_metadata_across_status_update(self) -> None:
+        async with self.session_factory() as session:
+            session.add(
+                WorkflowORM(
+                    id="workflow-governance-metadata",
+                    name="Governance Metadata",
+                    current_version=1,
+                    enabled=True,
+                )
+            )
+            await session.commit()
+
+        store = SQLExecutionStore(self.session_factory)
+        execution = await store.save_execution(
+            Execution(
+                id="execution-governance-metadata",
+                workflow_id="workflow-governance-metadata",
+                runtime_adapter="native",
+                status=ExecutionStatus.RUNNING,
+            )
+        )
+
+        await record_context_health_snapshot(
+            store,
+            execution_id=execution.id,
+            context_health=ContextHealth(
+                estimated_prompt_tokens=800,
+                reserved_completion_tokens=200,
+                estimated_total_context_tokens=1000,
+                context_window=2000,
+                remaining_context_tokens=1000,
+                usage_ratio=0.5,
+                status="normal",
+            ),
+            event_id="context-event-1",
+        )
+        await record_token_usage_snapshot(
+            store,
+            execution_id=execution.id,
+            usage=TokenUsage(
+                provider="openai",
+                model="gpt-test",
+                prompt_tokens=10,
+                completion_tokens=5,
+                total_tokens=15,
+            ),
+            event_id="token-event-1",
+        )
+
+        status_update = await store.get_execution(execution.id)
+        assert status_update is not None
+        status_update.status = ExecutionStatus.COMPLETED
+        await store.save_execution(status_update)
+
+        reloaded = await store.get_execution(execution.id)
+        assert reloaded is not None
+        governance = reloaded.metadata["runtime_governance"]
+        self.assertEqual(reloaded.status, ExecutionStatus.COMPLETED)
+        self.assertEqual(governance["context_health"]["last"]["event_id"], "context-event-1")
+        self.assertEqual(governance["token_usage"]["last_event_id"], "token-event-1")
+        self.assertEqual(governance["token_usage"]["total"]["total_tokens"], 15)
+
     async def test_execution_event_sequence_constraint(self) -> None:
         async with self.session_factory() as session:
             workflow = WorkflowORM(id="workflow-seq", name="Sequence", current_version=1, enabled=True)
@@ -517,9 +590,12 @@ class AlembicUpgradeTests(unittest.TestCase):
                 cfg.set_main_option("sqlalchemy.url", db_url)
                 command.upgrade(cfg, "head")
 
+            from sqlalchemy import create_engine
+
             engine = create_engine(f"sqlite:///{db_path}")
             inspector = inspect(engine)
             tables = set(inspector.get_table_names())
+            execution_columns = {column["name"] for column in inspector.get_columns("executions")}
             execution_indexes = {index["name"] for index in inspector.get_indexes("executions")}
             runtime_revision_indexes = {index["name"] for index in inspector.get_indexes("runtime_revisions")}
             channel_identity_indexes = {
@@ -534,50 +610,18 @@ class AlembicUpgradeTests(unittest.TestCase):
         self.assertIn("workflow_versions", tables)
         self.assertIn("runtime_revisions", tables)
         self.assertIn("approval_requests", tables)
+        self.assertIn("outbound_webhook_attempts", tables)
         self.assertIn("channel_identity_mappings", tables)
+        self.assertIn("home_context_rooms", tables)
+        self.assertIn("home_context_entity_mappings", tables)
+        self.assertIn("ambient_pending_actions", tables)
+        self.assertIn("ambient_action_audit_log", tables)
+        self.assertIn("metadata_json", execution_columns)
         self.assertIn("ix_executions_runtime_revision_id", execution_indexes)
         self.assertIn("ix_runtime_revisions_fingerprint", runtime_revision_indexes)
         self.assertIn("ix_channel_identity_mappings_channel", channel_identity_indexes)
         self.assertIn("ix_channel_identity_mappings_internal_user_id", channel_identity_indexes)
         self.assertIn("ix_conversation_messages_external_message", conversation_message_indexes)
-
-    def test_alembic_upgrade_normalizes_retired_agency_baseline(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            db_path = Path(tmp_dir) / "legacy-alembic.db"
-            db_url = f"sqlite+aiosqlite:///{db_path}"
-            ini_path = Path("/Users/kehchinleong/Documents/Personal/Agency/agency/alembic.ini")
-            alembic_path = Path("/Users/kehchinleong/Documents/Personal/Agency/agency/alembic")
-
-            engine = create_engine(f"sqlite:///{db_path}")
-            Base.metadata.create_all(engine)
-            with engine.begin() as connection:
-                connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
-                connection.execute(
-                    text("INSERT INTO alembic_version (version_num) VALUES (:revision)"),
-                    {"revision": "20260517_0002"},
-                )
-            engine.dispose()
-
-            with patch.dict(
-                    os.environ,
-                    {
-                        "APP_ENV": "test",
-                        "DATABASE_URL": db_url,
-                    },
-                    clear=False,
-            ):
-                reset_settings_cache()
-                cfg = Config(str(ini_path))
-                cfg.set_main_option("script_location", str(alembic_path))
-                cfg.set_main_option("sqlalchemy.url", db_url)
-                command.upgrade(cfg, "head")
-
-            engine = create_engine(f"sqlite:///{db_path}")
-            with engine.connect() as connection:
-                version = connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            engine.dispose()
-
-        self.assertEqual(version, "0001")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,56 @@
+id: persona_writing_style
+suite: persona_distillation
+name: Persona writing-style extraction
+mode: persona_distillation_fixture
+description: Checks whether style signals remain source-backed.
+persona_distillation:
+  source_memories:
+    - id: writing-style-note
+      title: Writing preference note
+      content: |
+        Writing preference: keep recommendations concise, concrete, and ordered by priority.
+        Avoid long preambles. Use short factual summaries before action items.
+      tags: ["persona-live-eval", "writing-style"]
+  expected_items:
+    - id: concise_style
+      item_type: writing_style
+      memory_layer: persona
+      content_keywords: ["concise", "concrete", "ordered by priority"]
+      evidence: "keep recommendations concise, concrete, and ordered by priority"
+  results:
+    deterministic:
+      items:
+        - title: Concise style
+          content: "Keep recommendations concise, concrete, and ordered by priority."
+          item_type: writing_style
+          memory_layer: persona
+          source_evidence: "keep recommendations concise, concrete, and ordered by priority"
+          evidence_verified: true
+      metrics: {latency_ms: 5, cost_usd: 0.0}
+    llm:
+      items:
+        - title: Concise recommendation style
+          content: "Keep recommendations concise, concrete, and ordered by priority."
+          item_type: writing_style
+          memory_layer: persona
+          source_evidence: "keep recommendations concise, concrete, and ordered by priority"
+          evidence_verified: true
+      metrics: {latency_ms: 70, cost_usd: 0.009}
+    hybrid:
+      items:
+        - title: Concise recommendation style
+          content: "Keep recommendations concise, concrete, and ordered by priority."
+          item_type: writing_style
+          memory_layer: persona
+          source_evidence: "keep recommendations concise, concrete, and ordered by priority"
+          evidence_verified: true
+      metrics: {latency_ms: 74, cost_usd: 0.009}
+assertions:
+  - type: persona_metric_min
+    mode: hybrid
+    metric: precision
+    value: 1.0
+  - type: persona_metric_min
+    mode: hybrid
+    metric: evidence_grounding
+    value: 1.0

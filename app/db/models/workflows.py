@@ -1,3 +1,5 @@
+"""ORM mappings for workflow definitions and immutable workflow versions."""
+
 from __future__ import annotations
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint

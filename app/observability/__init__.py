@@ -1,3 +1,4 @@
-from .event_bus import EventBus, get_default_event_bus, set_default_event_bus
+"""Observability package.
 
-__all__ = ["EventBus", "get_default_event_bus", "set_default_event_bus"]
+Import event bus primitives from `app.observability.event_bus`.
+"""

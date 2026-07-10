@@ -11,8 +11,8 @@ from app.api.context import create_test_api_context
 from app.domain import AgentDefinition, Execution, ExecutionEventType, ExecutionStatus, FrameworkHints, \
     ModelProfileDefinition, TaskDefinition, WorkflowDefinition, WorkflowNodeDefinition
 from app.llm.base import ModelResponse
-from app.runtime.adapters import CrewAIRuntimeAdapter, NativeRuntimeAdapter
-from app.runtime.adapters.crewai import CrewAIRuntimeAdapter as CrewAIImportSurface
+from app.runtime.adapters.crewai.adapter import CrewAIRuntimeAdapter
+from app.runtime.adapters.native_adapter import NativeRuntimeAdapter
 from app.runtime.adapters.crewai.errors import CrewAIUnsupportedOperationError, CrewAIUnavailableError
 from app.runtime.adapters.crewai.llm_bridge import AgencyModelClientLLM
 from app.runtime.adapters.crewai.mapper import agent_definition_to_crewai_config, task_definition_to_crewai_config, \
@@ -59,9 +59,6 @@ def _simple_workflow() -> WorkflowDefinition:
 
 
 class CrewAIAdapterStructureTests(unittest.TestCase):
-    def test_public_import_surface_points_to_new_package(self):
-        self.assertIs(CrewAIImportSurface, CrewAIRuntimeAdapter)
-
     def test_registry_registers_exactly_one_crewai_adapter(self):
         context = create_test_api_context()
         names = context.runtime_registry.registered_adapter_names()
@@ -200,6 +197,71 @@ class CrewAIRuntimeOverrideTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CrewAIExecutionEventTests(unittest.IsolatedAsyncioTestCase):
+    async def test_registry_defaults_unspecified_runtime_to_native(self):
+        workflow_repo = InMemoryWorkflowRepository()
+        profile_repo = InMemoryModelProfileRepository()
+        execution_store = InMemoryExecutionStore()
+        workflow = _simple_workflow()
+        await workflow_repo.save_workflow(workflow)
+        registry = RuntimeAdapterRegistry(
+            workflow_repository=workflow_repo,
+            model_profile_repository=profile_repo,
+            execution_store=execution_store,
+        )
+        engine = ExecutionEngine.create_in_memory(
+            model_provider_registry=create_test_api_context().llm_provider_registry
+        )
+        registry.register(NativeRuntimeAdapter(engine))
+        registry.register(
+            CrewAIRuntimeAdapter(
+                workflow_repository=workflow_repo,
+                model_profile_repository=profile_repo,
+                execution_store=execution_store,
+            )
+        )
+
+        execution = await registry.create_execution(
+            workflow.id,
+            {},
+            {"type": "manual"},
+        )
+
+        self.assertEqual(execution.runtime_adapter_id, "native")
+        self.assertIsNone(execution.metadata["requested_adapter"])
+
+    async def test_registry_treats_blank_runtime_adapter_as_native(self):
+        workflow_repo = InMemoryWorkflowRepository()
+        profile_repo = InMemoryModelProfileRepository()
+        execution_store = InMemoryExecutionStore()
+        workflow = _simple_workflow()
+        await workflow_repo.save_workflow(workflow)
+        registry = RuntimeAdapterRegistry(
+            workflow_repository=workflow_repo,
+            model_profile_repository=profile_repo,
+            execution_store=execution_store,
+        )
+        engine = ExecutionEngine.create_in_memory(
+            model_provider_registry=create_test_api_context().llm_provider_registry
+        )
+        registry.register(NativeRuntimeAdapter(engine))
+        registry.register(
+            CrewAIRuntimeAdapter(
+                workflow_repository=workflow_repo,
+                model_profile_repository=profile_repo,
+                execution_store=execution_store,
+            )
+        )
+
+        execution = await registry.create_execution(
+            workflow.id,
+            {},
+            {"type": "manual"},
+            runtime_adapter_id="   ",
+        )
+
+        self.assertEqual(execution.runtime_adapter_id, "native")
+        self.assertIsNone(execution.metadata["requested_adapter"])
+
     async def test_start_execution_passes_runtime_llm_override_to_crewai_runner(self):
         workflow_repo = InMemoryWorkflowRepository()
         profile_repo = InMemoryModelProfileRepository()
@@ -229,7 +291,7 @@ class CrewAIExecutionEventTests(unittest.IsolatedAsyncioTestCase):
         await adapter.prepare_execution(execution)
 
         async def fake_to_thread(func, workflow_arg, inputs, queue, process_id, run_by, *, default_model,
-                                 model_profiles, model_provider_registry, model_event_loop):
+                                 model_profiles, model_provider_registry, model_event_loop, execution_store):
             self.assertEqual(workflow_arg.id, workflow.id)
             self.assertEqual(default_model, "openai/llama3.2")
             self.assertIs(model_event_loop, asyncio.get_running_loop())
@@ -287,7 +349,7 @@ class CrewAIExecutionEventTests(unittest.IsolatedAsyncioTestCase):
             )
 
             async def fake_to_thread(func, workflow_arg, inputs, queue, process_id, run_by, *, default_model,
-                                     model_profiles, model_provider_registry, model_event_loop):
+                                     model_profiles, model_provider_registry, model_event_loop, execution_store):
                 self.assertEqual(workflow_arg.id, workflow.id)
                 self.assertEqual(default_model, "gpt-4o-mini")
                 self.assertEqual(model_profiles, {})
@@ -346,7 +408,7 @@ class CrewAIExecutionEventTests(unittest.IsolatedAsyncioTestCase):
             log_path.write_text("[]", encoding="utf-8")
 
             async def fake_to_thread(func, workflow_arg, inputs, queue, process_id, run_by, *, default_model,
-                                     model_profiles, model_provider_registry, model_event_loop):
+                                     model_profiles, model_provider_registry, model_event_loop, execution_store):
                 self.assertEqual(workflow_arg.id, workflow.id)
                 self.assertIs(model_event_loop, asyncio.get_running_loop())
                 log_path.write_text(
@@ -498,6 +560,99 @@ class CrewAIModelBridgeTests(unittest.TestCase):
         self.assertEqual(client.messages[0].role, "user")
         self.assertEqual(client.messages[0].content, "Hello")
         self.assertEqual(client.temperature, 0.2)
+
+    def test_agency_model_client_llm_records_governance_events(self):
+        profile = ModelProfileDefinition(
+            id="profile-bridge",
+            name="Bridge",
+            provider="openai-compatible",
+            model="bridge-model",
+            temperature=0.2,
+            max_tokens=64,
+            context_window=4096,
+        )
+
+        class FakeModelClient:
+            provider_key = "openai_compatible"
+
+            def generate_text(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+                return ModelResponse(
+                    content="CrewAI bridge response.",
+                    provider=profile.provider,
+                    model=profile.model,
+                    usage={"prompt_tokens": 19, "completion_tokens": 5, "total_tokens": 24},
+                )
+
+            def generate_structured(self, *args, **kwargs):
+                raise AssertionError("structured output was not requested")
+
+            def stream_text(self, *args, **kwargs):
+                raise AssertionError("streaming was not requested")
+
+            def count_tokens(self, *args, **kwargs):
+                return None
+
+            def embed_texts(self, *args, **kwargs):
+                return []
+
+            def health_check(self):
+                return {"ok": True}
+
+        class CrewTaskRef:
+            id = "task-1"
+            name = "Research Task"
+
+        class CrewAgentRef:
+            role = "Researcher"
+
+        execution_store = InMemoryExecutionStore()
+        asyncio.run(
+            execution_store.save_execution(
+                Execution(
+                    id="exec-crewai-bridge",
+                    workflow_id="workflow-1",
+                    runtime_adapter="crewai",
+                    status=ExecutionStatus.RUNNING,
+                    input_json={},
+                )
+            )
+        )
+        llm = AgencyModelClientLLM(
+            profile=profile,
+            model_client=FakeModelClient(),
+            execution_store=execution_store,
+            execution_id="exec-crewai-bridge",
+            workflow_id="workflow-1",
+            agent_id="agent-1",
+        )
+
+        result = llm.call(
+            [{"role": "user", "content": "Hello"}],
+            from_task=CrewTaskRef(),
+            from_agent=CrewAgentRef(),
+        )
+
+        self.assertEqual(result, "CrewAI bridge response.")
+        events = asyncio.run(execution_store.list_events("exec-crewai-bridge"))
+        event_types = [event.event_type for event in events]
+        self.assertIn(ExecutionEventType.CONTEXT_HEALTH_RECORDED, event_types)
+        self.assertIn(ExecutionEventType.LLM_REQUEST_CREATED, event_types)
+        self.assertIn(ExecutionEventType.LLM_RESPONSE_CREATED, event_types)
+        self.assertIn(ExecutionEventType.TOKEN_USAGE_RECORDED, event_types)
+
+        token_event = next(event for event in events if event.event_type == ExecutionEventType.TOKEN_USAGE_RECORDED)
+        self.assertEqual(token_event.agent_id, "agent-1")
+        self.assertEqual(token_event.task_id, "task-1")
+        self.assertEqual(token_event.payload["call_kind"], "crewai_bridge")
+        self.assertEqual(token_event.payload["usage"]["total_tokens"], 24)
+
+        execution = asyncio.run(execution_store.get_execution("exec-crewai-bridge"))
+        assert execution is not None
+        governance = execution.metadata["runtime_governance"]
+        self.assertEqual(governance["token_usage"]["total"]["total_tokens"], 24)
+        self.assertEqual(governance["token_usage"]["by_agent"]["agent-1"]["prompt_tokens"], 19)
+        self.assertEqual(governance["token_usage"]["by_task"]["task-1"]["completion_tokens"], 5)
+        self.assertEqual(governance["context_health"]["last"]["agent_id"], "agent-1")
 
 
 class CrewAIModelBridgeAsyncTests(unittest.IsolatedAsyncioTestCase):

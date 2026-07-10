@@ -3,9 +3,8 @@ from __future__ import annotations
 from copy import deepcopy
 
 from app.tools.cli_discovery import list_builtin_tool_definitions
-
+from app.tools.risk import risk_labels_for_tool_definition
 from .models import ToolContract
-
 
 CONTRACT_CONTEXT = "https://agency.local/tool-contracts/v1"
 CONTRACT_TYPE = "ToolContract"
@@ -24,6 +23,7 @@ def generated_builtin_contracts(*, existing_names: set[str] | None = None) -> li
                 name=tool.id,
                 version="1.0",
                 description=_contract_description(tool.description),
+                risk_labels=risk_labels_for_tool_definition(tool),
                 inputs=deepcopy(tool.input_schema),
                 outputs=deepcopy(_generic_tool_run_response_schema()),
             )

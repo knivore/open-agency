@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
+"""Run deterministic and optional live-backend evaluation cases.
+
+Cases are YAML/JSON files under `evals/cases`. Offline mode evaluates declared
+assertions against fixture evidence; live mode can create or inspect backend
+executions and optionally ask the Evaluation agent to judge outcomes.
+"""
+
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -11,22 +17,12 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+try:
+    from scripts._bootstrap import bootstrap_repo
+except ModuleNotFoundError:
+    from _bootstrap import bootstrap_repo
 
-def _bootstrap_repo(script_file: str, *, reexec: bool) -> Path:
-    script_path = Path(script_file).resolve()
-    repo_root = script_path.parents[1]
-    if reexec:
-        venv_dir = repo_root / ".venv"
-        venv_python = venv_dir / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
-        if venv_python.exists() and Path(sys.prefix).resolve() != venv_dir.resolve():
-            os.execv(str(venv_python), [str(venv_python), str(script_path), *sys.argv[1:]])
-    repo_root_text = str(repo_root)
-    if repo_root_text not in sys.path:
-        sys.path.insert(0, repo_root_text)
-    return repo_root
-
-
-REPO_ROOT = _bootstrap_repo(__file__, reexec=__name__ == "__main__")
+REPO_ROOT = bootstrap_repo(__file__, reexec=__name__ == "__main__")
 
 import httpx
 import yaml
@@ -110,6 +106,17 @@ class EvalResult:
         }
 
 
+@dataclass(slots=True)
+class LivePersonaDistillationOptions:
+    modes: tuple[str, ...] = ("deterministic", "llm", "hybrid")
+    user_id: str = "persona-eval-user"
+    user_email: str = "persona-eval-user@example.local"
+    llm_model_source: str | None = None
+    model_profile_id: str | None = None
+    llm_model_provider: str | None = None
+    llm_model: str | None = None
+
+
 def load_eval_cases(path: Path) -> list[dict[str, Any]]:
     paths = _case_paths(path)
     cases = [_load_case(item) for item in paths]
@@ -165,12 +172,55 @@ def run_case(
         base_url: str | None = None,
         judge_agent: bool = False,
         timeout_seconds: float = 60.0,
+        live_persona_distillation: bool = False,
+        live_persona_options: LivePersonaDistillationOptions | None = None,
 ) -> EvalResult:
     case_id = str(case["id"])
     suite = str(case.get("suite") or "default")
     name = str(case.get("name") or case_id)
     mode = str(case.get("mode") or "fixture")
     try:
+        if mode == "persona_distillation_fixture":
+            if live_persona_distillation:
+                if not base_url:
+                    raise ValueError("live persona distillation evals require --base-url.")
+                live_case = run_live_persona_distillation_case(
+                    case,
+                    base_url=base_url,
+                    timeout_seconds=timeout_seconds,
+                    options=live_persona_options or LivePersonaDistillationOptions(),
+                )
+                assertion_results = evaluate_persona_distillation_case(live_case)
+                return EvalResult(
+                    case_id=case_id,
+                    suite=suite,
+                    name=name,
+                    mode="persona_distillation_live",
+                    passed=all(item.passed for item in assertion_results),
+                    score=_score(assertion_results),
+                    assertion_results=assertion_results,
+                )
+            assertion_results = evaluate_persona_distillation_case(case)
+            return EvalResult(
+                case_id=case_id,
+                suite=suite,
+                name=name,
+                mode=mode,
+                passed=all(item.passed for item in assertion_results),
+                score=_score(assertion_results),
+                assertion_results=assertion_results,
+            )
+        if mode == "persona_runtime_fixture":
+            assertion_results = evaluate_persona_runtime_case(case)
+            return EvalResult(
+                case_id=case_id,
+                suite=suite,
+                name=name,
+                mode=mode,
+                passed=all(item.passed for item in assertion_results),
+                score=_score(assertion_results),
+                assertion_results=assertion_results,
+            )
         evidence = collect_evidence(case, base_url=base_url, timeout_seconds=timeout_seconds)
         assertion_results = evaluate_assertions(case.get("assertions") or [], evidence)
         deterministic_passed = all(item.passed for item in assertion_results)
@@ -227,7 +277,269 @@ def collect_evidence(
         if not base_url:
             raise ValueError("http_workflow evals require --base-url.")
         return _run_http_workflow_case(case, base_url=base_url, timeout_seconds=timeout_seconds)
+    if mode in {"persona_distillation_fixture", "persona_runtime_fixture"}:
+        return EvidenceBundle()
     raise ValueError(f"Unsupported eval mode: {mode}")
+
+
+def run_live_persona_distillation_case(
+        case: dict[str, Any],
+        *,
+        base_url: str,
+        timeout_seconds: float,
+        options: LivePersonaDistillationOptions,
+) -> dict[str, Any]:
+    persona_eval = case.get("persona_distillation") if isinstance(case.get("persona_distillation"), dict) else {}
+    source_memories = _live_persona_source_memories(case)
+    headers = {
+        "x-agency-user-id": options.user_id,
+        "x-agency-user-email": options.user_email,
+    }
+    timeout = httpx.Timeout(timeout_seconds)
+    with httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout, headers=headers) as client:
+        _sync_live_eval_user(client, options)
+        memory_ids = [
+            _create_live_eval_memory(client, case=case, source=source, options=options)
+            for source in source_memories
+        ]
+        mode_results = {
+            mode: _run_live_persona_distillation_mode(
+                client,
+                case=case,
+                mode=mode,
+                memory_ids=memory_ids,
+                options=options,
+            )
+            for mode in options.modes
+        }
+
+    live_case = dict(case)
+    live_persona_eval = dict(persona_eval)
+    live_persona_eval["results"] = mode_results
+    live_persona_eval["live_run"] = {
+        "base_url": base_url.rstrip("/"),
+        "modes": list(options.modes),
+        "user_id": options.user_id,
+        "source_memory_count": len(memory_ids),
+    }
+    live_case["persona_distillation"] = live_persona_eval
+    live_case["assertions"] = _filter_persona_assertions_for_modes(case.get("assertions"), set(mode_results))
+    return live_case
+
+
+def _live_persona_source_memories(case: dict[str, Any]) -> list[dict[str, Any]]:
+    persona_eval = case.get("persona_distillation") if isinstance(case.get("persona_distillation"), dict) else {}
+    sources = persona_eval.get("source_memories")
+    if isinstance(sources, list):
+        normalized = [source for source in sources if isinstance(source, dict)]
+    else:
+        normalized = []
+    if not normalized:
+        raise ValueError(
+            "persona_distillation.source_memories is required for --live-persona-distillation."
+        )
+    for index, source in enumerate(normalized):
+        content = source.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError(f"persona_distillation.source_memories[{index}].content is required.")
+    return normalized
+
+
+def _sync_live_eval_user(client: httpx.Client, options: LivePersonaDistillationOptions) -> None:
+    response = client.post(
+        "/users/sync",
+        json={"id": options.user_id, "email": options.user_email},
+    )
+    response.raise_for_status()
+
+
+def _create_live_eval_memory(
+        client: httpx.Client,
+        *,
+        case: dict[str, Any],
+        source: dict[str, Any],
+        options: LivePersonaDistillationOptions,
+) -> str:
+    case_id = str(case.get("id") or "persona-live-eval")
+    source_id = str(source.get("id") or f"{case_id}-source")
+    payload = {
+        "memory": {
+            "scope": source.get("scope") or "user",
+            "created_by_user_id": options.user_id,
+            "content": source["content"],
+            "summary": source.get("summary") or source.get("title") or case.get("name"),
+            "tags": list(source.get("tags") or ["persona-live-eval", case_id]),
+            "source": source.get("source") or "persona_live_eval",
+            "memory_type": source.get("memory_type") or "archive",
+            "metadata": {
+                "eval_case_id": case_id,
+                "eval_source_id": source_id,
+                "eval_suite": case.get("suite"),
+                **(source.get("metadata") if isinstance(source.get("metadata"), dict) else {}),
+            },
+        },
+        "confirmed": True,
+    }
+    response = client.post("/memories", json=payload)
+    response.raise_for_status()
+    memory = response.json()
+    memory_id = memory.get("id")
+    if not isinstance(memory_id, str) or not memory_id:
+        raise ValueError(f"Memory create response for case '{case_id}' did not include id.")
+    return memory_id
+
+
+def _run_live_persona_distillation_mode(
+        client: httpx.Client,
+        *,
+        case: dict[str, Any],
+        mode: str,
+        memory_ids: list[str],
+        options: LivePersonaDistillationOptions,
+) -> dict[str, Any]:
+    normalized_mode = mode.strip().lower()
+    if normalized_mode not in {"deterministic", "llm", "hybrid"}:
+        raise ValueError(f"Unsupported live persona distillation mode: {mode}")
+    case_id = str(case.get("id") or "persona-live-eval")
+    payload: dict[str, Any] = {
+        "name": f"Eval {case_id} {normalized_mode} {uuid4().hex[:8]}",
+        "description": f"Live Persona Factory eval for {case_id} in {normalized_mode} mode.",
+        "source_memory_ids": memory_ids,
+        "distillation_mode": normalized_mode,
+        "persona_type": "professional",
+        "capability_mode": "persona_plus_expertise",
+        "consent_status": "explicit_consent",
+        "source_basis": "memory_records",
+        "sensitivity_level": "standard",
+        "visibility": "private",
+    }
+    if normalized_mode in {"llm", "hybrid"}:
+        if options.llm_model_source:
+            payload["llm_model_source"] = options.llm_model_source
+        if options.model_profile_id:
+            payload["model_profile_id"] = options.model_profile_id
+        if options.llm_model_provider:
+            payload["llm_model_provider"] = options.llm_model_provider
+        if options.llm_model:
+            payload["llm_model"] = options.llm_model
+
+    started = time.perf_counter()
+    response = client.post("/persona-factory/distill", json=payload)
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    if response.status_code >= 400:
+        return {
+            "items": [],
+            "metrics": {"latency_ms": latency_ms, "cost_usd": 0.0},
+            "status": "http_error",
+            "error": _response_error_detail(response),
+        }
+    body = response.json()
+    run = body.get("run") if isinstance(body.get("run"), dict) else {}
+    metrics = _live_persona_metrics(run, latency_ms=latency_ms)
+    return {
+        "items": [
+            _live_persona_item(item)
+            for item in body.get("items") or []
+            if isinstance(item, dict)
+        ],
+        "metrics": metrics,
+        "run_id": run.get("id"),
+        "persona_id": (body.get("persona") or {}).get("id") if isinstance(body.get("persona"), dict) else None,
+        "status": run.get("status"),
+    }
+
+
+def _live_persona_item(item: dict[str, Any]) -> dict[str, Any]:
+    structured_payload = item.get("structured_payload") if isinstance(item.get("structured_payload"), dict) else {}
+    source_ref = structured_payload.get("source_ref") if isinstance(structured_payload.get("source_ref"), dict) else {}
+    source_refs = structured_payload.get("source_refs") if isinstance(structured_payload.get("source_refs"), list) else []
+    evidence_ref = _live_persona_evidence_ref(source_ref, source_refs)
+    evidence_grounding = evidence_ref.get("evidence_grounding") if isinstance(evidence_ref.get("evidence_grounding"), dict) else {}
+    if not evidence_grounding:
+        evidence_grounding = evidence_ref.get("evidence") if isinstance(evidence_ref.get("evidence"), dict) else {}
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    return {
+        "title": item.get("title"),
+        "content": item.get("content"),
+        "item_type": item.get("item_type"),
+        "memory_layer": item.get("memory_layer"),
+        "confidence": item.get("confidence"),
+        "needs_review": item.get("needs_review"),
+        "source_evidence": evidence_ref.get("evidence_text")
+        or _live_persona_evidence_text(evidence_ref)
+        or structured_payload.get("source_evidence")
+        or metadata.get("source_evidence")
+        or item.get("content"),
+        "evidence_verified": evidence_grounding.get("verified"),
+        "structured_payload": structured_payload,
+        "metadata": metadata,
+        "review_flags": metadata.get("review_flags"),
+        "conflict_group_id": metadata.get("conflict_group_id"),
+    }
+
+
+def _live_persona_evidence_ref(source_ref: dict[str, Any], source_refs: list[Any]) -> dict[str, Any]:
+    refs = [ref for ref in [source_ref, *source_refs] if isinstance(ref, dict)]
+    for ref in refs:
+        evidence = ref.get("evidence") if isinstance(ref.get("evidence"), dict) else {}
+        if evidence.get("verified") is True:
+            return ref
+    for ref in refs:
+        if isinstance(ref.get("evidence"), dict) or isinstance(ref.get("evidence_grounding"), dict):
+            return ref
+    return source_ref
+
+
+def _live_persona_evidence_text(source_ref: dict[str, Any]) -> Any:
+    evidence = source_ref.get("evidence")
+    if isinstance(evidence, dict):
+        return evidence.get("text")
+    return evidence
+
+
+def _response_error_detail(response: httpx.Response) -> dict[str, Any]:
+    try:
+        payload = response.json()
+    except Exception:
+        payload = response.text
+    return {
+        "status_code": response.status_code,
+        "body": payload,
+    }
+
+
+def _filter_persona_assertions_for_modes(assertions: Any, modes: set[str]) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    for assertion in assertions or []:
+        if not isinstance(assertion, dict):
+            continue
+        mode = assertion.get("mode")
+        baseline = assertion.get("baseline")
+        if isinstance(mode, str) and mode not in modes:
+            continue
+        if isinstance(baseline, str) and baseline not in modes:
+            continue
+        filtered.append(assertion)
+    return filtered
+
+
+def _live_persona_metrics(run: dict[str, Any], *, latency_ms: int) -> dict[str, Any]:
+    distillation_metrics = run.get("distillation_metrics") if isinstance(run.get("distillation_metrics"), dict) else {}
+    llm_metrics = distillation_metrics.get("llm_distillation") if isinstance(distillation_metrics.get("llm_distillation"), dict) else {}
+    cost = (
+        llm_metrics.get("cost_usd")
+        or llm_metrics.get("estimated_cost_usd")
+        or distillation_metrics.get("cost_usd")
+        or 0.0
+    )
+    return {
+        "latency_ms": latency_ms,
+        "cost_usd": float(cost or 0.0),
+        "llm_call_count": int(llm_metrics.get("call_count") or 0),
+        "llm_success_count": int(llm_metrics.get("success_count") or 0),
+        "llm_failure_count": int(llm_metrics.get("failure_count") or 0),
+        "llm_total_latency_ms": int(llm_metrics.get("total_latency_ms") or 0),
+    }
 
 
 def _fixture_evidence(case: dict[str, Any]) -> EvidenceBundle:
@@ -405,6 +717,442 @@ def _evaluate_assertion(
                 matched.append(artifact)
         return _result(assertion_type, bool(matched), "artifact contains expected text", expected, [item.get("name") for item in matched])
     raise ValueError(f"Unsupported assertion type: {assertion_type}")
+
+
+def evaluate_persona_distillation_case(case: dict[str, Any]) -> list[AssertionResult]:
+    persona_eval = case.get("persona_distillation") if isinstance(case.get("persona_distillation"), dict) else {}
+    expected_items = [
+        item for item in persona_eval.get("expected_items") or []
+        if isinstance(item, dict)
+    ]
+    mode_results = {
+        str(mode): payload
+        for mode, payload in (persona_eval.get("results") or {}).items()
+        if isinstance(payload, dict)
+    }
+    if not expected_items:
+        return [AssertionResult("persona_fixture_valid", False, "persona_distillation.expected_items is required.")]
+    if not mode_results:
+        return [AssertionResult("persona_fixture_valid", False, "persona_distillation.results is required.")]
+
+    report = {
+        mode: _score_persona_distillation_mode(expected_items, payload)
+        for mode, payload in mode_results.items()
+    }
+    assertions = case.get("assertions") or _default_persona_assertions(report)
+    results: list[AssertionResult] = [
+        AssertionResult(
+            "persona_metrics",
+            True,
+            "persona distillation metrics computed",
+            expected={"modes": sorted(mode_results)},
+            actual=report,
+        )
+    ]
+    for assertion in assertions:
+        if not isinstance(assertion, dict):
+            results.append(AssertionResult("invalid", False, "Assertion must be an object.", expected=assertion))
+            continue
+        assertion_type = str(assertion.get("type") or "")
+        try:
+            results.append(_evaluate_persona_assertion(assertion_type, assertion, report))
+        except Exception as exc:
+            results.append(AssertionResult(assertion_type or "invalid", False, str(exc), expected=assertion))
+    return results
+
+
+def _score_persona_distillation_mode(
+        expected_items: list[dict[str, Any]],
+        result: dict[str, Any],
+) -> dict[str, Any]:
+    items = [item for item in result.get("items") or [] if isinstance(item, dict)]
+    metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+    matches = _match_persona_items(expected_items, items)
+    matched_expected = {match["expected_index"] for match in matches}
+    matched_actual = {match["actual_index"] for match in matches}
+    precision = len(matched_actual) / len(items) if items else (1.0 if not expected_items else 0.0)
+    recall = len(matched_expected) / len(expected_items) if expected_items else 1.0
+    f1 = 0.0 if precision + recall == 0 else (2 * precision * recall) / (precision + recall)
+    evidence_grounding = _evidence_grounding_score(matches, expected_items, items)
+    item_type_accuracy = _field_accuracy(matches, expected_items, items, "item_type")
+    memory_layer_accuracy = _field_accuracy(matches, expected_items, items, "memory_layer")
+    conflict_quality = _conflict_detection_quality(expected_items, items)
+    review_burden = sum(1 for item in items if item.get("needs_review") is True) / len(items) if items else 0.0
+    return {
+        "item_count": len(items),
+        "matched_expected_count": len(matched_expected),
+        "matched_item_count": len(matched_actual),
+        "precision": round(precision, 4),
+        "recall": round(recall, 4),
+        "f1": round(f1, 4),
+        "evidence_grounding": round(evidence_grounding, 4),
+        "item_type_accuracy": round(item_type_accuracy, 4),
+        "memory_layer_accuracy": round(memory_layer_accuracy, 4),
+        "conflict_detection_quality": round(conflict_quality, 4),
+        "review_burden": round(review_burden, 4),
+        "cost_usd": float(metrics.get("cost_usd") or 0.0),
+        "latency_ms": int(metrics.get("latency_ms") or 0),
+        "status": result.get("status"),
+        "run_id": result.get("run_id"),
+        "error": result.get("error"),
+        "matches": matches,
+    }
+
+
+def _match_persona_items(expected_items: list[dict[str, Any]], items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    used_actual: set[int] = set()
+    for expected_index, expected in enumerate(expected_items):
+        best: tuple[float, int] | None = None
+        for actual_index, actual in enumerate(items):
+            if actual_index in used_actual:
+                continue
+            score = _persona_item_match_score(expected, actual)
+            if score <= 0:
+                continue
+            if best is None or score > best[0]:
+                best = (score, actual_index)
+        if best is None:
+            continue
+        used_actual.add(best[1])
+        matches.append(
+            {
+                "expected_index": expected_index,
+                "actual_index": best[1],
+                "score": round(best[0], 4),
+                "expected_id": expected.get("id"),
+                "actual_title": items[best[1]].get("title"),
+            }
+        )
+    return matches
+
+
+def _persona_item_match_score(expected: dict[str, Any], actual: dict[str, Any]) -> float:
+    if expected.get("item_type") and actual.get("item_type") and expected.get("item_type") != actual.get("item_type"):
+        return 0.0
+    if (
+            expected.get("memory_layer")
+            and actual.get("memory_layer")
+            and expected.get("memory_layer") != actual.get("memory_layer")
+    ):
+        return 0.0
+    expected_keywords = _normalized_keywords(expected.get("content_keywords") or expected.get("keywords") or [])
+    if not expected_keywords:
+        expected_keywords = _normalized_keywords([expected.get("content") or expected.get("title") or ""])
+    haystack = _normalized_text(" ".join([
+        str(actual.get("title") or ""),
+        str(actual.get("content") or ""),
+        json.dumps(actual.get("structured_payload") or {}, sort_keys=True, default=str),
+    ]))
+    keyword_hits = sum(1 for keyword in expected_keywords if keyword and keyword in haystack)
+    keyword_score = keyword_hits / len(expected_keywords) if expected_keywords else 0.0
+    type_bonus = 0.15 if expected.get("item_type") == actual.get("item_type") else 0.0
+    layer_bonus = 0.1 if expected.get("memory_layer") == actual.get("memory_layer") else 0.0
+    score = min(keyword_score + type_bonus + layer_bonus, 1.0)
+    return score if score >= 0.45 else 0.0
+
+
+def _normalized_keywords(values: Any) -> list[str]:
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, list):
+        return []
+    return [_normalized_text(str(value)) for value in values if str(value).strip()]
+
+
+def _normalized_text(value: str) -> str:
+    return " ".join("".join(char.lower() if char.isalnum() else " " for char in value).split())
+
+
+def _evidence_grounding_score(
+        matches: list[dict[str, Any]],
+        expected_items: list[dict[str, Any]],
+        items: list[dict[str, Any]],
+) -> float:
+    if not matches:
+        return 0.0
+    grounded = 0
+    for match in matches:
+        expected = expected_items[match["expected_index"]]
+        actual = items[match["actual_index"]]
+        evidence_text = str(actual.get("source_evidence") or actual.get("evidence") or "")
+        structured_payload = actual.get("structured_payload") if isinstance(actual.get("structured_payload"), dict) else {}
+        evidence = structured_payload.get("source_evidence") or evidence_text
+        expected_evidence = str(expected.get("evidence") or "")
+        evidence_verified = actual.get("evidence_verified")
+        if evidence_verified is False:
+            continue
+        if expected_evidence and _normalized_text(expected_evidence) not in _normalized_text(str(evidence)):
+            continue
+        if str(evidence).strip():
+            grounded += 1
+    return grounded / len(matches)
+
+
+def _field_accuracy(
+        matches: list[dict[str, Any]],
+        expected_items: list[dict[str, Any]],
+        items: list[dict[str, Any]],
+        field: str,
+) -> float:
+    if not matches:
+        return 0.0
+    correct = sum(
+        1
+        for match in matches
+        if expected_items[match["expected_index"]].get(field) == items[match["actual_index"]].get(field)
+    )
+    return correct / len(matches)
+
+
+def _conflict_detection_quality(expected_items: list[dict[str, Any]], items: list[dict[str, Any]]) -> float:
+    expected_conflict_count = sum(1 for item in expected_items if item.get("conflict_expected") is True)
+    if expected_conflict_count == 0:
+        return 1.0
+    detected = 0
+    for item in items:
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        flags = item.get("review_flags") or metadata.get("review_flags") or []
+        if not isinstance(flags, list):
+            flags = []
+        if item.get("conflict_group_id") or "material_conflict" in flags:
+            detected += 1
+    return min(detected / expected_conflict_count, 1.0)
+
+
+def _default_persona_assertions(report: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    assertions: list[dict[str, Any]] = []
+    for mode in sorted(report):
+        assertions.extend(
+            [
+                {"type": "persona_metric_min", "mode": mode, "metric": "precision", "value": 0.7},
+                {"type": "persona_metric_min", "mode": mode, "metric": "recall", "value": 0.7},
+                {"type": "persona_metric_min", "mode": mode, "metric": "evidence_grounding", "value": 0.7},
+            ]
+        )
+    if "hybrid" in report and "deterministic" in report:
+        assertions.append({"type": "persona_metric_gte", "mode": "hybrid", "baseline": "deterministic", "metric": "f1"})
+    return assertions
+
+
+def _evaluate_persona_assertion(
+        assertion_type: str,
+        assertion: dict[str, Any],
+        report: dict[str, dict[str, Any]],
+) -> AssertionResult:
+    if assertion_type == "persona_metric_min":
+        mode = _required_assertion_string(assertion, "mode")
+        metric = _required_assertion_string(assertion, "metric")
+        expected = float(assertion.get("value") or 0.0)
+        actual = float(report.get(mode, {}).get(metric, 0.0))
+        return _result(assertion_type, actual >= expected, f"{mode}.{metric} meets minimum", expected, actual)
+    if assertion_type == "persona_metric_max":
+        mode = _required_assertion_string(assertion, "mode")
+        metric = _required_assertion_string(assertion, "metric")
+        expected = float(assertion.get("value") or 0.0)
+        actual = float(report.get(mode, {}).get(metric, 0.0))
+        return _result(assertion_type, actual <= expected, f"{mode}.{metric} stays under maximum", expected, actual)
+    if assertion_type == "persona_metric_gte":
+        mode = _required_assertion_string(assertion, "mode")
+        baseline = _required_assertion_string(assertion, "baseline")
+        metric = _required_assertion_string(assertion, "metric")
+        actual = float(report.get(mode, {}).get(metric, 0.0))
+        expected = float(report.get(baseline, {}).get(metric, 0.0))
+        return _result(assertion_type, actual >= expected, f"{mode}.{metric} is at least {baseline}.{metric}", expected, actual)
+    if assertion_type == "persona_best_mode":
+        mode = _required_assertion_string(assertion, "mode")
+        metric = _required_assertion_string(assertion, "metric")
+        best_value = max(float(metrics.get(metric, 0.0)) for metrics in report.values()) if report else 0.0
+        winners = [
+            candidate_mode
+            for candidate_mode, metrics in report.items()
+            if float(metrics.get(metric, 0.0)) == best_value
+        ]
+        return _result(assertion_type, mode in winners, f"{mode} is best for {metric}", mode, winners)
+    raise ValueError(f"Unsupported persona assertion type: {assertion_type}")
+
+
+def evaluate_persona_runtime_case(case: dict[str, Any]) -> list[AssertionResult]:
+    runtime_eval = case.get("persona_runtime") if isinstance(case.get("persona_runtime"), dict) else {}
+    questions = [
+        question for question in runtime_eval.get("questions") or []
+        if isinstance(question, dict)
+    ]
+    personas = {
+        str(mode): payload
+        for mode, payload in (runtime_eval.get("personas") or {}).items()
+        if isinstance(payload, dict)
+    }
+    if not questions:
+        return [AssertionResult("persona_runtime_fixture_valid", False, "persona_runtime.questions is required.")]
+    if not personas:
+        return [AssertionResult("persona_runtime_fixture_valid", False, "persona_runtime.personas is required.")]
+
+    report = {
+        mode: _score_persona_runtime_mode(questions, payload)
+        for mode, payload in personas.items()
+    }
+    fixture_type = str(runtime_eval.get("fixture_type") or case.get("suite") or "persona_runtime")
+    report_summary = {
+        "fixture_type": fixture_type,
+        "modes": report,
+        "winners": _runtime_winners(report),
+    }
+    assertions = case.get("assertions") or _default_runtime_assertions(report)
+    results = [
+        AssertionResult(
+            "persona_runtime_metrics",
+            True,
+            "persona runtime metrics computed",
+            expected={"fixture_type": fixture_type, "modes": sorted(personas)},
+            actual=report_summary,
+        )
+    ]
+    for assertion in assertions:
+        if not isinstance(assertion, dict):
+            results.append(AssertionResult("invalid", False, "Assertion must be an object.", expected=assertion))
+            continue
+        assertion_type = str(assertion.get("type") or "")
+        try:
+            results.append(_evaluate_persona_runtime_assertion(assertion_type, assertion, report_summary))
+        except Exception as exc:
+            results.append(AssertionResult(assertion_type or "invalid", False, str(exc), expected=assertion))
+    return results
+
+
+def _score_persona_runtime_mode(
+        questions: list[dict[str, Any]],
+        persona: dict[str, Any],
+) -> dict[str, Any]:
+    answers = {
+        str(answer.get("question_id")): answer
+        for answer in persona.get("answers") or []
+        if isinstance(answer, dict) and answer.get("question_id")
+    }
+    per_question: list[dict[str, Any]] = []
+    for question in questions:
+        question_id = str(question.get("id") or "")
+        answer = answers.get(question_id, {})
+        text = str(answer.get("answer") or "")
+        per_question.append(
+            {
+                "question_id": question_id,
+                "answer_correctness": _keyword_score(text, question.get("expected_keywords")),
+                "style_fidelity": _keyword_score(text, question.get("style_keywords")),
+                "source_grounding": _source_grounding_score(text, answer, question),
+                "uncertainty_refusal": _uncertainty_refusal_score(text, question),
+                "graph_context_usefulness": _graph_context_score(text, answer, question),
+            }
+        )
+    aggregate = {
+        metric: _average([entry[metric] for entry in per_question])
+        for metric in (
+            "answer_correctness",
+            "style_fidelity",
+            "source_grounding",
+            "uncertainty_refusal",
+            "graph_context_usefulness",
+        )
+    }
+    aggregate["overall"] = _average(list(aggregate.values()))
+    aggregate["persona_version_id"] = persona.get("persona_version_id")
+    aggregate["distillation_mode"] = persona.get("distillation_mode")
+    aggregate["question_count"] = len(per_question)
+    aggregate["questions"] = per_question
+    return aggregate
+
+
+def _keyword_score(text: str, keywords: Any) -> float:
+    normalized_keywords = _normalized_keywords(keywords)
+    if not normalized_keywords:
+        return 1.0
+    haystack = _normalized_text(text)
+    return round(sum(1 for keyword in normalized_keywords if keyword in haystack) / len(normalized_keywords), 4)
+
+
+def _source_grounding_score(text: str, answer: dict[str, Any], question: dict[str, Any]) -> float:
+    expected_sources = _normalized_keywords(question.get("source_keywords"))
+    citations = _normalized_keywords(answer.get("citations") or answer.get("source_citations") or [])
+    if not expected_sources:
+        return 1.0
+    haystack = _normalized_text(" ".join([text, " ".join(citations)]))
+    return round(sum(1 for keyword in expected_sources if keyword in haystack) / len(expected_sources), 4)
+
+
+def _uncertainty_refusal_score(text: str, question: dict[str, Any]) -> float:
+    if question.get("requires_uncertainty") is not True:
+        return 1.0
+    uncertainty_keywords = question.get("uncertainty_keywords") or ["not enough evidence", "cannot confirm", "source does not"]
+    return _keyword_score(text, uncertainty_keywords)
+
+
+def _graph_context_score(text: str, answer: dict[str, Any], question: dict[str, Any]) -> float:
+    expected = _normalized_keywords(question.get("graph_context_keywords"))
+    if not expected:
+        return 1.0
+    graph_context = answer.get("graph_context") if isinstance(answer.get("graph_context"), dict) else {}
+    graph_terms = graph_context.get("used_nodes") or graph_context.get("used_edges") or []
+    haystack = _normalized_text(" ".join([text, json.dumps(graph_terms, sort_keys=True, default=str)]))
+    return round(sum(1 for keyword in expected if keyword in haystack) / len(expected), 4)
+
+
+def _average(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return round(sum(float(value) for value in values) / len(values), 4)
+
+
+def _runtime_winners(report: dict[str, dict[str, Any]]) -> dict[str, str]:
+    winners: dict[str, str] = {}
+    for metric in (
+        "overall",
+        "answer_correctness",
+        "style_fidelity",
+        "source_grounding",
+        "uncertainty_refusal",
+        "graph_context_usefulness",
+    ):
+        winners[metric] = max(report.items(), key=lambda item: float(item[1].get(metric, 0.0)))[0]
+    return winners
+
+
+def _default_runtime_assertions(report: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    assertions = [
+        {"type": "persona_runtime_metric_min", "mode": mode, "metric": "overall", "value": 0.7}
+        for mode in sorted(report)
+    ]
+    if "hybrid" in report and "deterministic" in report:
+        assertions.append(
+            {"type": "persona_runtime_metric_gte", "mode": "hybrid", "baseline": "deterministic", "metric": "overall"}
+        )
+    return assertions
+
+
+def _evaluate_persona_runtime_assertion(
+        assertion_type: str,
+        assertion: dict[str, Any],
+        report_summary: dict[str, Any],
+) -> AssertionResult:
+    report = report_summary["modes"]
+    if assertion_type == "persona_runtime_metric_min":
+        mode = _required_assertion_string(assertion, "mode")
+        metric = _required_assertion_string(assertion, "metric")
+        expected = float(assertion.get("value") or 0.0)
+        actual = float(report.get(mode, {}).get(metric, 0.0))
+        return _result(assertion_type, actual >= expected, f"{mode}.{metric} meets minimum", expected, actual)
+    if assertion_type == "persona_runtime_metric_gte":
+        mode = _required_assertion_string(assertion, "mode")
+        baseline = _required_assertion_string(assertion, "baseline")
+        metric = _required_assertion_string(assertion, "metric")
+        actual = float(report.get(mode, {}).get(metric, 0.0))
+        expected = float(report.get(baseline, {}).get(metric, 0.0))
+        return _result(assertion_type, actual >= expected, f"{mode}.{metric} is at least {baseline}.{metric}", expected, actual)
+    if assertion_type == "persona_runtime_best_mode":
+        mode = _required_assertion_string(assertion, "mode")
+        metric = _required_assertion_string(assertion, "metric")
+        actual = report_summary["winners"].get(metric)
+        return _result(assertion_type, actual == mode, f"{mode} wins runtime {metric}", mode, actual)
+    raise ValueError(f"Unsupported persona runtime assertion type: {assertion_type}")
 
 
 def _matching_events(assertion: dict[str, Any], events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -741,6 +1489,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--results-path", default=str(DEFAULT_RESULTS_PATH), help="JSONL results output path.")
     parser.add_argument("--fail-under", type=float, default=100.0, help="Minimum average score required.")
     parser.add_argument("--judge-agent", action="store_true", help="Invoke the Evaluation agent as a semantic judge.")
+    parser.add_argument(
+        "--live-persona-distillation",
+        action="store_true",
+        help=(
+            "Replay persona_distillation_fixture cases through a running backend. "
+            "Requires --base-url and fixture source_memories."
+        ),
+    )
+    parser.add_argument(
+        "--live-persona-modes",
+        default="deterministic,llm,hybrid",
+        help="Comma-separated modes for --live-persona-distillation.",
+    )
+    parser.add_argument("--live-user-id", default="persona-eval-user", help="User id for live persona eval writes.")
+    parser.add_argument(
+        "--live-user-email",
+        default="persona-eval-user@example.local",
+        help="User email for live persona eval writes.",
+    )
+    parser.add_argument(
+        "--live-llm-model-source",
+        choices=("main_agent", "model_profile", "model"),
+        help="Optional llm_model_source override for live LLM/hybrid persona evals.",
+    )
+    parser.add_argument("--live-model-profile-id", help="Optional model_profile_id for live persona evals.")
+    parser.add_argument("--live-llm-model-provider", help="Optional provider for live llm_model_source=model evals.")
+    parser.add_argument("--live-llm-model", help="Optional model for live llm_model_source=model evals.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON summary.")
     parser.add_argument("--no-write", action="store_true", help="Do not append results to JSONL.")
     return parser.parse_args()
@@ -756,12 +1531,23 @@ def main() -> int:
     if not cases:
         print("No eval cases matched the selected filters.", file=sys.stderr)
         return 1
+    live_persona_options = LivePersonaDistillationOptions(
+        modes=_parse_live_persona_modes(args.live_persona_modes),
+        user_id=args.live_user_id,
+        user_email=args.live_user_email,
+        llm_model_source=args.live_llm_model_source,
+        model_profile_id=args.live_model_profile_id,
+        llm_model_provider=args.live_llm_model_provider,
+        llm_model=args.live_llm_model,
+    )
     results = [
         run_case(
             case,
             base_url=args.base_url,
             judge_agent=args.judge_agent,
             timeout_seconds=args.timeout_seconds,
+            live_persona_distillation=args.live_persona_distillation,
+            live_persona_options=live_persona_options,
         )
         for case in cases
     ]
@@ -782,6 +1568,20 @@ def main() -> int:
             detail = f" ({result.error})" if result.error else ""
             print(f"{marker} {result.case_id}: {result.score}{detail}")
     return 1 if has_failures or failed_threshold else 0
+
+
+def _parse_live_persona_modes(value: str) -> tuple[str, ...]:
+    modes = tuple(
+        item.strip().lower()
+        for item in str(value or "").split(",")
+        if item.strip()
+    )
+    if not modes:
+        raise ValueError("--live-persona-modes must include at least one mode.")
+    unsupported = [mode for mode in modes if mode not in {"deterministic", "llm", "hybrid"}]
+    if unsupported:
+        raise ValueError(f"Unsupported --live-persona-modes value(s): {', '.join(unsupported)}")
+    return modes
 
 
 if __name__ == "__main__":

@@ -7,13 +7,17 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BACKEND_WORKSPACE = Path(os.getenv("AGENCY_BACKEND_WORKSPACE", str(REPO_ROOT))).expanduser().resolve()
 FRONTEND_WORKSPACE = Path(
-    os.getenv("AGENCY_FRONTEND_WORKSPACE", str(REPO_ROOT.parent / "agency-fe"))
+    os.getenv("AGENCY_FRONTEND_WORKSPACE", str(REPO_ROOT.parent / "open-agency-fe"))
 ).expanduser().resolve()
 
 ALLOWED_WORKSPACES: dict[str, Path] = {
+    "open-agency": BACKEND_WORKSPACE,
+    "open-agency-backend": BACKEND_WORKSPACE,
     "agency": BACKEND_WORKSPACE,
     "agency-backend": BACKEND_WORKSPACE,
     "backend": BACKEND_WORKSPACE,
+    "open-agency-fe": FRONTEND_WORKSPACE,
+    "open-agency-frontend": FRONTEND_WORKSPACE,
     "agency-fe": FRONTEND_WORKSPACE,
     "agency-frontend": FRONTEND_WORKSPACE,
     "frontend": FRONTEND_WORKSPACE,

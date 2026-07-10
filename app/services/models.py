@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
-import os
-from typing import Any
-
 import httpx
+import os
+from dataclasses import dataclass
+from typing import Any
 
 from app.api.context import ApiContext
 from app.domain import ModelProfileDefinition, ModelProviderDefinition, ModelProviderType
 
-
 CURATED_MODEL_OPTIONS: dict[str, list[dict[str, str]]] = {
     "openai": [
+        {"id": "gpt-5.6-sol", "name": "GPT-5.6 Sol"},
+        {"id": "gpt-5.6-terra", "name": "GPT-5.6 Terra"},
+        {"id": "gpt-5.6-luna", "name": "GPT-5.6 Luna"},
         {"id": "gpt-5.5", "name": "GPT-5.5"},
         {"id": "gpt-5.5-pro", "name": "GPT-5.5 Pro"},
         {"id": "gpt-5.4", "name": "GPT-5.4"},
@@ -28,6 +29,9 @@ CURATED_MODEL_OPTIONS: dict[str, list[dict[str, str]]] = {
         {"id": "gpt-4o-mini", "name": "GPT-4o mini"},
     ],
     "openai_codex": [
+        {"id": "gpt-5.6-sol", "name": "GPT-5.6 Sol"},
+        {"id": "gpt-5.6-terra", "name": "GPT-5.6 Terra"},
+        {"id": "gpt-5.6-luna", "name": "GPT-5.6 Luna"},
         {"id": "gpt-5.4", "name": "GPT-5.4"},
         {"id": "gpt-5.4-mini", "name": "GPT-5.4 mini"},
         {"id": "gpt-5.3-codex", "name": "GPT-5.3 Codex"},
@@ -79,6 +83,20 @@ CURATED_MODEL_OPTIONS: dict[str, list[dict[str, str]]] = {
         {"id": "grok-4-fast-non-reasoning", "name": "Grok 4 Fast Non-Reasoning"},
         {"id": "grok-4", "name": "Grok 4"},
     ],
+    "deepseek": [
+        {"id": "deepseek-v4-flash", "name": "DeepSeek V4 Flash"},
+        {"id": "deepseek-v4-pro", "name": "DeepSeek V4 Pro"},
+        {"id": "deepseek-chat", "name": "DeepSeek Chat (legacy)"},
+        {"id": "deepseek-reasoner", "name": "DeepSeek Reasoner (legacy)"},
+    ],
+    "qwen": [
+        {"id": "qwen-plus", "name": "Qwen Plus"},
+        {"id": "qwen-max", "name": "Qwen Max"},
+        {"id": "qwen-flash", "name": "Qwen Flash"},
+        {"id": "qwen3.5-plus", "name": "Qwen3.5 Plus"},
+        {"id": "qwen3.5-flash", "name": "Qwen3.5 Flash"},
+        {"id": "qwen3-coder-plus", "name": "Qwen3 Coder Plus"},
+    ],
 }
 
 
@@ -104,6 +122,10 @@ class ModelCatalogService:
             return "https://api.openai.com/v1"
         if provider_type == ModelProviderType.OPENAI_CODEX.value:
             return "https://api.openai.com/v1"
+        if provider_type == ModelProviderType.DEEPSEEK.value:
+            return "https://api.deepseek.com"
+        if provider_type == ModelProviderType.QWEN.value:
+            return "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
         return None
 
     def _provider_auth_profile(self, provider: ModelProviderDefinition) -> dict[str, Any]:
@@ -128,6 +150,10 @@ class ModelCatalogService:
             return os.getenv("ANTHROPIC_API_KEY")
         if provider_type == ModelProviderType.GOOGLE.value:
             return os.getenv("GOOGLE_API_KEY")
+        if provider_type == ModelProviderType.DEEPSEEK.value:
+            return os.getenv("DEEPSEEK_API_KEY")
+        if provider_type == ModelProviderType.QWEN.value:
+            return os.getenv("QWEN_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
         return None
 
     def _curated_models(self, provider: ModelProviderDefinition) -> list[dict[str, str]]:
@@ -196,7 +222,12 @@ class ModelCatalogService:
         api_key = self._provider_api_key(provider)
         if (
                 self._provider_type(provider)
-                in {ModelProviderType.OPENAI.value, ModelProviderType.OPENAI_CODEX.value}
+                in {
+            ModelProviderType.OPENAI.value,
+            ModelProviderType.OPENAI_CODEX.value,
+            ModelProviderType.DEEPSEEK.value,
+            ModelProviderType.QWEN.value,
+        }
                 and not api_key
         ):
             return self._fallback_model_response(
@@ -364,12 +395,14 @@ class ModelCatalogService:
                 ModelProviderType.OPENAI.value,
                 ModelProviderType.OPENAI_COMPATIBLE.value,
                 ModelProviderType.OPENAI_CODEX.value,
+                ModelProviderType.DEEPSEEK.value,
+                ModelProviderType.QWEN.value,
             }:
                 return await self._list_openai_compatible_models(provider)
         except Exception as exc:
             return self._fallback_model_response(provider, str(exc))
 
-        if family == "xai":
+        if family in {"xai", "deepseek", "qwen"}:
             try:
                 return await self._list_openai_compatible_models(provider)
             except Exception as exc:

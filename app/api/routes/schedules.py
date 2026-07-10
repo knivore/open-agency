@@ -6,8 +6,8 @@ from typing import Any, Optional
 
 from app.api.context import ApiContext, get_default_api_context
 from app.api.identity import resolve_current_user_if_present
-from app.scheduler import ScheduleConcurrencyError
-from app.services import ScheduleService
+from app.scheduler.scheduler import ScheduleConcurrencyError
+from app.services.schedules import ScheduleService
 from ._crud import serializable_validation_errors
 
 
@@ -90,6 +90,26 @@ def create_schedules_router(context: Optional[ApiContext] = None) -> APIRouter:
             "execution_id": result.execution_id,
             "triggered_at": result.triggered_at.isoformat(),
             "metadata": result.metadata,
+        }
+
+    @router.post("/events/dispatch", summary="Dispatch Schedule Event")
+    async def dispatch_schedule_event(payload: dict[str, Any], request: Request):
+        await resolve_current_user_if_present(request, context, required_scopes=["schedules:write"])
+        try:
+            results = await service.dispatch_event(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return {
+            "items": [
+                {
+                    "schedule": result.schedule.model_dump(mode="json"),
+                    "execution_id": result.execution_id,
+                    "triggered_at": result.triggered_at.isoformat(),
+                    "metadata": result.metadata,
+                }
+                for result in results
+            ],
+            "count": len(results),
         }
 
     @router.delete("/{schedule_id}", summary="Soft Delete Schedule")

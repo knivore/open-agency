@@ -16,9 +16,13 @@ constrained to app-owned adapter and route layers.
 Current documentation boundary:
 
 - active architecture and contract guidance lives in the current `docs/*.md` files
-- main-agent chat planning and model-auth recovery are covered in [main-agent.md](./main-agent.md)
+- main-agent chat planning and model-auth recovery are covered in [docs/main-agent.md](./main-agent.md)
 - migration trackers, TODO playbooks, and archive snapshots are intentionally excluded from the maintained documentation
   set
+
+Optional module loading is explicit. Core deployments start without add-on packs unless `AGENCY_BUILTIN_OPTIONAL_MODULES`
+or `AGENCY_OPTIONAL_MODULE_SPEC_REFS` names module specs to load; module-specific migrations should stay with their
+own packs instead of being chained into the core Alembic history.
 
 ## app/domain
 
@@ -102,14 +106,6 @@ Main areas:
 - `executors/`
 - `implementations/`
 
-Executor imports should resolve to the `app/tools/executors/` package. Do not add a sibling `app/tools/executors.py`
-compatibility file.
-
-## Migrations
-
-Schema migrations live in the top-level `alembic/` tree. Do not add a parallel empty `app/migrations` package unless it
-contains an actual app-owned migration workflow.
-
 ## app/llm
 
 Purpose:
@@ -153,6 +149,26 @@ Core principle:
 
 - `ExecutionEvent` is the internal source of truth for execution history
 
+## Agency Graph
+
+Agency Graph is the shared graph model for operational, memory, lineage, health, governance, cost, and debugging views.
+Neo4j is the durable graph projection backend, while Sigma and other clients are consumers of normalized graph DTOs.
+
+Current projection support lives under `app/graph/`. Existing Neo4j labels such as `WorkflowRun`, `StepRun`, `Memory`,
+`Document`, and `Entity` remain compatibility labels during the Agency Graph migration. User-facing docs, UI, and future
+agent tools should use the canonical model in [docs/agency-graph-model.md](./agency-graph-model.md).
+
+Graph projection is read-only with respect to source-of-truth runtime, workflow, conversation, and memory records.
+Graph reads must stay bounded, redacted, and normalized so they can safely serve UI, observability, and future
+agent-context tools.
+
+`agency.graph.context` is the first agent-facing Agency Graph tool. It is enabled for discovery and seed data through
+`AGENCY_GRAPH_CONTEXT_TOOLS_ENABLED` and remains read-only. Agents can call it with a known graph anchor or a bounded
+query to retrieve facts, related memories, execution context, failures, decisions, constraints, next actions, provenance,
+and optional raw graph DTOs. This complements durable/vector memory: durable memory recalls stored semantic facts, while
+Agency Graph context explains relationships, lineage, operational history, and why a run or workflow is connected to
+other records.
+
 ## Memory Architecture
 
 Memory is database-backed.
@@ -168,6 +184,33 @@ Current memory services:
 - `ExecutionRunSummaryService` writes optional durable `run_summary` records for non-main-agent executions
 
 This design keeps the source of truth in the database and avoids file-based memory concurrency issues.
+
+## Persona Factory
+
+Persona Factory is the DB-backed bounded context for converting source material into reusable Agency personas. `Persona`
+is the canonical Agency product and API term; other agent ecosystems may call similar reusable packages "skills". It
+composes existing primitives rather than replacing them:
+
+- persona records and versions are the governed persona package source of truth
+- selected source memories and uploaded document chunks provide provenance
+- approved packages can publish an `AgentDefinition`
+- package memory layers are written back into `memory_records` with persona metadata
+- future graph projection can add `Persona`, `PersonaVersion`, and source-lineage nodes without changing runtime records
+
+Initial product APIs live under `/persona` and `/persona-factory`. `/skills`, `/skill-factory`, and `/personas`
+compatibility endpoints are intentionally not exposed. The first distillation strategy is deterministic and review-first;
+LLM extraction can be added behind the same package schema after structured-output validation and approval controls are
+in place.
+
+Persona Factory is separate from tool management. A tool is an executable capability with a schema, permission model,
+and executor. A persona is reusable simulated identity and operating style: voice, knowledge, judgement, workflow
+patterns, guardrails, and source-backed memory. Professional expertise is a subtype of persona, not the whole model.
+Published personas can materialize an `AgentDefinition` and bind to tools, but Persona Factory owns the governed package
+lifecycle while tool management owns callable side effects.
+
+For backend developer guidance, see `docs/persona-factory.md`. For backend-only creation, review, approval, publish,
+and runtime invocation examples, see `docs/persona-factory-cli.md`. Recurring operator commands belong in
+`docs/runbook.md`.
 
 ## app/security
 
