@@ -10,7 +10,7 @@ from app.api.context import create_test_api_context
 from app.api.routes.conversations.core import create_conversations_router
 from app.domain import ConversationMessage, MCPExposureSettings, ModelProfileDefinition, SecuritySettings, \
     ToolDefinition, ToolImplementationReference, ToolType
-from app.llm.base import ModelResponse, ModelToolCall
+from app.llm.base import ModelResponse, ModelStreamEvent, ModelToolCall
 from app.llm.registry import LLMEnvironmentConfig
 from app.services.conversations.core import ConversationService
 from app.services.main_agent_setup.service import MainAgentSetupConfig, MainAgentSetupService
@@ -42,6 +42,16 @@ class _FakeModelClient:
         return {"ok": True}
 
 
+class _StreamingFakeModelClient(_FakeModelClient):
+    events: list[ModelStreamEvent] = []
+
+    def generate_text(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+        raise AssertionError("The streaming response path should be used")
+
+    def stream_generate_text(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+        yield from self.events
+
+
 class _ConnectedRequest:
     async def is_disconnected(self) -> bool:
         return False
@@ -63,9 +73,23 @@ class ConversationStreamingServiceTests(unittest.IsolatedAsyncioTestCase):
     def setUpClass(cls) -> None:
         cls.context = create_test_api_context()
         cls.context.llm_provider_registry.register("fake", lambda profile, env: _FakeModelClient(profile, env))
+        cls.context.llm_provider_registry.register(
+            "fake_streaming",
+            lambda profile, env: _StreamingFakeModelClient(profile, env),
+        )
         asyncio.run(
             cls.context.model_profile_repo.save(
                 ModelProfileDefinition(id="profile-fake", name="Fake", provider="fake", model="fake-model")
+            )
+        )
+        asyncio.run(
+            cls.context.model_profile_repo.save(
+                ModelProfileDefinition(
+                    id="profile-fake-streaming",
+                    name="Fake streaming",
+                    provider="fake_streaming",
+                    model="fake-streaming-model",
+                )
             )
         )
         asyncio.run(
@@ -217,6 +241,67 @@ class ConversationStreamingServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final_message_payload["message"]["metadata"]["turn_id"], "turn:message-activity-1")
         draft_payload = next(payload for payload in activity_payloads if payload["event_type"] == "assistant.draft_delta")
         self.assertEqual(draft_payload["text_delta"], "activity stream reply")
+
+    async def test_service_stream_emits_incremental_model_tokens_before_final_message(self) -> None:
+        profile = await self.context.main_agent_profile_repo.get("main-agent-profile")
+        assert profile is not None
+        agent = await self.context.agent_repo.get(profile.agent_id)
+        assert agent is not None
+        original_model_profile_id = agent.model_profile_id
+        await self.context.agent_repo.update(agent.id, {"model_profile_id": "profile-fake-streaming"})
+        _StreamingFakeModelClient.events = [
+            ModelStreamEvent(text_delta="token "),
+            ModelStreamEvent(text_delta="stream"),
+            ModelStreamEvent(
+                response=ModelResponse(
+                    content="token stream",
+                    provider="fake_streaming",
+                    model="fake-streaming-model",
+                )
+            ),
+        ]
+        stream = self.service.stream_conversation_events(
+            self.conversation_id,
+            _ConnectedRequest(),
+            idle_timeout_seconds=1.0,
+        )
+
+        async def produce_message() -> None:
+            await asyncio.sleep(0.05)
+            await self.service.post_message(
+                self.conversation_id,
+                {
+                    "response_mode": "async",
+                    "message": {
+                        "id": "message-token-stream-1",
+                        "role": "user",
+                        "message_type": "user_text",
+                        "plain_text": "stream actual tokens",
+                        "content": {"text": "stream actual tokens"},
+                    },
+                },
+            )
+
+        producer = asyncio.create_task(produce_message())
+        draft_deltas: list[str] = []
+        final_message_payload = None
+        try:
+            for _ in range(30):
+                event_name, payload = _parse_sse_payload(await anext(stream))
+                if event_name == "assistant.draft_delta":
+                    draft_deltas.append(payload["text_delta"])
+                if event_name == "message.created" and payload["message"]["role"] == "assistant":
+                    final_message_payload = payload
+                if event_name == "turn.completed":
+                    break
+            await producer
+        finally:
+            await stream.aclose()
+            await self.context.agent_repo.update(agent.id, {"model_profile_id": original_model_profile_id})
+
+        self.assertEqual(draft_deltas, ["token ", "stream"])
+        self.assertIsNotNone(final_message_payload)
+        self.assertEqual(final_message_payload["message"]["plain_text"], "token stream")
 
     async def test_service_stream_emits_live_approval_event(self) -> None:
         stream = self.service.stream_conversation_events(self.conversation_id, _ConnectedRequest(),

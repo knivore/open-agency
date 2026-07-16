@@ -15,8 +15,9 @@ from typing import Any, Dict, Iterator, List, Optional
 
 from app.core.config import get_settings
 from app.domain import ModelProfileDefinition
-from app.llm.base import ModelMessage, ModelResponse, ModelToolCall
+from app.llm.base import ModelMessage, ModelResponse, ModelStreamEvent, ModelToolCall
 from app.llm.openai_helpers import sanitize_openai_message_name
+from app.llm.openai_streaming import stream_openai_chat_response
 from app.llm.registry import LLMEnvironmentConfig
 from app.utils.oauth_pkce import OPENAI_CODEX_REDIRECT_URI, OAuthPKCEHandler
 
@@ -748,6 +749,47 @@ class OpenAICodexModelClient:
             content = getattr(delta, "content", None)
             if content:
                 yield content
+
+    def stream_generate_text(
+            self,
+            messages: List[ModelMessage],
+            *,
+            temperature: Optional[float] = None,
+            max_tokens: Optional[int] = None,
+            **kwargs: Any,
+    ) -> Iterator[ModelStreamEvent]:
+        asyncio.run(self._ensure_authorized())
+        if self.auth_mode == "chatgpt":
+            # The Codex CLI returns one completed response rather than Chat Completions
+            # deltas, so keep its existing response path instead of simulating tokens.
+            yield ModelStreamEvent(
+                response=self.generate_text(
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    **kwargs,
+                )
+            )
+            return
+
+        started_at = time.perf_counter()
+        options = self._chat_options(
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+            **kwargs,
+        )
+        options.setdefault("stream_options", {"include_usage": True})
+        stream = self.client.chat.completions.create(
+            messages=self._to_openai_messages(messages),
+            **options,
+        )
+        yield from stream_openai_chat_response(
+            stream,
+            provider=self.profile.provider,
+            model=self.profile.model,
+            started_at=started_at,
+        )
 
     def count_tokens(self, messages: List[ModelMessage], **kwargs: Any) -> Optional[int]:
         return None

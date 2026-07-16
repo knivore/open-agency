@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from app.domain import ModelProfileDefinition
@@ -467,6 +468,74 @@ class ModelProviderRegistryTests(unittest.TestCase):
         call_kwargs = client_instance.chat.completions.create.call_args.kwargs
         self.assertNotIn("temperature", call_kwargs)
         self.assertNotIn("max_tokens", call_kwargs)
+
+    @patch("app.llm.openai_compatible.OpenAI")
+    def test_openai_compatible_stream_assembles_fragmented_tool_calls(self, openai_cls):
+        usage = SimpleNamespace(
+            model_dump=lambda: {"prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19}
+        )
+        stream = [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content="Checking ",
+                            tool_calls=[
+                                SimpleNamespace(
+                                    index=0,
+                                    id="call-weather",
+                                    function=SimpleNamespace(name="get_", arguments='{"city":'),
+                                )
+                            ],
+                        )
+                    )
+                ],
+                usage=None,
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content="now",
+                            tool_calls=[
+                                SimpleNamespace(
+                                    index=0,
+                                    id=None,
+                                    function=SimpleNamespace(name="weather", arguments='"Paris"}'),
+                                )
+                            ],
+                        )
+                    )
+                ],
+                usage=None,
+            ),
+            SimpleNamespace(choices=[], usage=usage),
+        ]
+        client_instance = MagicMock()
+        client_instance.chat.completions.create.return_value = iter(stream)
+        openai_cls.return_value = client_instance
+        profile = ModelProfileDefinition(
+            name="OpenAI",
+            provider="openai",
+            model="gpt-test",
+            base_url="https://api.openai.com/v1",
+        )
+        client = OpenAICompatibleModelClient(profile, LLMEnvironmentConfig(openai_api_key="abc"))
+
+        events = list(client.stream_generate_text([ModelMessage(role="user", content="Weather?")]))
+
+        self.assertEqual([event.text_delta for event in events[:-1]], ["Checking ", "now"])
+        response = events[-1].response
+        self.assertIsNotNone(response)
+        assert response is not None
+        self.assertEqual(response.content, "Checking now")
+        self.assertEqual(response.usage["total_tokens"], 19)
+        self.assertEqual(len(response.tool_calls), 1)
+        self.assertEqual(response.tool_calls[0].id, "call-weather")
+        self.assertEqual(response.tool_calls[0].name, "get_weather")
+        self.assertEqual(response.tool_calls[0].arguments, {"city": "Paris"})
+        call_kwargs = client_instance.chat.completions.create.call_args.kwargs
+        self.assertEqual(call_kwargs["stream_options"], {"include_usage": True})
 
     @patch("app.llm.ollama.httpx.post")
     def test_ollama_generate_text_uses_profile_timeout(self, post):

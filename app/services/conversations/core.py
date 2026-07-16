@@ -49,7 +49,7 @@ from app.domain import (
     WorkflowNodeDefinition,
 )
 from app.integrations.connectors import normalize_connector_provider_key
-from app.llm.base import ModelMessage, ModelToolCall
+from app.llm.base import ModelMessage, ModelResponse, ModelStreamEvent, ModelToolCall
 from app.runtime.governance.context_health import estimate_context_health
 from app.runtime.governance.recorder import record_context_health_snapshot, record_token_usage_snapshot
 from app.runtime.governance.token_usage import normalize_token_usage
@@ -428,6 +428,27 @@ class ConversationService:
             status="running",
             message_id=origin_message.id,
         )
+        instant_response = await self._maybe_handle_instant_greeting(
+            profile=profile,
+            conversation_id=conversation_id,
+            origin_message=origin_message,
+        )
+        if instant_response is not None:
+            await self.publish_activity_event(
+                conversation_id,
+                "planner.completed",
+                "Selected instant greeting path",
+                status="completed",
+                message_id=origin_message.id,
+            )
+            await self._generate_title_if_needed(conversation_id)
+            response = {
+                "message": created.model_dump(mode="json"),
+                "assistant_message": instant_response["assistant_message"],
+            }
+            if response_mode in {"async", "stream"}:
+                response["stream_url"] = f"/conversations/{conversation_id}/stream?after={created.id}"
+            return response
         execution_response = await self._maybe_handle_execution_request(
             profile=profile,
             conversation_id=conversation_id,
@@ -5596,14 +5617,15 @@ class ConversationService:
         metadata = {"profile_id": profile.id, "delivery": "direct"}
         if isinstance(outcome.get("metadata"), dict):
             metadata.update(outcome["metadata"])
-        await self.publish_activity_event(
-            conversation_id,
-            "assistant.draft_delta",
-            "Drafted assistant response",
-            status="completed",
-            text_delta=text,
-            metadata={"source": "non_token_streamed_model_response"},
-        )
+        if not metadata.get("token_streamed"):
+            await self.publish_activity_event(
+                conversation_id,
+                "assistant.draft_delta",
+                "Drafted assistant response",
+                status="completed",
+                text_delta=text,
+                metadata={"source": "non_token_streamed_model_response"},
+            )
         assistant = await self.context.conversation_message_repo.create(
             ConversationMessage(
                 conversation_id=conversation_id,
@@ -5630,6 +5652,71 @@ class ConversationService:
             },
             metadata={"profile_id": profile.id, "delivery": "direct"},
             agent_id=profile.agent_id,
+        )
+        return {"assistant_message": assistant.model_dump(mode="json")}
+
+    async def _maybe_handle_instant_greeting(
+            self,
+            *,
+            profile: MainAgentProfile,
+            conversation_id: str,
+            origin_message: ConversationMessage,
+    ) -> dict[str, Any] | None:
+        settings = get_settings()
+        if settings.main_agent_router_enabled or not settings.main_agent_router_fast_path_enabled:
+            return None
+
+        enabled_rules = {
+            value.strip()
+            for value in settings.main_agent_router_fast_path_rules.split(",")
+            if value.strip()
+        }
+        fast_path = DeterministicFastPathClassifier(enabled_rules).evaluate(origin_message.plain_text)
+        if not fast_path.matched or fast_path.rule_code != "greeting":
+            return None
+
+        agent = await self.context.agent_repo.get(profile.agent_id)
+        model_profile_id = (
+            agent.model_profile_id
+            if agent is not None and agent.model_profile_id
+            else profile.default_model_profile_id
+        )
+        model_profile = (
+            await self.context.model_profile_repo.get(model_profile_id)
+            if model_profile_id
+            else None
+        )
+        provider_key = (
+            model_profile.provider.strip().lower().replace("-", "_")
+            if model_profile is not None
+            else ""
+        )
+        if provider_key == "openai_codex":
+            # Codex OAuth profiles must surface reauthorization requirements before any
+            # deterministic response can imply that the configured model is ready.
+            return None
+
+        # Exact greetings carry no tool or memory intent, so a deterministic acknowledgement
+        # avoids spending a model round trip before the user has made a substantive request.
+        text = "Hi — how can I help?"
+        await self.publish_activity_event(
+            conversation_id,
+            "assistant.draft_delta",
+            "Drafted instant greeting",
+            status="completed",
+            message_id=origin_message.id,
+            text_delta=text,
+            metadata={"source": "deterministic_fast_path", "fast_path_rule": fast_path.rule_code},
+        )
+        assistant = await self._append_assistant_text_message(
+            conversation_id=conversation_id,
+            text=text,
+            metadata={
+                "profile_id": profile.id,
+                "delivery": "direct",
+                "source": "deterministic_fast_path",
+                "fast_path_rule": fast_path.rule_code,
+            },
         )
         return {"assistant_message": assistant.model_dump(mode="json")}
 
@@ -7604,6 +7691,7 @@ class ConversationService:
                     (item.id for item in reversed(history) if item.role == ConversationRole.USER),
                     None,
                 )
+                has_streamed_text = False
                 for _ in range(max_tool_iterations or 4):
                     model_request_id = str(uuid4())
                     context_health = estimate_context_health(
@@ -7683,7 +7771,18 @@ class ConversationService:
                             "tool_count": len(tool_payload),
                         },
                     )
-                    if hasattr(client, "agenerate_text"):
+                    if model_profile.supports_streaming and hasattr(client, "stream_generate_text"):
+                        response, streamed_text = await self._stream_direct_reply_model_response(
+                            client=client,
+                            messages=messages,
+                            conversation_id=conversation_id,
+                            origin_message_id=latest_user_message_id,
+                            temperature=model_profile.temperature,
+                            max_tokens=completion_budget,
+                            tools=tool_payload or None,
+                        )
+                        has_streamed_text = has_streamed_text or streamed_text
+                    elif hasattr(client, "agenerate_text"):
                         response = await client.agenerate_text(
                             messages,
                             temperature=model_profile.temperature,
@@ -8113,7 +8212,10 @@ class ConversationService:
                         messages.append(ModelMessage(role="assistant", content=response.content))
                     content = response.content
                     if isinstance(content, str) and content.strip():
-                        return await finish({"text": content.strip()})
+                        return await finish({
+                            "text": content.strip(),
+                            "metadata": {"token_streamed": has_streamed_text},
+                        })
             except Exception as exc:
                 logger.exception(
                     "Direct main-agent reply model call failed for conversation %s with model profile %s",
@@ -8130,6 +8232,67 @@ class ConversationService:
             (item.plain_text for item in reversed(history) if item.role == ConversationRole.USER and item.plain_text),
             None)
         return await finish({"text": self._fallback_reply(latest_user or "How can I help?")})
+
+    async def _stream_direct_reply_model_response(
+            self,
+            *,
+            client: Any,
+            messages: list[ModelMessage],
+            conversation_id: str,
+            origin_message_id: str | None,
+            temperature: float | None,
+            max_tokens: int | None,
+            tools: list[dict[str, Any]] | None,
+    ) -> tuple[ModelResponse, bool]:
+        """Bridge a blocking provider iterator into async SSE events without losing its final response."""
+
+        queue: asyncio.Queue[ModelStreamEvent | Exception | object] = asyncio.Queue()
+        sentinel = object()
+        loop = asyncio.get_running_loop()
+
+        def produce() -> None:
+            try:
+                for event in client.stream_generate_text(
+                        messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        tools=tools,
+                ):
+                    loop.call_soon_threadsafe(queue.put_nowait, event)
+            except Exception as exc:
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, sentinel)
+
+        producer_task = asyncio.create_task(asyncio.to_thread(produce))
+        response: ModelResponse | None = None
+        streamed_text = False
+        try:
+            while True:
+                item = await queue.get()
+                if item is sentinel:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                if item.text_delta:
+                    streamed_text = True
+                    await self.publish_activity_event(
+                        conversation_id,
+                        "assistant.draft_delta",
+                        "",
+                        status="running",
+                        message_id=origin_message_id,
+                        text_delta=item.text_delta,
+                        metadata={"source": "token_streamed_model_response"},
+                    )
+                if item.response is not None:
+                    response = item.response
+        finally:
+            await producer_task
+
+        if response is None:
+            raise RuntimeError("Streaming model call ended without a terminal response")
+        return response, streamed_text
 
     async def _preflight_direct_reply_model_auth(
             self,

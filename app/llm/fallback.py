@@ -5,7 +5,7 @@ from collections.abc import Callable, Iterator
 from typing import Any, Optional
 
 from app.domain import ModelFallbackPolicy, ModelFallbackTarget, ModelProfileDefinition
-from app.llm.base import BaseModelClient, ModelMessage, ModelResponse
+from app.llm.base import BaseModelClient, ModelMessage, ModelResponse, ModelStreamEvent
 
 DEFAULT_AUTO_FALLBACK_MODELS: dict[str, tuple[str, str]] = {
     "openai": ("gpt-5-mini", "gpt-4o-mini"),
@@ -279,6 +279,64 @@ class FallbackModelClient:
                     break
         if last_error is not None:
             raise last_error
+
+    def stream_generate_text(
+            self,
+            messages: list[ModelMessage],
+            *,
+            temperature: Optional[float] = None,
+            max_tokens: Optional[int] = None,
+            **kwargs: Any,
+    ) -> Iterator[ModelStreamEvent]:
+        last_error: Exception | None = None
+        attempts: list[dict[str, Any]] = []
+        for index, (profile, client) in enumerate(self._clients()):
+            emitted_text = False
+            try:
+                stream_method = getattr(client, "stream_generate_text", None)
+                if stream_method is None:
+                    response = client.generate_text(
+                        messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        **kwargs,
+                    )
+                    yield ModelStreamEvent(
+                        response=self._annotate_response(response, profile, index=index, attempts=attempts)
+                    )
+                    return
+                for event in stream_method(
+                        messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        **kwargs,
+                ):
+                    if event.text_delta:
+                        emitted_text = True
+                    if event.response is not None:
+                        event.response = self._annotate_response(
+                            event.response,
+                            profile,
+                            index=index,
+                            attempts=attempts,
+                        )
+                    yield event
+                return
+            except Exception as exc:
+                attempts.append(self._attempt_record(profile, index=index, exc=exc))
+                # Once a partial answer is visible, switching models would duplicate or
+                # contradict it; surface the failure instead of silently restarting.
+                if emitted_text or not should_try_model_fallback(exc, self.profile.fallback_policy):
+                    raise
+                last_error = exc
+                if index >= len(self.fallback_profiles):
+                    break
+        if last_error is not None:
+            raise ModelFallbackExhaustedError(
+                f"All model fallback attempts failed after {len(attempts)} attempt(s): {last_error}",
+                attempts=attempts,
+                last_error=last_error,
+            ) from last_error
 
     def count_tokens(self, messages: list[ModelMessage], **kwargs: Any) -> Optional[int]:
         return self.primary_client.count_tokens(messages, **kwargs)

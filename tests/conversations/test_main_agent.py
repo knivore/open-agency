@@ -693,6 +693,54 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item["role"] for item in messages["items"]], ["user", "assistant"])
         self.assertIsNotNone(_FakeModelClient.last_system_message)
 
+    async def test_post_message_returns_exact_greetings_without_calling_the_model(self) -> None:
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Answer briefly.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+            )
+        )
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-instant-greeting",
+                "created_by_user_id": "user-1",
+                "channel_type": "web",
+            }
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "MAIN_AGENT_ROUTER_ENABLED": "false",
+                "MAIN_AGENT_ROUTER_FAST_PATH_ENABLED": "true",
+                "MAIN_AGENT_ROUTER_FAST_PATH_RULES": "greeting",
+            },
+        ):
+            reset_settings_cache()
+            result = await self.service.post_message(
+                conversation.id,
+                {
+                    "message": {
+                        "id": "message-instant-greeting",
+                        "role": "user",
+                        "message_type": "user_text",
+                        "plain_text": "hi",
+                        "content": {"text": "hi"},
+                    },
+                    "response_mode": "sync",
+                },
+            )
+
+        self.assertEqual(result["assistant_message"]["plain_text"], "Hi — how can I help?")
+        self.assertEqual(result["assistant_message"]["metadata"]["fast_path_rule"], "greeting")
+        self.assertEqual(_FakeModelClient.seen_messages, [])
+        refreshed = await self.service.get_conversation(conversation.id)
+        assert refreshed is not None
+        self.assertEqual(refreshed.title, "hi")
+
     async def test_post_message_invokes_published_persona_by_mention(self) -> None:
         user = await self.context.user_repo.create(
             UserDefinition(id="persona-user", email="persona@example.com", display_name="Persona User")

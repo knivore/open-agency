@@ -6,8 +6,9 @@ from openai import AzureOpenAI
 from typing import Any, Dict, Iterator, List, Optional
 
 from app.domain import ModelProfileDefinition
-from app.llm.base import ModelMessage, ModelResponse, ModelToolCall
+from app.llm.base import ModelMessage, ModelResponse, ModelStreamEvent, ModelToolCall
 from app.llm.openai_helpers import sanitize_openai_message_name
+from app.llm.openai_streaming import stream_openai_chat_response
 from app.llm.registry import LLMEnvironmentConfig
 
 
@@ -220,6 +221,33 @@ class AzureOpenAIModelClient:
             content = getattr(delta, "content", None)
             if content:
                 yield content
+
+    def stream_generate_text(
+            self,
+            messages: List[ModelMessage],
+            *,
+            temperature: Optional[float] = None,
+            max_tokens: Optional[int] = None,
+            **kwargs: Any,
+    ) -> Iterator[ModelStreamEvent]:
+        import asyncio
+
+        asyncio.run(self._ensure_authorized())
+        started_at = time.perf_counter()
+        stream = self.client.chat.completions.create(
+            model=self.profile.model,
+            messages=self._to_openai_messages(messages),
+            temperature=temperature if temperature is not None else self.profile.temperature,
+            max_tokens=max_tokens if max_tokens is not None else self.profile.max_tokens,
+            stream=True,
+            **kwargs,
+        )
+        yield from stream_openai_chat_response(
+            stream,
+            provider=self.profile.provider,
+            model=self.profile.model,
+            started_at=started_at,
+        )
 
     def count_tokens(self, messages: List[ModelMessage], **kwargs: Any) -> Optional[int]:
         return None

@@ -37,6 +37,14 @@ class ModelResponse:
     latency_ms: float = 0.0
 
 
+@dataclass(slots=True)
+class ModelStreamEvent:
+    """Carry an incremental text delta or the fully assembled terminal response."""
+
+    text_delta: str | None = None
+    response: ModelResponse | None = None
+
+
 class BaseModelClient(Protocol):
     provider_key: str
 
@@ -67,6 +75,15 @@ class BaseModelClient(Protocol):
             max_tokens: Optional[int] = None,
             **kwargs: Any,
     ) -> Iterator[str]: ...
+
+    def stream_generate_text(
+            self,
+            messages: List[ModelMessage],
+            *,
+            temperature: Optional[float] = None,
+            max_tokens: Optional[int] = None,
+            **kwargs: Any,
+    ) -> Iterator[ModelStreamEvent]: ...
 
     def count_tokens(self, messages: List[ModelMessage], **kwargs: Any) -> Optional[int]: ...
 
