@@ -198,6 +198,28 @@ class CrewAIRuntimeAdapter(BaseRuntimeAdapter):
         if not isinstance(provider, str) or not isinstance(model, str) or not model.strip():
             return None
 
+        explicit_base_url = (
+            llm_override.get("base_url").strip()
+            if isinstance(llm_override.get("base_url"), str) and llm_override.get("base_url").strip()
+            else None
+        )
+        explicit_api_key = (
+            llm_override.get("api_key").strip()
+            if isinstance(llm_override.get("api_key"), str) and llm_override.get("api_key").strip()
+            else None
+        )
+        provider_changed = base_profile is not None and provider.strip().lower() != base_profile.provider.strip().lower()
+        endpoint_changed = (
+            base_profile is not None
+            and explicit_base_url is not None
+            and explicit_base_url.rstrip("/") != (base_profile.base_url or "").strip().rstrip("/")
+        )
+        inherited_api_key = (
+            base_profile.api_key_ref
+            if base_profile is not None and not provider_changed and not endpoint_changed
+            else None
+        )
+
         return ModelProfileDefinition(
             id=f"runtime-override-{agent.id}",
             name=f"Runtime Override {agent.name}",
@@ -205,15 +227,13 @@ class CrewAIRuntimeAdapter(BaseRuntimeAdapter):
             model=model.strip(),
             description=f"Per-run runtime override for agent {agent.id}",
             base_url=(
-                llm_override.get("base_url")
-                if isinstance(llm_override.get("base_url"), str) and llm_override.get("base_url").strip()
+                explicit_base_url
+                if explicit_base_url is not None
                 else (base_profile.base_url if base_profile is not None else None)
             ),
-            api_key_ref=(
-                llm_override.get("api_key")
-                if isinstance(llm_override.get("api_key"), str) and llm_override.get("api_key").strip()
-                else (base_profile.api_key_ref if base_profile is not None else None)
-            ),
+            # A saved credential is bound to its provider and endpoint. Runtime
+            # overrides must opt in to a new credential when either changes.
+            api_key_ref=explicit_api_key or inherited_api_key,
             temperature=base_profile.temperature if base_profile is not None else None,
             max_tokens=base_profile.max_tokens if base_profile is not None else None,
             context_window=base_profile.context_window if base_profile is not None else None,

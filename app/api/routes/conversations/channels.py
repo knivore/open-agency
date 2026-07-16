@@ -147,6 +147,7 @@ def create_conversation_channels_router(context: Optional[ApiContext] = None) ->
                 channel_user_id=payload.channel_user_id,
                 internal_user_id=payload.internal_user_id,
                 reason=payload.reason,
+                metadata=payload.metadata,
             )
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
@@ -161,15 +162,16 @@ def create_conversation_channels_router(context: Optional[ApiContext] = None) ->
     async def post_chat_adapter_webhook(provider: str, request: Request, credential_id: str | None = None):
         try:
             body = await request.body()
+            payload = _parse_adapter_payload(request, body)
+            if not isinstance(payload, dict):
+                raise ValueError("Webhook payload must be a JSON object.")
             verification = await webhook_verification_service.verify(
                 provider=provider,
                 credential_id=credential_id,
                 headers={key.lower(): value for key, value in request.headers.items()},
                 body=body,
+                payload=payload,
             )
-            payload = _parse_adapter_payload(request, body)
-            if not isinstance(payload, dict):
-                raise ValueError("Webhook payload must be a JSON object.")
             adapter = create_chat_channel_adapter(context, provider)
             result = await adapter.handle_webhook(payload)
             if credential_id and result.get("provider_outbound_messages"):

@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
+from packaging.version import InvalidVersion, Version
+
 from app.domain import MCPServerDefinition
+from app.core.config import get_settings
 from .client import HttpMCPClient, MCPClientError, StdioMCPClient
 from .prompt_adapter import mcp_prompt_to_dict
 from .resource_adapter import mcp_resource_to_dict
@@ -15,6 +19,57 @@ from .tool_adapter import mcp_tool_to_definition
 
 class MCPRegistryError(RuntimeError):
     """Raised when MCP registry operations fail."""
+
+
+_NPM_PACKAGE_NAME_RE = re.compile(r"^(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*$", re.IGNORECASE)
+_NPM_EXACT_VERSION_RE = re.compile(
+    r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
+)
+_PYTHON_PACKAGE_NAME_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9,._-]+\])?$"
+)
+
+
+def _has_exact_package_pin(command_name: str, args: list[str]) -> bool:
+    """Accept only immutable package specs for package-manager-backed MCP servers."""
+    normalized_args = [str(arg).strip() for arg in args if str(arg).strip()]
+    # Package-selection flags can introduce a second mutable dependency even
+    # when the positional package is pinned, so reject those invocation shapes.
+    if command_name == "npx" and any(
+        arg in {"-p", "--package", "-c", "--call"} or arg.startswith("--package=")
+        for arg in normalized_args
+    ):
+        return False
+    if command_name == "uvx" and any(
+        arg in {"--from", "--with", "--with-editable", "-e", "--editable", "-r", "--requirements"}
+        or arg.startswith(
+            ("--from=", "--with=", "--with-editable=", "--editable=", "--requirements=")
+        )
+        for arg in normalized_args
+    ):
+        return False
+
+    package_spec = next((arg for arg in normalized_args if not arg.startswith("-")), None)
+    if not package_spec:
+        return False
+    if command_name == "npx":
+        separator = package_spec.rfind("@")
+        if separator <= 0:
+            return False
+        package_name = package_spec[:separator]
+        version = package_spec[separator + 1:]
+        return bool(_NPM_PACKAGE_NAME_RE.fullmatch(package_name) and _NPM_EXACT_VERSION_RE.fullmatch(version))
+
+    package_name, separator, version = package_spec.partition("==")
+    if not separator or not _PYTHON_PACKAGE_NAME_RE.fullmatch(package_name):
+        return False
+    try:
+        # PEP 440 parsing rejects tags, wildcards, URLs, paths, VCS refs, and
+        # range syntax while preserving exact prerelease/local-version pins.
+        Version(version)
+    except InvalidVersion:
+        return False
+    return True
 
 
 class MCPClientRegistry:
@@ -39,6 +94,22 @@ class MCPClientRegistry:
         if not definition.enabled:
             raise MCPRegistryError(f"MCP server '{definition.id}' is disabled")
         command_name = Path(definition.command).name
+        settings = get_settings()
+        allowed_commands = settings.parsed_mcp_server_allowed_commands
+        # Test fixtures use the active Python interpreter as a deterministic MCP
+        # server; production still requires an explicit operator allowlist.
+        if settings.app_env != "test" and command_name not in allowed_commands:
+            raise MCPRegistryError(
+                f"MCP server '{definition.id}' command '{command_name}' is not allowed by MCP_SERVER_ALLOWED_COMMANDS"
+            )
+        if settings.app_env != "test" and command_name in {"npx", "uvx"}:
+            if not _has_exact_package_pin(command_name, definition.args):
+                # Package runners otherwise resolve mutable registry state at
+                # launch time, turning catalog discovery into a supply-chain RCE.
+                raise MCPRegistryError(
+                    f"MCP server '{definition.id}' must use one exact package version in args before "
+                    f"{command_name} may run"
+                )
         if definition.allowlisted_command:
             if definition.allowlisted_command != command_name:
                 raise MCPRegistryError(

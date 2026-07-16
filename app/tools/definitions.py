@@ -639,12 +639,18 @@ def _default_security_for(tool_id: str, implementation: ToolImplementationRefere
         "agency.repo.inspect",
     }
 
+    allow_browser = tool_id in browser_tools
+    allow_filesystem = tool_id in filesystem_tools or tool_id == "agency.repo.inspect"
+    allow_network = tool_id in network_tools
+
     return SecuritySettings(
         requires_approval=tool_id in dangerous_tools or tool_id == "agency.human.ask",
-        sandbox=tool_id in dangerous_tools or tool_id in browser_tools or tool_id in network_tools,
-        allow_browser=tool_id in browser_tools,
-        allow_filesystem=tool_id in filesystem_tools or tool_id == "agency.repo.inspect",
-        allow_network=tool_id in network_tools,
+        # Derive sandboxing from the capabilities themselves so adding a new
+        # filesystem, browser, or network tool cannot omit the runtime guard.
+        sandbox=any((tool_id in dangerous_tools, allow_browser, allow_filesystem, allow_network)),
+        allow_browser=allow_browser,
+        allow_filesystem=allow_filesystem,
+        allow_network=allow_network,
         allowed_domains=[],
         allowed_paths=["local_storage", "logs", "."] if tool_id in filesystem_tools else [],
         module_allowlist=[implementation.module],

@@ -347,7 +347,7 @@ class ConnectorHealthApiTests(unittest.TestCase):
         kwargs = mock_request.call_args.kwargs
         self.assertEqual(kwargs["proxy"], "http://x:mapped-onecli-agent-token@onecli:10255")
 
-    def test_telegram_connector_health_rejects_onecli_token_in_url_shape(self) -> None:
+    def test_telegram_connector_health_uses_onecli_url_path_injection(self) -> None:
         self._run(
             self.context.credential_repo.create(
                 CredentialDefinition(
@@ -363,6 +363,10 @@ class ConnectorHealthApiTests(unittest.TestCase):
 
         with patch.dict("os.environ", {"ONECLI_ENABLED": "true"}, clear=False), patch(
                 "app.services.connectors.httpx.request",
+                return_value=_HttpxResponse(
+                    200,
+                    {"ok": True, "result": {"id": 123, "username": "agency_bot"}},
+                ),
         ) as mock_request:
             from app.core.config import reset_settings_cache
 
@@ -375,12 +379,15 @@ class ConnectorHealthApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertFalse(payload["ok"])
+        self.assertTrue(payload["ok"])
         self.assertEqual(payload["provider"], "telegram-bot")
-        self.assertEqual(payload["credential_mode"], "direct")
+        self.assertEqual(payload["credential_mode"], "onecli")
         self.assertEqual(payload["secret_source"], "onecli")
-        self.assertIn("runtime-resolvable secret ref", payload["error"])
-        mock_request.assert_not_called()
+        mock_request.assert_called_once()
+        kwargs = mock_request.call_args.kwargs
+        self.assertEqual(kwargs["url"], "https://api.telegram.org/botonecli-managed/getMe")
+        self.assertIsNone(kwargs["headers"])
+        self.assertIsNotNone(kwargs["proxy"])
 
     def test_whatsapp_connector_health_can_route_through_onecli_without_raw_token(self) -> None:
         self._run(

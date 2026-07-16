@@ -10,6 +10,32 @@ from app.services.generated_tool_workspace import GeneratedToolWorkspaceService
 
 
 class GeneratedToolWorkspaceServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scaffolded_tool_stub_returns_explicit_not_implemented_status(self) -> None:
+        context = create_test_api_context()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "generated_tools"
+            root.mkdir(parents=True, exist_ok=True)
+            (root / "__init__.py").write_text('"""temp generated tools root."""\n', encoding="utf-8")
+            sys.path.insert(0, tmp_dir)
+            try:
+                service = GeneratedToolWorkspaceService(context, root_path=root)
+                package = service.scaffold_package(
+                    package_id="portal-audit",
+                    name="Portal Audit",
+                    description="Portal inspection helpers.",
+                    function_name="audit_portal",
+                )
+                module_name = f"{package['module_root']}.tools"
+                module = service._load_generated_module_from_root(module_name)
+                result = module.audit_portal("probe")
+            finally:
+                sys.path.remove(tmp_dir)
+
+        self.assertEqual(result["status"], "not_implemented")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["message"], "TODO: implement audit_portal")
+        self.assertEqual(result["text"], "probe")
+
     async def test_scaffold_and_publish_generated_tool(self) -> None:
         context = create_test_api_context()
         with tempfile.TemporaryDirectory() as tmp_dir:

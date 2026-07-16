@@ -633,7 +633,7 @@ class GraphStreamApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 404)
 
-    def test_graph_stream_route_rejects_anonymous_identity_outside_development(self) -> None:
+    def test_graph_stream_route_fails_closed_without_trusted_identity_key(self) -> None:
         with patch.dict("os.environ", {"APP_ENV": "production"}, clear=False):
             reset_settings_cache()
             try:
@@ -642,8 +642,8 @@ class GraphStreamApiTests(unittest.TestCase):
 
                 response = client.get("/graph/stream/deltas")
 
-                self.assertEqual(response.status_code, 401)
-                self.assertEqual(response.json()["detail"], "Graph stream identity is required")
+                self.assertEqual(response.status_code, 403)
+                self.assertEqual(response.json()["detail"], "Trusted identity source is required")
             finally:
                 reset_settings_cache()
 

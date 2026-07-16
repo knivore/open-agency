@@ -30,6 +30,7 @@ from app.runtime.native.errors import ExecutionNotFoundError, WorkflowNotFoundEr
 from app.runtime.native.planner import LinearWorkflowPlanner
 from app.runtime.process_supervisor import execution_process_manager
 from app.services.execution_classification import classify_execution_staleness
+from app.services.execution_waits import ExecutionWaitService
 from app.services.goals import GoalService
 from app.services.memory import MemoryService
 
@@ -63,6 +64,7 @@ AGENT_EVENT_TYPES = {
 ERROR_EVENT_TYPES = {
     ExecutionEventType.CONTEXT_COMPACTION_FAILED,
     ExecutionEventType.EXECUTION_FAILED,
+    ExecutionEventType.EXECUTION_CYCLE_FAILED,
     ExecutionEventType.SUBAGENT_STEP_FAILED,
     ExecutionEventType.TOOL_CALL_FAILED,
     ExecutionEventType.CONTAINER_FAILED,
@@ -74,6 +76,7 @@ WARN_EVENT_TYPES = {
     ExecutionEventType.APPROVAL_REQUESTED,
     ExecutionEventType.EXECUTION_PAUSED,
     ExecutionEventType.EXECUTION_CANCELLED,
+    ExecutionEventType.EXECUTION_CYCLE_GUARD_TRIGGERED,
     ExecutionEventType.CONTAINER_REPLACED,
     ExecutionEventType.CONTEXT_COMPACTION_STARTED,
     ExecutionEventType.MONITOR_FINDING_CREATED,
@@ -168,6 +171,11 @@ class ExecutionService:
 
         input_payload = dict(input_payload or {})
         trigger = dict(trigger or {})
+        if current_user is not None:
+            # Actor identity is derived from the authenticated principal. Trigger
+            # metadata remains descriptive input and cannot impersonate another user.
+            trigger.pop("run_by", None)
+            trigger["created_by"] = current_user.id
         if goal_id:
             goal = await GoalService(self.context).get_goal(goal_id)
             trigger["goal_id"] = goal.id
@@ -762,6 +770,18 @@ class ExecutionService:
         if event_type == ExecutionEventType.EXECUTION_REPAIRED:
             action = payload.get("repair_action") or "stale execution repaired"
             return f"Execution repaired: {self._preview(action)}".strip()
+        if event_type == ExecutionEventType.EXECUTION_CYCLE_STARTED:
+            return f"Monitor cycle {payload.get('cycle_number') or '?'} started."
+        if event_type == ExecutionEventType.EXECUTION_CYCLE_COMPLETED:
+            return f"Monitor cycle {payload.get('cycle_number') or '?'} completed."
+        if event_type == ExecutionEventType.EXECUTION_CYCLE_FAILED:
+            return f"Monitor cycle failed: {self._preview(payload.get('error'))}".strip()
+        if event_type == ExecutionEventType.EXECUTION_CYCLE_GUARD_TRIGGERED:
+            return f"Monitor cycle paused: {self._preview(payload.get('reason'))}".strip()
+        if event_type == ExecutionEventType.EXECUTION_WAITING:
+            return f"Execution waiting for {payload.get('kind') or 'wake condition'}."
+        if event_type == ExecutionEventType.EXECUTION_WOKEN:
+            return f"Execution wait resolved: {payload.get('status') or 'resolved'}."
         if event_type.value.startswith("container."):
             return f"Container event: {event_type.value}."
         if event_type.value.startswith("runtime."):
@@ -782,7 +802,10 @@ class ExecutionService:
 
     async def reconcile_runtime(self) -> dict[str, Any]:
         report = await self.context.runtime_reconciler.reconcile_once()
-        return asdict(report)
+        return {
+            **asdict(report),
+            "execution_waits": await ExecutionWaitService(self.context).wake_due_waits(),
+        }
 
     async def repair_stale_executions(self, *, workflow_id: str | None = None) -> dict[str, Any]:
         repaired = await self.context.control_plane.repair_stale_executions(workflow_id=workflow_id)

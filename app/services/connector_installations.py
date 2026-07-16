@@ -1,44 +1,72 @@
 from __future__ import annotations
 
-import httpx
+import hashlib
 import logging
 import secrets
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import urlencode
 from uuid import uuid4
+
+import httpx
 
 from app.api.context import ApiContext
 from app.core.config import get_settings
 from app.domain import ConnectorInstallation, ConnectorSetupSessionPayload, CredentialDefinition
-from app.integrations.connectors import get_connector_definition, normalize_connector_provider_key
+from app.integrations.connectors import (
+    get_connector_definition,
+    normalize_connector_provider_key,
+    validate_connector_metadata,
+)
+from app.integrations.onecli_catalog import (
+    ONECLI_NATIVE_APP_BY_CONNECTOR,
+    ONECLI_SECRET_PROFILE_BY_CONNECTOR,
+    onecli_resource_name,
+)
 from app.integrations.secrets import resolve_secret_ref
 from app.services.connectors import ConnectorService
-from app.services.credentials import RAW_SECRET_PAYLOAD_KEYS
+from app.services.credentials import CredentialService, RAW_SECRET_PAYLOAD_KEYS
 from app.services.integrations_registry import IntegrationsRegistryService
+from app.services.onecli_control import OneCLIControlClient
 from app.services.public_endpoints import PublicEndpointService
-from app.services.runtime_secrets import open_runtime_secret, seal_runtime_secret
 
 logger = logging.getLogger(__name__)
+
+_RAW_METADATA_SECRET_KEYS = {
+    "access_token",
+    "api_token",
+    "app_secret",
+    "bot_token",
+    "client_secret",
+    "private_key",
+    "refresh_token",
+    "signing_secret",
+    "webhook_secret",
+    "webhook_secret_token",
+}
 
 
 @dataclass(slots=True)
 class ConnectorInstallationService:
     context: ApiContext
 
-    def _runtime_secret_required_for_provider(self, provider: str) -> bool:
-        # Telegram must stay direct because the token is embedded in the URL path.
-        # Discord can keep working through owner-scoped OneCLI proxy delivery and
-        # REST polling, while mirrored runtime secrets remain optional for more
-        # direct Gateway-style behavior.
-        return provider == "telegram-bot"
-
     def _raw_secret_payload_errors(self, payload: dict[str, Any]) -> list[str]:
         raw_keys = sorted(RAW_SECRET_PAYLOAD_KEYS.intersection({key.lower() for key in payload}))
-        if not raw_keys:
-            return []
-        return ["Raw upstream secrets must be entered through OneCLI setup, not Agency."]
+        metadata = payload.get("metadata")
+        raw_metadata_keys = (
+            sorted(
+                (RAW_SECRET_PAYLOAD_KEYS | _RAW_METADATA_SECRET_KEYS).intersection(
+                    {str(key).lower() for key in metadata}
+                )
+            )
+            if isinstance(metadata, dict)
+            else []
+        )
+        if raw_keys or raw_metadata_keys:
+            return [
+                "Raw upstream secrets must be entered through OneCLI setup; Agency metadata accepts only secret references."
+            ]
+        return []
 
     def _raise_for_raw_secret_payload(self, payload: dict[str, Any]) -> None:
         errors = self._raw_secret_payload_errors(payload)
@@ -78,22 +106,51 @@ class ConnectorInstallationService:
             owner_user_id: str,
             onecli_credential_ref: str,
     ) -> str:
-        base_url = get_settings().onecli_api_url.rstrip("/")
-        query = urlencode(
-            {
-                "agency_installation_id": installation_id,
-                "agency_user_id": owner_user_id,
-                "device_code": device_code,
-                "onecli_credential_ref": onecli_credential_ref,
-                "provider": provider,
-            }
-        )
-        return f"{base_url}/?{query}"
+        # OneCLI does not consume Agency identity/session query parameters. Keep
+        # them out of browser history and let the frontend add only documented
+        # OneCLI setup-prefill parameters.
+        return f"{get_settings().onecli_api_url.rstrip('/')}/"
 
-    def _ensure_owner_scoped_onecli_ref(self, *, owner_user_id: str, onecli_credential_ref: str) -> None:
-        owner_prefix = f"onecli://users/{owner_user_id}/"
-        if not onecli_credential_ref.startswith(owner_prefix):
-            raise ValueError(f"OneCLI credential refs must be scoped under {owner_prefix}.")
+    def _setup_window(self) -> tuple[datetime, datetime]:
+        started_at = datetime.now(timezone.utc)
+        expires_at = started_at + timedelta(seconds=get_settings().onecli_setup_session_ttl_seconds)
+        return started_at, expires_at
+
+    def _require_live_setup_session(self, installation: ConnectorInstallation) -> datetime:
+        if installation.status not in {"setup_pending", "rotation_required"}:
+            raise ValueError("This connector does not have a setup session awaiting verification.")
+        if installation.setup_started_at is None or installation.setup_expires_at is None:
+            raise ValueError("This setup session is missing its verification window. Start setup again.")
+        now = datetime.now(timezone.utc)
+        expires_at = installation.setup_expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if now >= expires_at:
+            raise ValueError("This setup session has expired. Start setup again to create a fresh session.")
+        started_at = installation.setup_started_at
+        return started_at if started_at.tzinfo else started_at.replace(tzinfo=timezone.utc)
+
+    async def _verified_onecli_ref(self, installation: ConnectorInstallation) -> str:
+        started_at = self._require_live_setup_session(installation)
+        client = OneCLIControlClient.from_settings()
+        native_app_id = ONECLI_NATIVE_APP_BY_CONNECTOR.get(installation.provider)
+        if native_app_id:
+            verified = await client.verify_connection(provider=native_app_id, started_at=started_at)
+        else:
+            profile = ONECLI_SECRET_PROFILE_BY_CONNECTOR.get(installation.provider)
+            if profile is None:
+                raise ValueError(
+                    f"Connector '{installation.provider}' does not have a verified OneCLI setup contract."
+                )
+            verified = await client.verify_secret(
+                resource_name=onecli_resource_name(
+                    installation.provider,
+                    installation.setup_session_id or installation.id,
+                ),
+                started_at=started_at,
+                profile=profile,
+            )
+        return f"onecli://users/{installation.owner_user_id}/{verified.kind}/{verified.id}"
 
     async def _public_webhook_base_url(self) -> str | None:
         base_url = str(get_settings().agency_public_webhook_base_url or "").strip()
@@ -125,31 +182,56 @@ class ConnectorInstallationService:
             return resolved.value
         return None
 
+    @staticmethod
+    def _telegram_webhook_secret_hash(token: str) -> str:
+        # Inbound verification only needs a one-way verifier. Keeping the
+        # generated token out of installation metadata prevents API/UI exposure.
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def _telegram_metadata_without_plaintext_token(
+            self,
+            metadata: dict[str, Any],
+            *,
+            token: str,
+    ) -> dict[str, Any]:
+        scrubbed = {key: value for key, value in metadata.items() if key != "webhook_secret_token"}
+        secret_ref = scrubbed.get("webhook_secret_ref")
+        if isinstance(secret_ref, str) and secret_ref.strip():
+            scrubbed.pop("webhook_secret_token_sha256", None)
+        else:
+            scrubbed["webhook_secret_token_sha256"] = self._telegram_webhook_secret_hash(token)
+        return scrubbed
+
     def _telegram_webhook_request_payload(self, installation: ConnectorInstallation) -> dict[str, Any]:
         # setWebhook should point Telegram back to the launcher-discovered public
         # Agency base URL so direct bot completion works after startup.
         return {}
 
-    async def _register_telegram_webhook(self, installation: ConnectorInstallation) -> dict[str, Any] | None:
+    async def _register_telegram_webhook(
+            self,
+            installation: ConnectorInstallation,
+            *,
+            secret_token: str | None = None,
+    ) -> dict[str, Any] | None:
         if installation.status != "active":
             raise ValueError("Telegram webhook auto-registration requires an active installation.")
         webhook_url = await self._telegram_webhook_url(installation.id)
         if webhook_url is None:
             return None
-        if not installation.runtime_secret_encrypted:
-            raise ValueError("Telegram webhook auto-registration requires a mirrored runtime secret.")
-
-        token = open_runtime_secret(installation.runtime_secret_encrypted)
-        if not token:
-            raise ValueError("Telegram webhook auto-registration requires a readable runtime secret.")
 
         request_payload = self._telegram_webhook_request_payload(installation)
         request_payload["url"] = webhook_url
-        webhook_secret_token = self._telegram_webhook_secret_token(installation.metadata)
+        webhook_secret_token = secret_token or self._telegram_webhook_secret_token(installation.metadata)
         if webhook_secret_token is not None:
             request_payload["secret_token"] = webhook_secret_token
-        webhook_registration_url = f"https://api.telegram.org/bot{token}/setWebhook"
-        async with httpx.AsyncClient(timeout=10.0, trust_env=False) as client:
+        # OneCLI v1.40+ can replace a placeholder in the URL path. This keeps
+        # the Telegram bot token in OneCLI while preserving automatic webhook
+        # registration during setup and launcher reconciliation.
+        webhook_registration_url = "https://api.telegram.org/botonecli-managed/setWebhook"
+        proxy_kwargs = await ConnectorService(self.context).onecli_proxy_kwargs_for_owner(
+            installation.owner_user_id
+        )
+        async with httpx.AsyncClient(timeout=10.0, **proxy_kwargs) as client:
             response = await client.post(webhook_registration_url, data=request_payload)
         try:
             body = response.json()
@@ -178,6 +260,8 @@ class ConnectorInstallationService:
             ),
             device_code=device_code,
             onecli_credential_ref=installation.onecli_credential_ref,
+            onecli_resource_name=onecli_resource_name(installation.provider, session_id),
+            expires_at=installation.setup_expires_at,
         )
 
     async def _list_all_for_owner(self, owner_user_id: str) -> list[ConnectorInstallation]:
@@ -206,16 +290,43 @@ class ConnectorInstallationService:
             owner_user_id: str,
     ) -> ConnectorSetupSessionPayload:
         self._raise_for_raw_secret_payload(payload)
+        if "onecli_credential_ref" in payload or "runtime_secret_value" in payload:
+            raise ValueError(
+                "Agency creates and verifies the OneCLI setup resource; do not submit a credential ref or secret."
+            )
         provider = self._resolve_provider(provider_key)
+        if (
+                provider not in ONECLI_NATIVE_APP_BY_CONNECTOR
+                and provider not in ONECLI_SECRET_PROFILE_BY_CONNECTOR
+        ):
+            raise ValueError(
+                "This connector's guide requires a OneCLI setup shape that cannot yet be verified. "
+                "Use the guide for preparation, but do not create an Agency installation yet."
+            )
         name = str(payload.get("name") or provider).strip() or provider
         metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
         workflow_id = payload.get("workflow_id") if isinstance(payload.get("workflow_id"), str) else None
+        now = datetime.now(timezone.utc)
+        for existing in await self._list_all_for_owner(owner_user_id):
+            if existing.provider != provider or existing.status not in {"setup_pending", "rotation_required"}:
+                continue
+            expires_at = existing.setup_expires_at
+            if expires_at is not None and expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at is None or expires_at <= now:
+                # Expired pre-verification records cannot become active and
+                # should not accumulate as ambiguous resumable installations.
+                await self.context.connector_installation_repo.update(
+                    existing.id,
+                    {"status": "revoked", "revoked_at": now},
+                )
         installation_id = str(uuid4())
         onecli_credential_ref = self._default_onecli_ref(
             owner_user_id=owner_user_id,
             provider=provider,
             installation_id=installation_id,
         )
+        setup_started_at, setup_expires_at = self._setup_window()
 
         installation = ConnectorInstallation(
             id=installation_id,
@@ -225,11 +336,24 @@ class ConnectorInstallationService:
             name=name,
             onecli_credential_ref=onecli_credential_ref,
             setup_session_id=installation_id,
+            setup_started_at=setup_started_at,
+            setup_expires_at=setup_expires_at,
             status="setup_pending",
             metadata=metadata,
         )
         saved = await self.context.connector_installation_repo.create(installation)
         return self._setup_session_payload(saved)
+
+    async def resume_setup_session_for_owner(
+            self,
+            installation_id: str,
+            owner_user_id: str,
+    ) -> ConnectorSetupSessionPayload | None:
+        installation = await self.get_for_owner(installation_id, owner_user_id)
+        if installation is None:
+            return None
+        self._require_live_setup_session(installation)
+        return self._setup_session_payload(installation)
 
     async def complete_for_owner(
             self,
@@ -239,47 +363,55 @@ class ConnectorInstallationService:
             payload: dict[str, Any],
     ) -> ConnectorInstallation | None:
         self._raise_for_raw_secret_payload(payload)
+        if "onecli_credential_ref" in payload or "runtime_secret_value" in payload:
+            raise ValueError(
+                "Agency determines the OneCLI resource during verification; do not submit a credential ref or secret."
+            )
         current = await self.get_for_owner(installation_id, owner_user_id)
         if current is None:
             return None
-        transport_mode = self._transport_mode(current.provider)
-        onecli_credential_ref = str(
-            payload.get("onecli_credential_ref") or current.onecli_credential_ref
-        ).strip()
-        self._ensure_owner_scoped_onecli_ref(
-            owner_user_id=owner_user_id,
-            onecli_credential_ref=onecli_credential_ref,
-        )
-        runtime_secret_value = payload.get("runtime_secret_value")
-        runtime_secret_encrypted = current.runtime_secret_encrypted
-        if isinstance(runtime_secret_value, str) and runtime_secret_value.strip():
-            if transport_mode != "direct":
-                raise ValueError("runtime_secret_value is only used for direct transport connectors.")
-            runtime_secret_encrypted = seal_runtime_secret(runtime_secret_value)
-        elif (
-                transport_mode == "direct"
-                and self._runtime_secret_required_for_provider(current.provider)
-                and not runtime_secret_encrypted
-        ):
-            raise ValueError(
-                "Direct transport requires runtime_secret_value so Agency can resolve the secret at request time."
-            )
         metadata = current.metadata
         if isinstance(payload.get("metadata"), dict):
             metadata = {**metadata, **payload["metadata"]}
+        telegram_webhook_secret_token: str | None = None
         if current.provider == "telegram-bot":
-            webhook_secret_token = self._telegram_webhook_secret_token(metadata)
-            if webhook_secret_token is None:
-                metadata = {**metadata, "webhook_secret_token": secrets.token_urlsafe(32)}
+            telegram_webhook_secret_token = (
+                self._telegram_webhook_secret_token(metadata) or secrets.token_urlsafe(32)
+            )
+            # Connector metadata validation still sees the transient token, but
+            # the durable record below retains only its one-way verifier.
+            metadata = {**metadata, "webhook_secret_token": telegram_webhook_secret_token}
+        metadata_errors = validate_connector_metadata(current.provider, metadata)
+        if metadata_errors:
+            raise ValueError(metadata_errors[0])
+
+        if telegram_webhook_secret_token is not None:
+            metadata = self._telegram_metadata_without_plaintext_token(
+                metadata,
+                token=telegram_webhook_secret_token,
+            )
+
+        # The browser never chooses this reference. It is bound to the resource
+        # id returned by OneCLI's metadata-only control API after exact matching.
+        onecli_credential_ref = await self._verified_onecli_ref(current)
 
         patch: dict[str, Any] = {
             "onecli_credential_ref": onecli_credential_ref,
-            "runtime_secret_encrypted": runtime_secret_encrypted,
+            "runtime_secret_encrypted": None,
             "metadata": metadata,
             "status": "active",
         }
         if current.status == "rotation_required":
             patch["last_rotated_at"] = datetime.now(timezone.utc)
+
+        if current.provider == "telegram-bot":
+            # Keep the durable record pending when provider-side registration
+            # fails, so the user can correct OneCLI and retry verification.
+            candidate = current.model_copy(update=patch)
+            await self._register_telegram_webhook(
+                candidate,
+                secret_token=telegram_webhook_secret_token,
+            )
 
         updated = await self.context.connector_installation_repo.update(
             installation_id,
@@ -289,11 +421,6 @@ class ConnectorInstallationService:
             return None
 
         await self._save_legacy_credential_projection(updated)
-        if updated.provider == "telegram-bot":
-            # Telegram webhook registration lives at completion time so the
-            # launcher can supply the public URL once and keep provider calls
-            # direct without a separate manual setWebhook step.
-            await self._register_telegram_webhook(updated)
         return updated
 
     async def _save_legacy_credential_projection(self, installation: ConnectorInstallation) -> None:
@@ -342,51 +469,39 @@ class ConnectorInstallationService:
             payload: dict[str, Any],
     ) -> ConnectorSetupSessionPayload | None:
         self._raise_for_raw_secret_payload(payload)
+        if "onecli_credential_ref" in payload or "runtime_secret_value" in payload:
+            raise ValueError(
+                "Agency creates a fresh OneCLI verification session; do not submit a credential ref or secret."
+            )
         current = await self.get_for_owner(installation_id, owner_user_id)
         if current is None:
             return None
         if current.status in {"revoked", "disabled"}:
             raise ValueError("Revoked or disabled connector installations cannot be rotated.")
-        transport_mode = self._transport_mode(current.provider)
-        onecli_credential_ref = str(
-            payload.get("onecli_credential_ref") or current.onecli_credential_ref
-        ).strip()
-        self._ensure_owner_scoped_onecli_ref(
-            owner_user_id=owner_user_id,
-            onecli_credential_ref=onecli_credential_ref,
-        )
-        runtime_secret_value = payload.get("runtime_secret_value")
-        runtime_secret_encrypted = current.runtime_secret_encrypted
-        if isinstance(runtime_secret_value, str) and runtime_secret_value.strip():
-            if transport_mode != "direct":
-                raise ValueError("runtime_secret_value is only used for direct transport connectors.")
-            runtime_secret_encrypted = seal_runtime_secret(runtime_secret_value)
-        elif (
-                transport_mode == "direct"
-                and self._runtime_secret_required_for_provider(current.provider)
-                and not runtime_secret_encrypted
-        ):
-            raise ValueError(
-                "Direct transport requires runtime_secret_value so Agency can resolve the secret at request time."
-            )
-
         metadata = current.metadata
         if isinstance(payload.get("metadata"), dict):
             metadata = {**metadata, **payload["metadata"]}
         if current.provider == "telegram-bot":
-            webhook_secret_token = self._telegram_webhook_secret_token(metadata)
-            if webhook_secret_token is None:
-                metadata = {**metadata, "webhook_secret_token": secrets.token_urlsafe(32)}
+            legacy_token = metadata.get("webhook_secret_token")
+            if isinstance(legacy_token, str) and legacy_token.strip():
+                metadata = self._telegram_metadata_without_plaintext_token(
+                    metadata,
+                    token=legacy_token.strip(),
+                )
 
         session_id = str(uuid4())
+        setup_started_at, setup_expires_at = self._setup_window()
         updated = await self.context.connector_installation_repo.update(
             installation_id,
             {
-                "onecli_credential_ref": onecli_credential_ref,
-                "runtime_secret_encrypted": runtime_secret_encrypted,
+                # Keep the last verified reference available until the fresh
+                # rotation resource passes OneCLI verification.
+                "runtime_secret_encrypted": None,
                 "metadata": metadata,
                 "status": "rotation_required",
                 "setup_session_id": session_id,
+                "setup_started_at": setup_started_at,
+                "setup_expires_at": setup_expires_at,
             },
         )
         if updated is None:
@@ -398,13 +513,22 @@ class ConnectorInstallationService:
         current = await self.get_for_owner(installation_id, owner_user_id)
         if current is None:
             return None
-        return await self.context.connector_installation_repo.update(
+        revoked = await self.context.connector_installation_repo.update(
             installation_id,
             {
                 "status": "revoked",
                 "revoked_at": datetime.now(timezone.utc),
             },
         )
+        if revoked is not None:
+            # Connector installations project into the legacy credential store
+            # for agent/runtime compatibility. Revoking only one side would
+            # leave the OneCLI reference usable through the other boundary.
+            await CredentialService(self.context).revoke_credential_for_owner(
+                installation_id,
+                owner_user_id,
+            )
+        return revoked
 
     async def reconcile_startup_integrations(self) -> dict[str, int]:
         public_base_url = await self._public_webhook_base_url()
@@ -420,8 +544,25 @@ class ConnectorInstallationService:
             if installation.provider != "telegram-bot":
                 continue
             try:
-                result = await self._register_telegram_webhook(installation)
+                webhook_secret_token = (
+                    self._telegram_webhook_secret_token(installation.metadata)
+                    or secrets.token_urlsafe(32)
+                )
+                result = await self._register_telegram_webhook(
+                    installation,
+                    secret_token=webhook_secret_token,
+                )
                 if result is not None:
+                    metadata = self._telegram_metadata_without_plaintext_token(
+                        installation.metadata,
+                        token=webhook_secret_token,
+                    )
+                    updated = await self.context.connector_installation_repo.update(
+                        installation.id,
+                        {"metadata": metadata},
+                    )
+                    if updated is not None:
+                        await self._save_legacy_credential_projection(updated)
                     reconciled += 1
             except Exception as exc:
                 errors += 1

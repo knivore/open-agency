@@ -3,6 +3,7 @@ from __future__ import annotations
 import boto3
 import json
 import os
+from urllib.parse import quote
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from fastapi import HTTPException
@@ -57,6 +58,18 @@ def _normalize_local_storage_key(key: str) -> str:
     if clean == ".." or clean.startswith(f"..{os.sep}"):
         raise ValueError("Path traversal is not allowed")
     return clean
+
+
+def user_scoped_storage_key(user_id: str, key: str) -> str:
+    """Place caller-provided object names under a server-derived user namespace."""
+    normalized_user_id = user_id.strip()
+    if not normalized_user_id:
+        raise ValueError("Storage owner must not be empty")
+    normalized_key = _normalize_local_storage_key(key).replace(os.sep, "/")
+    # Encoding the identity keeps separators in external identity formats from
+    # becoming bucket-prefix authority.
+    owner_segment = quote(normalized_user_id, safe="")
+    return f"users/{owner_segment}/{normalized_key}"
 
 
 def _is_file_like(value: object) -> bool:
@@ -343,6 +356,7 @@ __all__ = [
     "LOCAL_STORAGE_PATH",
     "ensure_local_storage",
     "generate_presigned_url",
+    "user_scoped_storage_key",
     "get_local_file_path",
     "get_log_file_content",
     "get_s3_client",

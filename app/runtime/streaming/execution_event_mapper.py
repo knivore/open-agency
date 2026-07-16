@@ -127,6 +127,18 @@ def _log_message_for(event: ExecutionEvent) -> str:
         return f"Execution failed: {event.payload.get('error') or 'unknown error'}"
     if event_type == ExecutionEventType.EXECUTION_REPAIRED:
         return f"Execution repaired: {event.payload.get('repair_action') or 'stale execution repaired'}"
+    if event_type == ExecutionEventType.EXECUTION_CYCLE_STARTED:
+        return f"Monitor cycle {event.payload.get('cycle_number') or '?'} started"
+    if event_type == ExecutionEventType.EXECUTION_CYCLE_COMPLETED:
+        return f"Monitor cycle {event.payload.get('cycle_number') or '?'} completed"
+    if event_type == ExecutionEventType.EXECUTION_CYCLE_FAILED:
+        return f"Monitor cycle failed: {event.payload.get('error') or 'unknown error'}"
+    if event_type == ExecutionEventType.EXECUTION_CYCLE_GUARD_TRIGGERED:
+        return f"Monitor cycle paused: {event.payload.get('reason') or 'loop guard triggered'}"
+    if event_type == ExecutionEventType.EXECUTION_WAITING:
+        return f"Execution waiting for {event.payload.get('kind') or 'wake condition'}"
+    if event_type == ExecutionEventType.EXECUTION_WOKEN:
+        return f"Execution wait {event.payload.get('status') or 'resolved'}"
     if event_type == ExecutionEventType.MONITOR_FINDING_CREATED:
         return f"Monitor finding: {event.payload.get('category') or 'finding'}"
     if event_type == ExecutionEventType.MONITOR_EVALUATION_RECORDED:
@@ -384,6 +396,12 @@ def map_execution_event_to_runtime_events(event: ExecutionEvent) -> list[Runtime
         ExecutionEventType.TOOL_CALL_FAILED,
         ExecutionEventType.EXECUTION_FAILED,
         ExecutionEventType.EXECUTION_REPAIRED,
+        ExecutionEventType.EXECUTION_CYCLE_STARTED,
+        ExecutionEventType.EXECUTION_CYCLE_COMPLETED,
+        ExecutionEventType.EXECUTION_CYCLE_FAILED,
+        ExecutionEventType.EXECUTION_CYCLE_GUARD_TRIGGERED,
+        ExecutionEventType.EXECUTION_WAITING,
+        ExecutionEventType.EXECUTION_WOKEN,
         ExecutionEventType.MONITOR_FINDING_CREATED,
         ExecutionEventType.MONITOR_IMPROVEMENT_PROPOSED,
         ExecutionEventType.SUPERVISOR_STEERING_REQUESTED,
@@ -395,6 +413,7 @@ def map_execution_event_to_runtime_events(event: ExecutionEvent) -> list[Runtime
             ExecutionEventType.SUBAGENT_STEP_FAILED,
             ExecutionEventType.TOOL_CALL_FAILED,
             ExecutionEventType.EXECUTION_FAILED,
+            ExecutionEventType.EXECUTION_CYCLE_FAILED,
         } else RuntimeEventLevel.WARNING if event.event_type in {
             ExecutionEventType.TOKEN_BUDGET_WARNING,
             ExecutionEventType.TOKEN_BUDGET_EXCEEDED,
@@ -402,6 +421,7 @@ def map_execution_event_to_runtime_events(event: ExecutionEvent) -> list[Runtime
             ExecutionEventType.MODEL_FALLBACK_USED,
             ExecutionEventType.SUBAGENT_NEEDS_INPUT,
             ExecutionEventType.SUBAGENT_NEEDS_APPROVAL,
+            ExecutionEventType.EXECUTION_CYCLE_GUARD_TRIGGERED,
             ExecutionEventType.SUPERVISOR_STEERING_REQUESTED,
         } else RuntimeEventLevel.INFO
         runtime_events.append(

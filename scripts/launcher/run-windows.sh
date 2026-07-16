@@ -15,6 +15,14 @@ ONECLI_GATEWAY_CA_HOST_PATH_DEFAULT="${ROOT_DIR}/certs/onecli-gateway-ca.pem"
 ONECLI_BACKEND_CA_HOST_PATH_DEFAULT="${ROOT_DIR}/.data/onecli/worker-ca-plus-onecli.pem"
 . "${LAUNCHER_DIR}/common.sh"
 
+if [ -n "${AGENCY_RUN_LOG:-}" ]; then
+  # The CMD entrypoint sets a Windows path; tee keeps first-run builds visible
+  # while preserving the same diagnostic log that previous launchers produced.
+  launcher_log="$(cygpath -u "${AGENCY_RUN_LOG}")"
+  mkdir -p "$(dirname "${launcher_log}")"
+  exec > >(tee "${launcher_log}") 2>&1
+fi
+
 pause_on_error() {
   local exit_code="$1"
   local line_no="$2"
@@ -64,6 +72,12 @@ Common environment overrides:
   FRONTEND_PORT / BACKEND_PORT      Change local ports. Defaults to 3000 / 8000.
   AGENCY_FE_DIR                     Frontend repo path. Defaults to ../open-agency-fe.
   AGENCY_FRONTEND_ENABLED=false     Run backend/runtime only.
+  AGENCY_FRONTEND_RUNTIME           Use auto, native, or container. Defaults to auto.
+  AGENCY_NGROK_BIN / AGENCY_CLOUDFLARE_TUNNEL_BIN
+                                    Verified tunnel executable paths when not on PATH.
+  AGENCY_TUNNEL_AUTO_INSTALL       Install a selected provider with WinGet when missing.
+  AGENCY_NGROK_AUTHTOKEN            ngrok agent token, when required by the account.
+  AGENCY_CLOUDFLARE_TUNNEL_TOKEN    Managed Cloudflare Tunnel token.
   AGENCY_OPEN_BROWSER=false         Do not open the browser automatically.
 EOF
 }
@@ -126,6 +140,209 @@ run_powershell() {
   fi
 }
 
+resolve_configured_binary() {
+  local configured="$1"
+  local unix_path=""
+
+  [ -n "${configured}" ] || return 1
+  if [ -f "${configured}" ]; then
+    printf '%s\n' "${configured}"
+    return 0
+  fi
+
+  if command -v cygpath >/dev/null 2>&1; then
+    unix_path="$(cygpath -u "${configured}" 2>/dev/null || true)"
+    if [ -f "${unix_path}" ]; then
+      printf '%s\n' "${unix_path}"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+ngrok_bin_path() {
+  local configured=""
+  local candidate=""
+
+  configured="$(resolve_configured_binary "${AGENCY_NGROK_BIN:-}" || true)"
+  if [ -n "${configured}" ]; then
+    printf '%s\n' "${configured}"
+    return 0
+  fi
+
+  for candidate in ngrok ngrok.exe; do
+    if command -v "${candidate}" >/dev/null 2>&1; then
+      command -v "${candidate}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+cloudflared_bin_path() {
+  local configured=""
+  local candidate=""
+
+  configured="$(resolve_configured_binary "${AGENCY_CLOUDFLARE_TUNNEL_BIN:-}" || true)"
+  if [ -n "${configured}" ]; then
+    printf '%s\n' "${configured}"
+    return 0
+  fi
+
+  for candidate in cloudflared cloudflared.exe; do
+    if command -v "${candidate}" >/dev/null 2>&1; then
+      command -v "${candidate}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+powershell_command_path() {
+  local command_name="$1"
+  local windows_path=""
+
+  windows_path="$(run_powershell "\$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User'); (Get-Command '${command_name}.exe' -ErrorAction SilentlyContinue).Source" 2>/dev/null | sed -n '1p' || true)"
+  resolve_configured_binary "${windows_path}"
+}
+
+winget_bin_path() {
+  if command_exists winget; then
+    command -v winget
+    return 0
+  fi
+  powershell_command_path winget
+}
+
+install_tunnel_provider() {
+  local provider="$1"
+  local package_id=""
+  local winget_bin=""
+
+  tunnel_auto_install_enabled || return 1
+  winget_bin="$(winget_bin_path || true)"
+  if [ -z "${winget_bin}" ]; then
+    echo "WinGet is not available; install ${provider} or set its AGENCY_*_BIN path manually." >&2
+    return 1
+  fi
+
+  case "${provider}" in
+    ngrok)
+      package_id="Ngrok.Ngrok"
+      ;;
+    cloudflare)
+      package_id="Cloudflare.cloudflared"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  echo "Installing ${provider} with WinGet (${package_id})..."
+  "${winget_bin}" install \
+    --id "${package_id}" \
+    --exact \
+    --source winget \
+    --accept-source-agreements \
+    --accept-package-agreements \
+    --silent
+}
+
+ensure_tunnel_binary() {
+  local provider="$1"
+  local tunnel_bin=""
+
+  case "${provider}" in
+    ngrok)
+      tunnel_bin="$(ngrok_bin_path || true)"
+      if [ -z "${tunnel_bin}" ]; then
+        tunnel_bin="$(powershell_command_path ngrok || true)"
+      fi
+      ;;
+    cloudflare)
+      tunnel_bin="$(cloudflared_bin_path || true)"
+      if [ -z "${tunnel_bin}" ]; then
+        tunnel_bin="$(powershell_command_path cloudflared || true)"
+      fi
+      ;;
+  esac
+
+  if [ -n "${tunnel_bin}" ]; then
+    printf '%s\n' "${tunnel_bin}"
+    return 0
+  fi
+
+  if ! install_tunnel_provider "${provider}"; then
+    return 1
+  fi
+
+  case "${provider}" in
+    ngrok)
+      tunnel_bin="$(ngrok_bin_path || true)"
+      [ -n "${tunnel_bin}" ] || tunnel_bin="$(powershell_command_path ngrok || true)"
+      ;;
+    cloudflare)
+      tunnel_bin="$(cloudflared_bin_path || true)"
+      [ -n "${tunnel_bin}" ] || tunnel_bin="$(powershell_command_path cloudflared || true)"
+      ;;
+  esac
+
+  if [ -n "${tunnel_bin}" ]; then
+    printf '%s\n' "${tunnel_bin}"
+    return 0
+  fi
+
+  echo "${provider} installation completed, but its executable is not available yet." >&2
+  return 1
+}
+
+ngrok_config_file() {
+  local configured="${LOCALAPPDATA:-}"
+  local windows_path=""
+
+  if [ -z "${configured}" ]; then
+    windows_path="$(run_powershell '[Environment]::GetEnvironmentVariable("LOCALAPPDATA","User")' 2>/dev/null | sed -n '1p' || true)"
+    configured="${windows_path}"
+  fi
+  if [ -n "${configured}" ]; then
+    configured="$(cygpath -u "${configured}" 2>/dev/null || printf '%s\n' "${configured}")"
+    printf '%s\n' "${configured}/ngrok/ngrok.yml"
+  fi
+}
+
+ngrok_has_authtoken() {
+  local config_file=""
+
+  config_file="$(ngrok_config_file)"
+  [ -f "${config_file}" ] && grep -Eq '^[[:space:]]*authtoken:[[:space:]]*[^[:space:]]+' "${config_file}"
+}
+
+configure_ngrok_auth() {
+  local ngrok_bin="$1"
+  local token="${AGENCY_NGROK_AUTHTOKEN:-}"
+
+  if [ -z "${token}" ] && ! ngrok_has_authtoken && [ -t 0 ]; then
+    printf 'Enter your ngrok authtoken (leave blank to disable ngrok): '
+    read -r -s token || true
+    printf '\n'
+  fi
+  if [ -z "${token}" ]; then
+    if ! ngrok_has_authtoken; then
+      echo "ngrok requires an authtoken. Set AGENCY_NGROK_AUTHTOKEN before restarting." >&2
+      disable_public_tunnel
+    fi
+    return 0
+  fi
+
+  if ! "${ngrok_bin}" config add-authtoken "${token}" >/dev/null 2>"$(ngrok_log_file)"; then
+    echo "Unable to configure the ngrok authtoken. Check $(ngrok_log_file)." >&2
+    disable_public_tunnel
+  fi
+}
+
 ensure_run_dir() {
   if mkdir -p "${RUN_DIR}" 2>/dev/null; then
     return 0
@@ -179,8 +396,9 @@ configure_frontend_lan_env() {
   local env_file="${FE_DIR}/.env.local"
   local env_file_win=""
   local env_source_win=""
-  local backend_internal_url="${BACKEND_INTERNAL_URL}"
   local generated_env="${RUN_DIR}/open-agency-fe.env.local"
+  local generated_env_win=""
+  local backend_internal_url="${BACKEND_INTERNAL_URL}"
 
   if ! frontend_available; then
     explain_frontend_skip
@@ -188,13 +406,17 @@ configure_frontend_lan_env() {
   fi
 
   env_file_win="$(cygpath -w "${env_file}")"
-  if [ -f "${FE_DIR}/.env" ]; then
+  ensure_run_dir
+  generated_env_win="$(cygpath -w "${generated_env}")"
+  if [ -f "${env_file}" ]; then
+    env_source_win="${env_file_win}"
+  elif [ -f "${FE_DIR}/.env" ]; then
     env_source_win="$(cygpath -w "${FE_DIR}/.env")"
   elif [ -f "${FE_DIR}/.env.example" ]; then
     env_source_win="$(cygpath -w "${FE_DIR}/.env.example")"
   fi
 
-  ENV_FILE_WIN="${env_file_win}" \
+  ENV_FILE_WIN="${generated_env_win}" \
   ENV_SOURCE_WIN="${env_source_win}" \
   LAN_HOST_VALUE="${lan_host}" \
   BACKEND_INTERNAL_URL_VALUE="${backend_internal_url}" \
@@ -205,78 +427,10 @@ configure_frontend_lan_env() {
     if (-not (Test-Path -LiteralPath $parent)) {
       throw "Frontend env directory does not exist: $parent"
     }
-    if (-not (Test-Path -LiteralPath $envFile)) {
-      if ($source -and (Test-Path -LiteralPath $source)) {
-        Copy-Item -LiteralPath $source -Destination $envFile
-      } else {
-        New-Item -ItemType File -Path $envFile -Force | Out-Null
-      }
-    }
-
-    $remove = @(
-      "NEXTAUTH_URL",
-      "AUTH_URL",
-      "AUTH_TRUST_HOST",
-      "AUTH_SECRET",
-      "NEXTAUTH_SECRET",
-      "NEXT_PUBLIC_AGENCY_DEV_AUTH_ENABLED",
-      "DEV_AUTH_EMAIL",
-      "DEV_AUTH_PASSWORD",
-      "DEV_AUTH_NAME",
-      "DEV_AUTH_USER_ID"
-    )
-    $set = [ordered]@{
-      NEXT_ALLOWED_DEV_ORIGINS = "$($env:LAN_HOST_VALUE),localhost,127.0.0.1"
-      NEXT_PUBLIC_APP_ENV = "local"
-      AGENCY_FE_ENABLE_BACKEND_REWRITE = "true"
-      NEXT_PUBLIC_AGENCY_API_BASE_URL = "/backend"
-      LOCAL_BACKEND = "/backend"
-      AGENCY_INTERNAL_API_BASE_URL = $env:BACKEND_INTERNAL_URL_VALUE
-    }
-
-    $lines = @()
-    if (Test-Path -LiteralPath $envFile) {
-      $lines = @(Get-Content -LiteralPath $envFile)
-    }
-    $keysToReplace = @{}
-    foreach ($key in $remove) { $keysToReplace[$key] = $true }
-    foreach ($key in $set.Keys) { $keysToReplace[$key] = $true }
-
-    $next = New-Object System.Collections.Generic.List[string]
-    foreach ($line in $lines) {
-      if ($line -match "^\s*([^#=\s]+)=") {
-        $key = $Matches[1]
-        if ($keysToReplace.ContainsKey($key)) { continue }
-      }
-      $next.Add($line)
-    }
-    foreach ($key in $set.Keys) {
-      $next.Add("$key=$($set[$key])")
-    }
-    Set-Content -LiteralPath $envFile -Value $next -Encoding UTF8
-  ' >/dev/null && return 0
-
-  echo "Warning: unable to update frontend env file: ${env_file_win}" >&2
-  echo "Startup will continue, but the frontend may use stale proxy settings." >&2
-  echo "Writing the intended env file to ${generated_env} instead." >&2
-
-  ENV_FILE_WIN="$(cygpath -w "${generated_env}")" \
-  ENV_SOURCE_WIN="${env_source_win}" \
-  LAN_HOST_VALUE="${lan_host}" \
-  BACKEND_INTERNAL_URL_VALUE="${backend_internal_url}" \
-  run_powershell '
-    $envFile = $env:ENV_FILE_WIN
-    $source = $env:ENV_SOURCE_WIN
-    $parent = Split-Path -Parent $envFile
-    if (-not (Test-Path -LiteralPath $parent)) {
-      throw "Frontend env directory does not exist: $parent"
-    }
-    if (-not (Test-Path -LiteralPath $envFile)) {
-      if ($source -and (Test-Path -LiteralPath $source)) {
-        Copy-Item -LiteralPath $source -Destination $envFile
-      } else {
-        New-Item -ItemType File -Path $envFile -Force | Out-Null
-      }
+    if ($source -and (Test-Path -LiteralPath $source)) {
+      Copy-Item -LiteralPath $source -Destination $envFile -Force
+    } elseif (-not (Test-Path -LiteralPath $envFile)) {
+      New-Item -ItemType File -Path $envFile -Force | Out-Null
     }
 
     $remove = @(
@@ -322,10 +476,20 @@ configure_frontend_lan_env() {
     Set-Content -LiteralPath $envFile -Value $next -Encoding UTF8
   ' >/dev/null
 
-  echo "To apply it manually from PowerShell:" >&2
-  echo "  Copy-Item \"$(cygpath -w "${generated_env}")\" \"${env_file_win}\" -Force" >&2
-  echo "If Windows permissions are the issue, run:" >&2
-  echo "  icacls \"${env_file_win}\" /grant \"\$env:USERNAME:F\"" >&2
+  export AGENCY_FRONTEND_CONTAINER_ENV_FILE="${generated_env_win}"
+  export NEXT_ALLOWED_DEV_ORIGINS="${lan_host},localhost,127.0.0.1"
+
+  if GENERATED_ENV_WIN="${generated_env_win}" ENV_FILE_WIN="${env_file_win}" run_powershell '
+    Copy-Item -LiteralPath $env:GENERATED_ENV_WIN -Destination $env:ENV_FILE_WIN -Force
+  ' >/dev/null 2>&1; then
+    export AGENCY_FRONTEND_HOST_WRITABLE="true"
+    return 0
+  fi
+
+  # A read-only sibling workspace is normal inside Codex. The container
+  # frontend consumes this managed env file and stores build state in volumes.
+  export AGENCY_FRONTEND_HOST_WRITABLE="false"
+  echo "Frontend source is read-only; using the automatic Docker frontend runtime."
 }
 
 host_python() {
@@ -432,15 +596,19 @@ start_ngrok_tunnel() {
 
   local ngrok_bin=""
   local custom_domain="${AGENCY_TUNNEL_CUSTOM_DOMAIN:-}"
-  ngrok_bin="$(command -v ngrok 2>/dev/null || true)"
+  ngrok_bin="$(ensure_tunnel_binary ngrok || true)"
   if [ -z "${ngrok_bin}" ]; then
-    echo "ngrok is not installed or not on PATH; continuing without a public tunnel." >&2
+    echo "ngrok is selected but no executable was found. Install ngrok, set AGENCY_NGROK_BIN, or enable WinGet auto-install." >&2
     disable_public_tunnel
     return 0
   fi
 
   mkdir -p "${RUN_DIR}"
   : >"$(ngrok_log_file)"
+  configure_ngrok_auth "${ngrok_bin}"
+  if [ "$(public_tunnel_provider_mode)" != "ngrok" ]; then
+    return 0
+  fi
   stop_ngrok
   if [ -n "${custom_domain}" ]; then
     nohup "${ngrok_bin}" http --url "${custom_domain#https://}" "http://127.0.0.1:${BACKEND_PORT}" >"$(ngrok_log_file)" 2>&1 </dev/null &
@@ -454,14 +622,17 @@ start_ngrok_tunnel() {
   while [ "${attempts}" -lt 20 ]; do
     if command -v curl >/dev/null 2>&1 && curl -fsS "${NGROK_API_URL}/api/tunnels" >/dev/null 2>&1; then
       public_url="$(public_tunnel_url || true)"
-      echo "ngrok tunnel: ${public_url}"
-      return 0
+      if [ -n "${public_url}" ]; then
+        echo "ngrok tunnel: ${public_url}"
+        return 0
+      fi
     fi
     sleep 1
     attempts=$((attempts + 1))
   done
 
   echo "ngrok did not report a public URL. Check $(ngrok_log_file)." >&2
+  tail -n 40 "$(ngrok_log_file)" >&2 || true
   disable_public_tunnel
 }
 
@@ -473,9 +644,9 @@ start_cloudflare_tunnel() {
   local cloudflared_bin=""
   local tunnel_token="${AGENCY_CLOUDFLARE_TUNNEL_TOKEN:-}"
   local custom_domain="${AGENCY_TUNNEL_CUSTOM_DOMAIN:-}"
-  cloudflared_bin="$(command -v cloudflared 2>/dev/null || true)"
+  cloudflared_bin="$(ensure_tunnel_binary cloudflare || true)"
   if [ -z "${cloudflared_bin}" ]; then
-    echo "cloudflared is not installed or not on PATH; continuing without a public tunnel." >&2
+    echo "Cloudflare is selected but cloudflared was not found. Install it, set AGENCY_CLOUDFLARE_TUNNEL_BIN, or enable WinGet auto-install." >&2
     disable_public_tunnel
     return 0
   fi
@@ -512,6 +683,12 @@ start_cloudflare_tunnel() {
   local attempts=0
   local public_url=""
   while [ "${attempts}" -lt 20 ]; do
+    if ! pid_is_running "$(cloudflared_pid_file)"; then
+      echo "cloudflared exited before it reported a public URL. Check $(cloudflared_log_file)." >&2
+      stop_cloudflared || true
+      disable_public_tunnel
+      return 0
+    fi
     public_url="$(public_tunnel_url || true)"
     if [ -n "${public_url}" ]; then
       echo "Cloudflare tunnel: ${public_url}"
@@ -522,6 +699,7 @@ start_cloudflare_tunnel() {
   done
 
   echo "cloudflared did not report a public URL. Check $(cloudflared_log_file)." >&2
+  stop_cloudflared || true
   disable_public_tunnel
 }
 
@@ -556,14 +734,22 @@ sync_codex_oauth_to_volume() {
   fi
 
   local codex_host_home="${CODEX_HOST_HOME:-"${HOME}/.codex"}"
+  local codex_host_home_docker=""
+
+  if [ -n "${CODEX_HOME_SOURCE:-}" ] && [ -d "${CODEX_HOME_SOURCE}" ]; then
+    echo "Host Codex home is already mounted into the backend; OAuth sync is current."
+    return 0
+  fi
 
   if [ ! -f "${codex_host_home}/auth.json" ]; then
     echo "Host Codex auth not found at ${codex_host_home}/auth.json; run codex login or set CODEX_HOST_HOME." >&2
     return 0
   fi
 
+  codex_host_home_docker="$(cygpath -w "${codex_host_home}")"
   echo "Syncing host Codex OAuth into Docker Codex volume..."
-  docker compose run --rm --no-deps -v "${codex_host_home}:/host-codex:ro" backend sh -lc '
+  MSYS_NO_PATHCONV=1 docker compose run --rm --no-deps -v "${codex_host_home_docker}:/host-codex:ro" backend sh -lc '
+    set -e
     mkdir -p /codex && chmod 700 /codex
     cp /host-codex/auth.json /codex/auth.json
     chmod 600 /codex/auth.json
@@ -589,6 +775,10 @@ upsert_env_value() {
 }
 
 sync_onecli_gateway_ca_to_host() {
+  if [ "${ONECLI_ENABLED:-false}" != "true" ]; then
+    return 0
+  fi
+
   local env_file="${ROOT_DIR}/.env"
   local host_ca_path="${AGENCY_ONECLI_GATEWAY_CA_HOST_PATH:-${ONECLI_GATEWAY_CA_HOST_PATH_DEFAULT}}"
   local backend_ca_path="${AGENCY_BACKEND_ONECLI_GATEWAY_CA_HOST_PATH:-${ONECLI_BACKEND_CA_HOST_PATH_DEFAULT}}"
@@ -698,15 +888,6 @@ PY
   export AGENCY_BACKEND_ONECLI_GATEWAY_CA_BUNDLE_PATH="${backend_ca_container_path}"
 }
 
-load_dotenv() {
-  if [ -f "${ROOT_DIR}/.env" ]; then
-    set -a
-    # shellcheck disable=SC1091
-    . "${ROOT_DIR}/.env"
-    set +a
-  fi
-}
-
 wait_for_http() {
   local url="$1"
   local label="$2"
@@ -739,46 +920,62 @@ frontend_port_in_use() {
     >/dev/null 2>&1
 }
 
-start_frontend() {
+container_frontend_running() {
+  [ "$(docker inspect -f '{{.State.Running}}' open-agency-frontend 2>/dev/null || true)" = "true" ]
+}
+
+frontend_host_writable() {
+  local fe_dir_win=""
+
+  case "${AGENCY_FRONTEND_HOST_WRITABLE:-}" in
+    true)
+      return 0
+      ;;
+    false)
+      return 1
+      ;;
+esac
+  fe_dir_win="$(cygpath -w "${FE_DIR}")"
+  FE_DIR_WIN="${fe_dir_win}" run_powershell '
+    $testPath = Join-Path $env:FE_DIR_WIN ".agency-write-test"
+    try {
+      Set-Content -LiteralPath $testPath -Value "ok" -Encoding UTF8 -ErrorAction Stop
+    } finally {
+      Remove-Item -LiteralPath $testPath -Force -ErrorAction SilentlyContinue
+    }
+  ' >/dev/null 2>&1
+}
+
+frontend_native_available() {
+  frontend_host_writable && command -v npm >/dev/null 2>&1
+}
+
+start_container_frontend() {
+  local timeout="${AGENCY_FRONTEND_STARTUP_TIMEOUT_SECONDS:-300}"
+
+  echo "Starting frontend in Docker with read-only source and managed build volumes..."
+  rm -f "${RUN_DIR}/frontend.pid"
+  docker compose --profile container-frontend up -d frontend
+  printf '%s\n' "container" >"${RUN_DIR}/frontend.runtime"
+
+  if wait_for_http "http://127.0.0.1:${FRONTEND_PORT}/login" "Frontend" "${timeout}"; then
+    return 0
+  fi
+
+  docker compose logs --tail 120 frontend >&2 || true
+  return 1
+}
+
+start_native_frontend() {
   local fe_dir_win=""
   local frontend_log_win=""
   local frontend_pid=""
+  local timeout="${AGENCY_FRONTEND_STARTUP_TIMEOUT_SECONDS:-180}"
 
-  if ! frontend_available; then
-    explain_frontend_skip
-    return 0
-  fi
-
-  if agency_frontend_reachable; then
-    echo "Agency frontend already reachable at http://localhost:${FRONTEND_PORT}; reusing it."
-    return 0
-  fi
-  if pid_is_running "${RUN_DIR}/frontend.pid"; then
-    echo "Frontend is already running with PID $(cat "${RUN_DIR}/frontend.pid")."
-    return 0
-  fi
-  if frontend_port_in_use; then
-    echo "Port ${FRONTEND_PORT} is already in use by a non-Agency frontend process." >&2
-    echo "Stop that process or set FRONTEND_PORT before starting Agency." >&2
-    return 1
-  fi
-
-  echo "Starting frontend on http://0.0.0.0:${FRONTEND_PORT}..."
   fe_dir_win="$(cygpath -w "${FE_DIR}")"
   frontend_log_win="$(cygpath -w "${RUN_DIR}/frontend.log")"
 
-  if ! FE_DIR_WIN="${fe_dir_win}" run_powershell '
-    $testPath = Join-Path $env:FE_DIR_WIN ".agency-write-test"
-    Set-Content -LiteralPath $testPath -Value "ok" -Encoding UTF8
-    Remove-Item -LiteralPath $testPath -Force
-  ' >/dev/null; then
-    echo "Unable to write to frontend directory: ${fe_dir_win}" >&2
-    echo "Next.js needs write access there for .env.local and .next lock/cache files." >&2
-    echo "Run this from a normal PowerShell window, then retry:" >&2
-    echo "  icacls \"${fe_dir_win}\" /grant \"\$env:USERNAME:(OI)(CI)F\" /T" >&2
-    return 1
-  fi
-
+  echo "Starting frontend natively on http://0.0.0.0:${FRONTEND_PORT}..."
   frontend_pid="$(
     FE_DIR_WIN="${fe_dir_win}" \
     FRONTEND_LOG_WIN="${frontend_log_win}" \
@@ -798,6 +995,73 @@ start_frontend() {
     return 1
   fi
   echo "${frontend_pid}" >"${RUN_DIR}/frontend.pid"
+  printf '%s\n' "native" >"${RUN_DIR}/frontend.runtime"
+
+  if wait_for_http "http://127.0.0.1:${FRONTEND_PORT}/login" "Frontend" "${timeout}"; then
+    return 0
+  fi
+
+  tail -n 120 "${RUN_DIR}/frontend.log" >&2 || true
+  return 1
+}
+
+start_frontend() {
+  local runtime="${AGENCY_FRONTEND_RUNTIME:-auto}"
+
+  if ! frontend_available; then
+    explain_frontend_skip
+    return 0
+  fi
+
+  if agency_frontend_reachable; then
+    echo "Agency frontend already reachable at http://localhost:${FRONTEND_PORT}; reusing it."
+    return 0
+  fi
+  if container_frontend_running; then
+    echo "Container frontend is already running; waiting for it to become ready."
+    if wait_for_http "http://127.0.0.1:${FRONTEND_PORT}/login" "Frontend" "${AGENCY_FRONTEND_STARTUP_TIMEOUT_SECONDS:-300}"; then
+      return 0
+    fi
+    docker compose logs --tail 120 frontend >&2 || true
+    return 1
+  fi
+  if pid_is_running "${RUN_DIR}/frontend.pid"; then
+    echo "Frontend is already running with PID $(cat "${RUN_DIR}/frontend.pid")."
+    return 0
+  fi
+  if frontend_port_in_use; then
+    echo "Port ${FRONTEND_PORT} is already in use by a non-Agency frontend process." >&2
+    echo "Stop that process or set FRONTEND_PORT before starting Agency." >&2
+    return 1
+  fi
+
+  case "${runtime}" in
+    auto)
+      if frontend_native_available; then
+        start_native_frontend
+      else
+        start_container_frontend
+      fi
+      ;;
+    native)
+      if ! frontend_host_writable; then
+        echo "AGENCY_FRONTEND_RUNTIME=native requires a writable frontend directory." >&2
+        return 1
+      fi
+      if ! command -v npm >/dev/null 2>&1; then
+        echo "AGENCY_FRONTEND_RUNTIME=native requires npm on PATH." >&2
+        return 1
+      fi
+      start_native_frontend
+      ;;
+    container)
+      start_container_frontend
+      ;;
+    *)
+      echo "Unknown AGENCY_FRONTEND_RUNTIME value: ${runtime}. Use auto, native, or container." >&2
+      return 2
+      ;;
+  esac
 }
 
 start_background() {
@@ -812,7 +1076,7 @@ start_background() {
   if [ ! -f .env ]; then
     run_powershell "Copy-Item -LiteralPath '$(cygpath -w "${ROOT_DIR}/.env.example")' -Destination '$(cygpath -w "${ROOT_DIR}/.env")'" >/dev/null
   fi
-  load_dotenv
+  load_dotenv_preserving_cli_tunnel_overrides
   apply_saved_or_detected_tunnel_preference
 
   if frontend_available; then
@@ -891,11 +1155,12 @@ stop_all() {
 
   stop_pid_file "frontend" "${RUN_DIR}/frontend.pid"
   stop_public_tunnel
-  kill_port "${FRONTEND_PORT}"
-  kill_port "${BACKEND_PORT}"
 
   echo "Stopping Agency containers..."
-  docker compose down
+  docker compose --profile container-frontend down
+  rm -f "${RUN_DIR}/frontend.runtime"
+  kill_port "${FRONTEND_PORT}"
+  kill_port "${BACKEND_PORT}"
 }
 
 show_pid_status() {
@@ -909,12 +1174,29 @@ show_pid_status() {
   fi
 }
 
+show_frontend_status() {
+  if pid_is_running "${RUN_DIR}/frontend.pid"; then
+    echo "Frontend: running natively (PID $(cat "${RUN_DIR}/frontend.pid"))"
+  elif container_frontend_running; then
+    echo "Frontend: running in Docker (open-agency-frontend)"
+  elif agency_frontend_reachable; then
+    echo "Frontend: reachable on port ${FRONTEND_PORT} (external process)"
+  else
+    echo "Frontend: stopped"
+  fi
+}
+
 show_status() {
   local env_file="${FE_DIR}/.env.local"
 
   ensure_run_dir
   cd "${ROOT_DIR}"
-  show_pid_status "Frontend" "${RUN_DIR}/frontend.pid"
+  load_dotenv_preserving_cli_tunnel_overrides
+  apply_saved_or_detected_tunnel_preference
+  if container_frontend_running; then
+    env_file="${RUN_DIR}/open-agency-fe.env.local"
+  fi
+  show_frontend_status
 
   echo
   echo "Containers:"
@@ -943,7 +1225,11 @@ show_status() {
   echo
   echo "Logs:"
   echo "Backend:  docker compose logs -f backend"
-  echo "Frontend: ${RUN_DIR}/frontend.log"
+  if container_frontend_running; then
+    echo "Frontend: docker compose logs -f frontend"
+  else
+    echo "Frontend: ${RUN_DIR}/frontend.log"
+  fi
   print_public_tunnel_summary
 }
 
@@ -953,6 +1239,12 @@ stream_logs() {
 
   ensure_run_dir
   cd "${ROOT_DIR}"
+
+  if container_frontend_running; then
+    echo "Streaming backend and Docker frontend logs..."
+    docker compose logs -f backend frontend
+    return $?
+  fi
 
   if [ -f "${frontend_log}" ]; then
     echo "Streaming frontend log: ${frontend_log}"

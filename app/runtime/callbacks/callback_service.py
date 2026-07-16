@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any, Protocol
 
 from app.core.time import utc_now
-from app.domain import ExecutionEventType, ExecutionStatus, SubAgentStatusUpdate
+from app.domain import (
+    ExecutionEventType,
+    ExecutionStatus,
+    ExecutionWait,
+    ExecutionWaitKind,
+    SubAgentStatusUpdate,
+)
 from app.runtime.events.factory import RuntimeEventEnvelope, RuntimeEventStatus, \
     create_execution_event_from_runtime_event
 from app.runtime.native.errors import ExecutionNotFoundError
+from app.runtime.native.events import ExecutionEventEmitter
+from app.runtime.native.state import NativeExecutionState
 from .callback_schemas import CallbackReceipt, SubAgentCallbackPayload
 
 
@@ -200,7 +209,9 @@ class SubAgentCallbackService:
             event_type=ExecutionEventType.SUBAGENT_NEEDS_INPUT,
             event_status=RuntimeEventStatus.QUEUED,
             checkpoint_status="needs_input",
-            execution_status=ExecutionStatus.PAUSED,
+            # Waiting for a requested value is resumable workflow state; PAUSED is
+            # reserved for an operator or policy explicitly stopping execution.
+            execution_status=ExecutionStatus.WAITING_FOR_INPUT,
             dispatcher_action="pause",
         )
 
@@ -280,6 +291,14 @@ class SubAgentCallbackService:
         )
         event = create_execution_event_from_runtime_event(envelope)
         saved = await self.execution_store.save_event(event)
+        durable_wait = await self._create_durable_wait(
+            execution=execution,
+            callback=callback,
+            event_id=saved.id,
+            checkpoint_status=checkpoint_status,
+            event_payload=event_payload,
+            source=source,
+        )
 
         ready_dependent_step_ids = await self._ready_dependent_step_ids(
             execution,
@@ -302,7 +321,22 @@ class SubAgentCallbackService:
             previous_checkpoint=previous_checkpoint,
             ready_dependent_step_ids=ready_dependent_step_ids,
         )
+        if durable_wait is not None:
+            execution.metadata["active_wait"] = {
+                "wait_id": durable_wait.id,
+                "kind": durable_wait.kind.value,
+                "created_at": durable_wait.created_at.isoformat(),
+                "wake_at": None,
+                "deadline_at": None,
+            }
         await self.execution_store.update_execution(execution)
+
+        if durable_wait is not None:
+            await self._emit_execution_waiting(
+                execution=execution,
+                wait=durable_wait,
+                parent_event_id=saved.id,
+            )
 
         await self._notify_dispatcher(
             dispatcher_action,
@@ -322,6 +356,59 @@ class SubAgentCallbackService:
         )
         return CallbackReceipt(event_id=saved.id, run_id=callback.run_id, step_id=callback.step_id,
                                created_at=saved.timestamp)
+
+    async def _create_durable_wait(
+            self,
+            *,
+            execution,
+            callback: SubAgentCallbackPayload,
+            event_id: str,
+            checkpoint_status: str,
+            event_payload: dict[str, Any],
+            source: str,
+    ) -> ExecutionWait | None:
+        kind = {
+            "needs_input": ExecutionWaitKind.INPUT,
+            "needs_approval": ExecutionWaitKind.APPROVAL,
+        }.get(checkpoint_status)
+        if kind is None or not hasattr(self.execution_store, "create_execution_wait"):
+            return None
+        idempotency_suffix = callback.idempotency_key or event_id
+        wait = ExecutionWait(
+            execution_id=execution.id,
+            kind=kind,
+            idempotency_key=f"subagent:{callback.step_id}:{checkpoint_status}:{idempotency_suffix}"[:255],
+            correlation_key=f"subagent:{callback.agent_id}:{callback.step_id}",
+            checkpoint=deepcopy(execution.output_payload) if isinstance(execution.output_payload, dict) else {},
+            request_payload=deepcopy(event_payload),
+            metadata={
+                "source": source,
+                "callback_event_id": event_id,
+                "agent_id": callback.agent_id,
+                "step_id": callback.step_id,
+            },
+        )
+        return await self.execution_store.create_execution_wait(wait)
+
+    async def _emit_execution_waiting(self, *, execution, wait: ExecutionWait, parent_event_id: str) -> None:
+        state = NativeExecutionState(execution_id=execution.id, workflow_id=execution.workflow_id)
+        events = await self.execution_store.list_events(execution.id)
+        if events:
+            state.sequence = events[-1].sequence
+            state.last_event_id = events[-1].id
+            state.trace_id = events[-1].trace_id or state.trace_id
+        await ExecutionEventEmitter(self.execution_store).emit(
+            state,
+            ExecutionEventType.EXECUTION_WAITING,
+            parent_event_id=parent_event_id,
+            payload={
+                "wait_id": wait.id,
+                "kind": wait.kind.value,
+                "status": wait.status.value,
+                "correlation_key": wait.correlation_key,
+                "source": "subagent_callback",
+            },
+        )
 
     @staticmethod
     def _event_payload(callback: SubAgentCallbackPayload) -> dict[str, Any]:

@@ -2316,7 +2316,11 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
                     target="tests.native_test_tools",
                     callable_name="echo_tool",
                 ),
-                security=SecuritySettings(requires_approval=False),
+                security=SecuritySettings(
+                    requires_approval=False,
+                    module_allowlist=["tests.native_test_tools"],
+                    function_allowlist=["echo_tool"],
+                ),
                 mcp_exposure=MCPExposureSettings(),
             )
         )
@@ -3519,7 +3523,9 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
             runtime_adapter_id="native",
             status=ExecutionStatus.PAUSED,
             input_payload={},
+            created_by="user-1",
         )
+        await self.context.execution_store.save_execution(paused_execution)
         self.context.control_plane.pause = AsyncMock(return_value=paused_execution)
         _FakeModelClient.responses = [
             ModelResponse(
@@ -4956,7 +4962,11 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
                     target="tests.native_test_tools",
                     callable_name="echo_tool",
                 ),
-                security=SecuritySettings(requires_approval=False),
+                security=SecuritySettings(
+                    requires_approval=False,
+                    module_allowlist=["tests.native_test_tools"],
+                    function_allowlist=["echo_tool"],
+                ),
                 mcp_exposure=MCPExposureSettings(),
             )
         )
@@ -5047,7 +5057,11 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
                     callable_name="echo_tool",
                     config={"tool_family": "computer_use", "canonical_tool_name": "click"},
                 ),
-                security=SecuritySettings(requires_approval=True),
+                security=SecuritySettings(
+                    requires_approval=True,
+                    module_allowlist=["tests.native_test_tools"],
+                    function_allowlist=["echo_tool"],
+                ),
                 mcp_exposure=MCPExposureSettings(),
                 tags=["computer_use"],
             )
@@ -5133,7 +5147,11 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
                     callable_name="echo_tool",
                     config={"tool_family": "computer_use", "canonical_tool_name": "click"},
                 ),
-                security=SecuritySettings(requires_approval=True),
+                security=SecuritySettings(
+                    requires_approval=True,
+                    module_allowlist=["tests.native_test_tools"],
+                    function_allowlist=["echo_tool"],
+                ),
                 mcp_exposure=MCPExposureSettings(),
                 tags=["computer_use"],
             )

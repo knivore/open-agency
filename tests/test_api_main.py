@@ -8,6 +8,7 @@ from unittest.mock import patch
 from app.api.context import create_test_api_context
 from app.api.main import create_app
 from app.core.config import get_settings, reset_settings_cache
+from app.domain import Conversation, WorkflowDefinition
 
 
 class ApiMainTests(unittest.TestCase):
@@ -48,9 +49,14 @@ class ApiMainTests(unittest.TestCase):
         self.assertIn("/auth/bootstrap", schema["paths"])
         self.assertIn("/auth/login", schema["paths"])
         self.assertIn("/auth/me", schema["paths"])
+        self.assertIn("/auth/me/credentials", schema["paths"])
         self.assertIn("/setup/model-profile", schema["paths"])
         self.assertIn("/setup/main-agent", schema["paths"])
         self.assertIn("/setup/recommended-agents", schema["paths"])
+        self.assertIn("/setup/openvoice", schema["paths"])
+        self.assertIn("/setup/openvoice/install", schema["paths"])
+        self.assertIn("/setup/openvoice/test", schema["paths"])
+        self.assertIn("/me/profile", schema["paths"])
         self.assertIn("/onecli/rule-profiles/default", schema["paths"])
         self.assertIn("/onecli/admin/rule-profiles/default", schema["paths"])
         self.assertIn("/integrations/connectors/{credential_id}/history", schema["paths"])
@@ -418,6 +424,211 @@ class ApiMainTests(unittest.TestCase):
         self.assertEqual(redoc_response.status_code, 200)
         self.assertIn("ReDoc", redoc_response.text)
 
+    def test_production_disables_docs_and_rejects_untrusted_hosts(self):
+        with patch.dict(
+                "os.environ",
+                {
+                    "APP_ENV": "production",
+                    "AGENCY_INTERNAL_API_KEY": "shared-test-key",
+                    "AGENCY_ALLOWED_HOSTS": "testserver",
+                },
+                clear=False,
+        ):
+            reset_settings_cache()
+            client = TestClient(create_app(context=self.context))
+            trusted_headers = {**self.owner_headers, "x-agency-internal-api-key": "shared-test-key"}
+            self.assertEqual(client.get("/docs", headers=trusted_headers).status_code, 404)
+            self.assertEqual(client.get("/openapi.json", headers=trusted_headers).status_code, 404)
+            self.assertEqual(client.get("/health", headers={"host": "untrusted.example"}).status_code, 400)
+
+    def test_api_responses_include_baseline_security_headers(self):
+        response = self.client.get("/health")
+        self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+        self.assertEqual(response.headers["x-frame-options"], "DENY")
+        self.assertEqual(response.headers["referrer-policy"], "no-referrer")
+
+    def test_development_api_requires_authenticated_identity(self):
+        with patch.dict(
+                "os.environ",
+                {"APP_ENV": "development", "AGENCY_INTERNAL_API_KEY": ""},
+                clear=False,
+        ):
+            reset_settings_cache()
+            client = TestClient(create_app(context=self.context))
+            self.assertEqual(client.get("/agents").status_code, 403)
+            self.assertEqual(client.get("/agents", headers=self.owner_headers).status_code, 403)
+            self.assertEqual(
+                client.get(
+                    "/agents",
+                    headers={
+                        "x-agency-user-email": self.owner_headers["x-agency-user-email"],
+                        "x-agency-internal-api-key": "attacker-chosen-key",
+                    },
+                ).status_code,
+                403,
+            )
+            self.assertEqual(client.get("/health").status_code, 200)
+
+        with patch.dict(
+                "os.environ",
+                {"APP_ENV": "development", "AGENCY_INTERNAL_API_KEY": "shared-test-key"},
+                clear=False,
+        ):
+            reset_settings_cache()
+            client = TestClient(create_app(context=self.context))
+            self.assertEqual(
+                client.get(
+                    "/agents",
+                    headers={**self.owner_headers, "x-agency-internal-api-key": "wrong-key"},
+                ).status_code,
+                403,
+            )
+            response = client.get(
+                "/agents",
+                headers={**self.owner_headers, "x-agency-internal-api-key": "shared-test-key"},
+            )
+            self.assertEqual(response.status_code, 200)
+
+    def test_development_conversations_are_owner_scoped(self):
+        self.client.post(
+            "/users/sync",
+            json={"id": "user-other", "email": "other@example.com", "display_name": "Other User"},
+        )
+        asyncio.run(
+            self.context.conversation_repo.create(
+                Conversation(id="owner-scoped-conversation", created_by_user_id="user-main")
+            )
+        )
+        with patch.dict(
+                "os.environ",
+                {"APP_ENV": "development", "AGENCY_INTERNAL_API_KEY": "shared-test-key"},
+                clear=False,
+        ):
+            reset_settings_cache()
+            client = TestClient(create_app(context=self.context))
+            owner_headers = {**self.owner_headers, "x-agency-internal-api-key": "shared-test-key"}
+            other_headers = {
+                "x-agency-user-id": "user-other",
+                "x-agency-user-email": "other@example.com",
+                "x-agency-internal-api-key": "shared-test-key",
+            }
+
+            self.assertEqual(
+                client.get("/conversations/owner-scoped-conversation", headers=other_headers).status_code,
+                404,
+            )
+            listed = client.get("/conversations", headers=other_headers)
+            self.assertEqual(listed.status_code, 200)
+            self.assertNotIn(
+                "owner-scoped-conversation",
+                {item["id"] for item in listed.json()["items"]},
+            )
+            self.assertEqual(
+                client.patch(
+                    "/conversations/owner-scoped-conversation",
+                    headers=other_headers,
+                    json={"title": "cross-owner update"},
+                ).status_code,
+                404,
+            )
+            self.assertEqual(
+                client.patch(
+                    "/conversations/main-agent-profile",
+                    headers=owner_headers,
+                    json={"name": "unauthorized global change"},
+                ).status_code,
+                403,
+            )
+
+    def test_development_presigned_storage_uses_server_derived_owner_prefix(self):
+        with patch.dict(
+                "os.environ",
+                {"APP_ENV": "development", "AGENCY_INTERNAL_API_KEY": "shared-test-key"},
+                clear=False,
+        ), patch("app.api.routes.storage.generate_presigned_url", return_value="https://storage.example.test/signed") as signer:
+            reset_settings_cache()
+            client = TestClient(create_app(context=self.context))
+            headers = {**self.owner_headers, "x-agency-internal-api-key": "shared-test-key"}
+            response = client.post(
+                "/storage/presigned",
+                headers=headers,
+                json={"operation": "upload", "filename": "users/another-user/private.txt"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            signer.call_args.kwargs["filename"],
+            "users/user-main/users/another-user/private.txt",
+        )
+
+    def test_presigned_storage_rejects_unknown_operation(self):
+        with patch("app.api.routes.storage.generate_presigned_url") as signer:
+            response = self.client.post(
+                "/storage/presigned",
+                json={"operation": "delete", "filename": "demo.txt"},
+            )
+        self.assertEqual(response.status_code, 422)
+        signer.assert_not_called()
+
+    def test_development_workflow_reads_are_owner_scoped(self):
+        self.client.post(
+            "/users/sync",
+            json={"id": "user-other", "email": "other@example.com", "display_name": "Other User"},
+        )
+        asyncio.run(
+            self.context.workflow_repo.create(
+                WorkflowDefinition(
+                    id="owner-scoped-workflow",
+                    name="Owner Scoped Workflow",
+                    entrypoint="manual",
+                    metadata={"created_by": "user-main", "owner_ids": ["user-main"]},
+                )
+            )
+        )
+        asyncio.run(
+            self.context.workflow_repo.create(
+                WorkflowDefinition(
+                    id="legacy-ownerless-workflow",
+                    name="Legacy Ownerless Workflow",
+                    entrypoint="manual",
+                )
+            )
+        )
+        with patch.dict(
+                "os.environ",
+                {"APP_ENV": "development", "AGENCY_INTERNAL_API_KEY": "shared-test-key"},
+                clear=False,
+        ):
+            reset_settings_cache()
+            client = TestClient(create_app(context=self.context))
+            other_headers = {
+                "x-agency-user-id": "user-other",
+                "x-agency-user-email": "other@example.com",
+                "x-agency-internal-api-key": "shared-test-key",
+            }
+            listed = client.get("/workflows", headers=other_headers)
+            self.assertEqual(listed.status_code, 200)
+            listed_ids = {item["id"] for item in listed.json()["items"]}
+            self.assertNotIn("owner-scoped-workflow", listed_ids)
+            self.assertNotIn("legacy-ownerless-workflow", listed_ids)
+            self.assertEqual(
+                client.get("/workflows/owner-scoped-workflow", headers=other_headers).status_code,
+                403,
+            )
+            self.assertEqual(
+                client.put(
+                    "/workflows/legacy-ownerless-workflow",
+                    headers=other_headers,
+                    json={"description": "must not claim"},
+                ).status_code,
+                403,
+            )
+
+        legacy = asyncio.run(self.context.workflow_repo.get("legacy-ownerless-workflow"))
+        self.assertIsNotNone(legacy)
+        self.assertFalse(legacy.metadata.get("owner_ids"))
+        self.assertFalse(legacy.metadata.get("created_by"))
+
     def test_root_payload_includes_api_docs_links(self):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
@@ -600,6 +811,18 @@ class ApiMainTests(unittest.TestCase):
             )
             self.assertEqual(download.status_code, 200)
             self.assertEqual(download.json()["path"], "/tmp/demo.txt")
+
+    def test_local_storage_upload_rejects_oversized_body_before_write(self):
+        with patch("app.api.routes.health.mock_upload_to_local") as mock_upload:
+            response = self.client.put(
+                "/api/local-storage/upload",
+                headers={**self.owner_headers, "content-length": str(10 * 1024 * 1024 + 1)},
+                params={"file": "oversized.bin"},
+                content=b"x",
+            )
+
+        self.assertEqual(response.status_code, 413)
+        mock_upload.assert_not_called()
 
 
 if __name__ == "__main__":

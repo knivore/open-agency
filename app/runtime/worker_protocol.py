@@ -7,6 +7,7 @@ WORKER_EXIT_WORKFLOW_FAILED = 10
 WORKER_EXIT_BOOTSTRAP_FAILED = 20
 WORKER_EXIT_INFRA_FAILED = 30
 WORKER_EXIT_CANCELLED = 40
+WORKER_EXIT_SUSPENDED = 50
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 1.0
 
 
@@ -21,4 +22,6 @@ def worker_exit_reason(exit_code: int | None) -> str:
         return "worker_exit_infra_failed"
     if exit_code == WORKER_EXIT_CANCELLED:
         return "worker_exit_cancelled"
+    if exit_code == WORKER_EXIT_SUSPENDED:
+        return "worker_exit_suspended"
     return "worker_exit_unknown"

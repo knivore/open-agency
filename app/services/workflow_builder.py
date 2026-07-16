@@ -77,6 +77,21 @@ class WorkflowBuilderService:
     _COMMAND_TOOL_NAME = "run_command"
     _MEMORY_LIST_TOOL_ID = "agency.memory.list"
 
+    @staticmethod
+    def _contains_signal(text: str, signals: tuple[str, ...]) -> bool:
+        """Match intent words as standalone signals, not accidental substrings.
+
+        Workflow fields often contain identifiers such as ``storage_key_prefix``.
+        Plain substring checks made the ``fix`` suffix in ``prefix`` look like an
+        instruction to modify repository code, so code-writing enhancements must
+        use lexical boundaries instead.
+        """
+        lowered = text.lower()
+        return any(
+            re.search(rf"(?<![a-z0-9]){re.escape(signal.lower())}(?![a-z0-9])", lowered) is not None
+            for signal in signals
+        )
+
     async def build_workflow_definition(
             self,
             *,
@@ -1034,8 +1049,35 @@ class WorkflowBuilderService:
                 right_agent_id=qa_reviewer.id,
             )
 
-        implementation_keywords = ("implement", "code", "patch", "fix", "apply", "todo", "to-do")
-        verification_keywords = ("verify", "validate", "test", "lint")
+        implementation_keywords = (
+            "implement",
+            "implements",
+            "implemented",
+            "implementation",
+            "code",
+            "coding",
+            "patch",
+            "patches",
+            "patched",
+            "fix",
+            "fixes",
+            "fixed",
+            "apply",
+            "applies",
+            "applied",
+            "todo",
+            "to-do",
+        )
+        verification_keywords = (
+            "verify",
+            "verification",
+            "validate",
+            "validation",
+            "test",
+            "tests",
+            "testing",
+            "lint",
+        )
         verification_agent_id = qa_reviewer.id if qa_reviewer is not None else implementer.id
         tasks = self._assign_tasks_to_agent(
             tasks=tasks,
@@ -1262,14 +1304,34 @@ class WorkflowBuilderService:
             workflow_text = " ".join(parts).lower()
 
         haystacks = [lowered, workflow_text]
-        recommendation_signals = ("recommend", "idea", "improvement", "suggestion")
+        recommendation_signals = (
+            "recommend",
+            "recommended",
+            "recommendation",
+            "recommendations",
+            "idea",
+            "ideas",
+            "improvement",
+            "improvements",
+            "suggestion",
+            "suggestions",
+        )
         coding_signals = (
             "implement",
+            "implements",
+            "implemented",
+            "implementation",
             "apply",
+            "applies",
+            "applied",
             "coding",
             "code",
             "patch",
+            "patches",
+            "patched",
             "fix",
+            "fixes",
+            "fixed",
             "todo",
             "to-do",
             "action item",
@@ -1277,11 +1339,30 @@ class WorkflowBuilderService:
             "direct8000",
             "llmfirst",
         )
-        repo_signals = ("repo", "repository", "agency", "agency-fe")
-        has_recommendation = any(any(signal in text for signal in recommendation_signals) for text in haystacks)
-        has_coding = any(any(signal in text for signal in coding_signals) for text in haystacks)
-        has_repo = any(any(signal in text for signal in repo_signals) for text in haystacks)
-        if has_recommendation and has_coding and has_repo:
+        repo_signals = ("repo", "repos", "repository", "repositories", "agency", "agency-fe")
+        has_recommendation = any(self._contains_signal(text, recommendation_signals) for text in haystacks)
+        # Adding shell access and a coder must be driven by the user's current request.
+        # Existing workflow prose about code or fixes is context, not mutation consent.
+        forbids_code_changes = self._contains_signal(
+            lowered,
+            (
+                "read-only",
+                "read only",
+                "no code change",
+                "no code changes",
+                "do not change code",
+                "do not modify code",
+                "don't change code",
+                "don't modify code",
+                "without changing code",
+                "without modifying code",
+            ),
+        )
+        if forbids_code_changes:
+            return False
+        has_explicit_coding_request = self._contains_signal(lowered, coding_signals)
+        has_repo = any(self._contains_signal(text, repo_signals) for text in haystacks)
+        if has_recommendation and has_explicit_coding_request and has_repo:
             return True
 
         # Support direct phrasing like:
@@ -1289,7 +1370,7 @@ class WorkflowBuilderService:
         direct_coder_todo_request = (
                 "coder" in lowered
                 and "workflow" in lowered
-                and any(token in lowered for token in ("todo", "to-do", "action item"))
+                and self._contains_signal(lowered, ("todo", "to-do", "action item"))
         )
         if direct_coder_todo_request:
             return True
@@ -1313,13 +1394,27 @@ class WorkflowBuilderService:
             workflow_text = " ".join(parts).lower()
         haystacks = [lowered, workflow_text]
         has_qa_signal = any(
-            any(token in text for token in ("qa", "quality assurance", "verify", "validation", "test"))
+            self._contains_signal(
+                text,
+                ("qa", "quality assurance", "verify", "verification", "validation", "test", "tests", "testing"),
+            )
             for text in haystacks
         )
-        has_coder_signal = any(any(token in text for token in ("coder", "coding agent", "code")) for text in haystacks)
-        has_fix_signal = any(any(token in text for token in ("fix", "error", "bug", "failure")) for text in haystacks)
+        has_coder_signal = any(
+            self._contains_signal(text, ("coder", "coding agent", "code", "coding")) for text in haystacks
+        )
+        has_fix_signal = any(
+            self._contains_signal(
+                text,
+                ("fix", "fixes", "fixed", "error", "errors", "bug", "bugs", "failure", "failures"),
+            )
+            for text in haystacks
+        )
         has_collaboration_signal = any(
-            any(token in text for token in ("work together", "together", "handoff", "collaborat"))
+            self._contains_signal(
+                text,
+                ("work together", "together", "handoff", "collaborate", "collaboration", "collaborative"),
+            )
             for text in haystacks
         )
         if has_qa_signal and has_coder_signal and (has_fix_signal or has_collaboration_signal):
@@ -1334,9 +1429,16 @@ class WorkflowBuilderService:
             "from the 3rd task",
             "from the third task",
         )
-        asks_for_fourth_task = any(token in lowered for token in ("4th task", "fourth task"))
-        asks_for_coding = any(token in lowered for token in ("coding", "code", "implement", "todo", "to-do"))
-        return asks_for_fourth_task and asks_for_coding and any(signal in lowered for signal in third_output_signals)
+        asks_for_fourth_task = self._contains_signal(lowered, ("4th task", "fourth task"))
+        asks_for_coding = self._contains_signal(
+            lowered,
+            ("coding", "code", "implement", "implemented", "implementation", "todo", "to-do"),
+        )
+        return (
+            asks_for_fourth_task
+            and asks_for_coding
+            and self._contains_signal(lowered, third_output_signals)
+        )
 
     def _build_command_tool_definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -1431,7 +1533,10 @@ class WorkflowBuilderService:
                     agent.description or "",
                 ]
             ).lower()
-            if any(token in text for token in ("implement", "coding", "code", "patch", "fix")):
+            if self._contains_signal(
+                    text,
+                    ("implement", "implemented", "implementation", "coding", "code", "patch", "fix", "fixed"),
+            ):
                 return agent
 
         base_agent = agents[0]
@@ -1467,7 +1572,7 @@ class WorkflowBuilderService:
                     agent.description or "",
                 ]
             ).lower()
-            if "qa" in text or any(token in text for token in ("quality assurance", "tester", "test engineer")):
+            if self._contains_signal(text, ("qa", "quality assurance", "tester", "test engineer")):
                 return agent
 
         base_agent = agents[0]
@@ -1532,7 +1637,7 @@ class WorkflowBuilderService:
                     task.expected_output or "",
                 ]
             ).lower()
-            if any(keyword in haystack for keyword in keywords):
+            if self._contains_signal(haystack, keywords):
                 return True
         return False
 
@@ -1540,7 +1645,7 @@ class WorkflowBuilderService:
         name_text = (task.name or "").lower()
         primary_text = " ".join([task.name or "", task.description or ""]).lower()
         execution_name_verbs = ("implement", "apply", "patch", "fix", "code", "verify", "validate", "test", "lint")
-        if any(token in name_text for token in execution_name_verbs):
+        if self._contains_signal(name_text, execution_name_verbs):
             return False
         non_execution_signals = (
             "brief",
@@ -1555,7 +1660,7 @@ class WorkflowBuilderService:
             "produce",
             "gather",
         )
-        return any(token in primary_text for token in non_execution_signals)
+        return self._contains_signal(primary_text, non_execution_signals)
 
     def _assign_tasks_to_agent(
             self,
@@ -1578,7 +1683,7 @@ class WorkflowBuilderService:
                     task.expected_output or "",
                 ]
             ).lower()
-            if any(keyword in haystack for keyword in keywords):
+            if self._contains_signal(haystack, keywords):
                 tool_ids = list(task.tool_ids or [])
                 if required_tool_id not in tool_ids:
                     tool_ids.append(required_tool_id)
@@ -1597,21 +1702,27 @@ class WorkflowBuilderService:
                     task.expected_output or "",
                 ]
             ).lower()
-            if any(keyword in haystack for keyword in keywords):
+            if self._contains_signal(haystack, keywords):
                 return task.id
         return None
 
     def _has_qa_fix_task(self, tasks: list[TaskDefinition]) -> bool:
         for task in tasks:
             name_text = (task.name or "").lower()
-            if "qa" in name_text and any(token in name_text for token in ("fix", "resolve", "remediate", "address")):
+            if self._contains_signal(name_text, ("qa",)) and self._contains_signal(
+                    name_text,
+                    ("fix", "resolve", "remediate", "address"),
+            ):
                 return True
         return False
 
     def _latest_qa_fix_task_id(self, tasks: list[TaskDefinition]) -> str | None:
         for task in reversed(tasks):
             name_text = (task.name or "").lower()
-            if "qa" in name_text and any(token in name_text for token in ("fix", "resolve", "remediate", "address")):
+            if self._contains_signal(name_text, ("qa",)) and self._contains_signal(
+                    name_text,
+                    ("fix", "resolve", "remediate", "address"),
+            ):
                 return task.id
         return None
 

@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import os
-from fastapi import APIRouter, Query, WebSocket
+from fastapi import APIRouter, HTTPException, Query, Request, WebSocket
 from starlette.websockets import WebSocketDisconnect
 
 from app.runtime.streaming.event_bus import get_default_runtime_event_bus
+from app.api.context import ApiContext, get_default_api_context
+from app.api.identity import request_has_identity, resolve_current_user
+from app.core.config import get_settings
 from app.runtime.streaming.stream_filters import RuntimeEventFilter
 from app.runtime.streaming.stream_safety import (
     DEFAULT_RUNTIME_STREAM_MAX_EVENTS_PER_SECOND,
@@ -24,14 +28,15 @@ from app.runtime.streaming.stream_serialization import (
 
 
 def authorize_runtime_websocket(websocket: WebSocket) -> bool:
-    expected = os.getenv(RUNTIME_STREAM_AUTH_ENV)
+    expected = os.getenv(RUNTIME_STREAM_AUTH_ENV) or get_settings().agency_internal_api_key
     if not expected:
-        return True
-    provided = websocket.headers.get("x-runtime-stream-key") or websocket.query_params.get("stream_key")
-    return provided == expected
+        return False
+    provided = websocket.headers.get("x-runtime-stream-key")
+    return bool(provided and hmac.compare_digest(provided, expected))
 
 
-def create_runtime_websocket_router() -> APIRouter:
+def create_runtime_websocket_router(context: ApiContext | None = None) -> APIRouter:
+    context = context or get_default_api_context()
     router = APIRouter(tags=["Runtime Events"])
 
     @router.websocket("/ws/runtime/events")
@@ -45,6 +50,21 @@ def create_runtime_websocket_router() -> APIRouter:
         if not authorize_runtime_websocket(websocket):
             await websocket.close(code=1008)
             return
+
+        identity_request = Request({**websocket.scope, "type": "http", "method": "GET"})
+        if get_settings().app_env != "test" or request_has_identity(identity_request):
+            try:
+                current_user = await resolve_current_user(
+                    identity_request,
+                    context,
+                    required_scopes=["executions:read"],
+                )
+            except HTTPException:
+                await websocket.close(code=1008)
+                return
+            if "admin" not in current_user.roles:
+                await websocket.close(code=1008)
+                return
 
         await websocket.accept()
         runtime_bus = get_default_runtime_event_bus()

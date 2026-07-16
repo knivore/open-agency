@@ -126,8 +126,12 @@ class RuntimeStreamRouteTests(unittest.IsolatedAsyncioTestCase):
         app = FastAPI()
         app.include_router(create_runtime_websocket_router())
 
+        os.environ[RUNTIME_STREAM_AUTH_ENV] = "secret"
         with TestClient(app) as client:
-            with client.websocket_connect("/ws/runtime/events?heartbeat_seconds=1&after=evt:previous") as websocket:
+            with client.websocket_connect(
+                    "/ws/runtime/events?heartbeat_seconds=1&after=evt:previous",
+                    headers={"x-runtime-stream-key": "secret"},
+            ) as websocket:
                 connected = websocket.receive_json()
                 self.assertEqual(connected["type"], "runtime_stream.connected")
                 self.assertEqual(connected["lastEventId"], "evt:previous")
@@ -144,9 +148,11 @@ class RuntimeStreamRouteTests(unittest.IsolatedAsyncioTestCase):
         app = FastAPI()
         app.include_router(create_runtime_websocket_router())
 
+        os.environ[RUNTIME_STREAM_AUTH_ENV] = "secret"
         with TestClient(app) as client:
             with client.websocket_connect(
-                    "/ws/runtime/events?heartbeat_seconds=1&workflow_id=workflow:keep&agent_id=agent:keep"
+                    "/ws/runtime/events?heartbeat_seconds=1&workflow_id=workflow:keep&agent_id=agent:keep",
+                    headers={"x-runtime-stream-key": "secret"},
             ) as websocket:
                 connected = websocket.receive_json()
                 self.assertEqual(connected["type"], "runtime_stream.connected")

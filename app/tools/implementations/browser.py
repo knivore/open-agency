@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from app.core.storage import upload_to_s3
+from app.core.outbound_http import validate_outbound_http_url
 from .browser_interaction import dismiss_common_overlays, humanize_page, sleep
 from .browser_navigation import goto_with_readiness
 from .browser_session import BrowserSessionManager
@@ -254,6 +255,7 @@ def open_browser(
         extra_http_headers: dict[str, str] | None = None,
         img_directory: str | None = None,
         headless_mode: bool | None = None,
+        _allowed_hosts: list[str] | None = None,
         **_: Any,
 ) -> Any:
     if not url:
@@ -280,6 +282,25 @@ def open_browser(
             "trace_name": re.sub(r"[^a-zA-Z0-9_-]+", "-", page_url_host(url)),
         },
     )
+    allowed_hosts = list(_allowed_hosts or [])
+    if manager.context is None:
+        raise RuntimeError("Browser context was not initialized")
+
+    def enforce_request_destination(route: Any, request: Any) -> None:
+        parsed = urlparse(request.url)
+        if parsed.scheme in {"data", "blob", "about"}:
+            route.continue_()
+            return
+        try:
+            # Playwright applies this to redirects and subresources as well as
+            # the initial navigation, closing policy gaps after page.goto().
+            validate_outbound_http_url(request.url, allowed_hosts=allowed_hosts)
+        except ValueError:
+            route.abort("blockedbyclient")
+            return
+        route.continue_()
+
+    manager.context.route("**/*", enforce_request_destination)
     navigation_state = goto_with_readiness(page, url)
     manager.merge_result(navigation_state)
     manager.merge_result(_capture_screenshot_artifact(page, img_directory))

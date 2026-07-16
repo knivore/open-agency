@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import os
 from collections.abc import AsyncIterator
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from starlette.responses import StreamingResponse
 from typing import Optional
 
+from app.api.context import ApiContext, get_default_api_context
+from app.api.identity import request_has_identity, resolve_current_user
 from app.runtime.streaming.event_bus import RuntimeEventBus, get_default_runtime_event_bus
 from app.runtime.streaming.stream_filters import RuntimeEventFilter
 from app.runtime.streaming.stream_safety import (
@@ -26,14 +29,16 @@ from app.runtime.streaming.stream_serialization import (
     runtime_stream_connected_payload,
     runtime_stream_heartbeat_payload,
 )
+from app.core.config import get_settings
 
 
 def authorize_runtime_sse_request(request: Request) -> None:
-    expected = os.getenv(RUNTIME_STREAM_AUTH_ENV)
+    expected = os.getenv(RUNTIME_STREAM_AUTH_ENV) or get_settings().agency_internal_api_key
     if not expected:
-        return
-    provided = request.headers.get("x-runtime-stream-key") or request.query_params.get("stream_key")
-    if provided != expected:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="Runtime stream authentication is not configured")
+    provided = request.headers.get("x-runtime-stream-key")
+    if not provided or not hmac.compare_digest(provided, expected):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Runtime stream auth failed")
 
 
@@ -79,7 +84,8 @@ async def runtime_event_sse_stream(
         await runtime_bus.unsubscribe(queue)
 
 
-def create_runtime_sse_router() -> APIRouter:
+def create_runtime_sse_router(context: ApiContext | None = None) -> APIRouter:
+    context = context or get_default_api_context()
     router = APIRouter(prefix="/api/runtime/events", tags=["Runtime Events"])
 
     @router.get("/stream", summary="Stream Runtime Events")
@@ -92,6 +98,12 @@ def create_runtime_sse_router() -> APIRouter:
             agent_id: str | None = None,
     ):
         authorize_runtime_sse_request(request)
+        if get_settings().app_env != "test" or request_has_identity(request):
+            current_user = await resolve_current_user(request, context, required_scopes=["executions:read"])
+            if "admin" not in current_user.roles:
+                # This stream spans executions and workflows, so a tenant-level
+                # principal cannot be authorized by an optional query filter.
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Administrator role is required")
         last_event_id = request.headers.get("last-event-id") or after
         event_filter = RuntimeEventFilter.from_query(workflow_id=workflow_id, agent_id=agent_id)
         return StreamingResponse(

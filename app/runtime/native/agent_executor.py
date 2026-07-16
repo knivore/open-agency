@@ -13,6 +13,8 @@ from dataclasses import asdict
 from typing import Any, Awaitable, Callable, Dict, List, Tuple
 from uuid import uuid4
 
+from jsonschema import ValidationError as JSONSchemaValidationError, validate
+
 from app.domain import (
     AgentDefinition,
     ContextCompactionRecord,
@@ -37,11 +39,15 @@ from app.runtime.governance.recorder import (
     record_token_usage_snapshot,
 )
 from app.runtime.governance.token_usage import normalize_token_usage
-from app.runtime.native.errors import ExecutionCancelledError, ExecutionPausedError, MaxIterationsReachedError
+from app.runtime.native.errors import (
+    ExecutionCancelledError,
+    ExecutionPausedError,
+    MaxIterationsReachedError,
+    ToolExecutionError,
+)
 from app.runtime.native.events import ExecutionEventEmitter
 from app.runtime.native.state import NativeExecutionState, record_graph_context_working_set_entry
 from app.runtime.native.tool_executor import ToolExecutor
-from app.tools.cli_discovery import list_builtin_tool_definitions
 from app.tools.names import tool_call_name
 
 MemoryPromptBuilder = Callable[
@@ -87,6 +93,115 @@ ProposalToolGraphContextRetriever = Callable[
     ],
     Awaitable[dict[str, Any] | None],
 ]
+ToolDefinitionLoader = Callable[[set[str]], Awaitable[list[ToolDefinition]]]
+
+
+_RUNTIME_WORKFLOW_METADATA_KEYS = {
+    "connector_bindings",
+    "discord_delivery",
+    "media_delivery",
+    "voice_delivery",
+    "voice_generation",
+}
+
+
+def _structured_model_output(content: Any, output_schema: dict[str, Any]) -> Any:
+    """Parse and validate declared structured outputs before routing uses them."""
+    if not output_schema:
+        return content
+    parsed = content
+    if isinstance(content, str):
+        stripped = content.strip()
+        if stripped.startswith(("{", "[")):
+            parsed = json.loads(stripped)
+    validate(instance=parsed, schema=output_schema)
+    return parsed
+
+
+def _structured_output_contract(output_schema: dict[str, Any]) -> str:
+    """Tell text-generation models the same contract enforced after their response."""
+    return (
+        "Final response contract: return only JSON that validates against this JSON Schema. "
+        "Include every required property and use only allowed enum values.\n"
+        f"{json.dumps(output_schema, sort_keys=True)}"
+    )
+
+
+def _structured_output_repair_message(
+        output_schema: dict[str, Any],
+        error: Exception,
+) -> str:
+    error_message = getattr(error, "message", str(error))
+    return (
+        "Your previous final response did not satisfy the task output schema. "
+        "Reformat the existing result only; do not call tools again or repeat side effects. "
+        f"Validation error: {error_message}.\n"
+        f"{_structured_output_contract(output_schema)}"
+    )
+
+
+def _dependency_outputs(
+        workflow: WorkflowDefinition,
+        task: TaskDefinition,
+        state: NativeExecutionState,
+) -> dict[str, Any]:
+    if not task.depends_on_task_ids:
+        return dict(state.node_outputs)
+    dependency_ids = set(task.depends_on_task_ids)
+    return {
+        node.task_id: state.node_outputs[node.id]
+        for node in workflow.nodes
+        if node.task_id in dependency_ids and node.id in state.node_outputs
+    }
+
+
+def _task_runtime_context(
+        workflow: WorkflowDefinition,
+        task: TaskDefinition,
+        execution: Execution,
+        state: NativeExecutionState,
+) -> dict[str, Any]:
+    workflow_metadata = {
+        key: value
+        for key, value in workflow.metadata.items()
+        if key in _RUNTIME_WORKFLOW_METADATA_KEYS
+    }
+    dependency_outputs = _dependency_outputs(workflow, task, state) if task.depends_on_task_ids else {}
+    if not task.metadata and not workflow_metadata and not dependency_outputs:
+        return {}
+    return {
+        "workflow_id": workflow.id,
+        "execution_id": execution.id,
+        "task_id": task.id,
+        "task_metadata": task.metadata,
+        "workflow_metadata": workflow_metadata,
+        "dependency_outputs": dependency_outputs,
+    }
+
+APPROVAL_CONTINUATION_KEY = "approval_continuation"
+
+
+def _json_safe(value: Any) -> Any:
+    return json.loads(json.dumps(value, default=str))
+
+
+def _model_message_from_payload(payload: dict[str, Any]) -> ModelMessage:
+    return ModelMessage(
+        role=payload.get("role", "user"),
+        content=payload.get("content"),
+        name=payload.get("name"),
+        tool_call_id=payload.get("tool_call_id"),
+        tool_calls=[
+            ModelToolCall(
+                id=item.get("id"),
+                name=str(item.get("name") or ""),
+                arguments=dict(item.get("arguments") or {}),
+            )
+            for item in payload.get("tool_calls", [])
+            if isinstance(item, dict)
+        ],
+        metadata=dict(payload.get("metadata") or {}),
+    )
 
 
 def _graph_context_prompt_for_task(
@@ -184,12 +299,14 @@ class AgentExecutor:
             self,
             tool_executor: ToolExecutor,
             *,
+            tool_definition_loader: ToolDefinitionLoader | None = None,
             memory_prompt_builder: MemoryPromptBuilder | None = None,
             context_compactor: ContextCompactor | None = None,
             context_compaction_graph_context_retriever: ContextCompactionGraphContextRetriever | None = None,
             proposal_tool_graph_context_retriever: ProposalToolGraphContextRetriever | None = None,
     ):
         self.tool_executor = tool_executor
+        self.tool_definition_loader = tool_definition_loader
         self.memory_prompt_builder = memory_prompt_builder
         self.context_compactor = context_compactor
         self.context_compaction_graph_context_retriever = context_compaction_graph_context_retriever
@@ -212,6 +329,8 @@ class AgentExecutor:
             task.instructions or "",
             f"Expected output: {task.expected_output}" if task.expected_output else "",
         ]
+        if task.output_schema:
+            system_parts.append(_structured_output_contract(task.output_schema))
         if self.memory_prompt_builder is not None:
             try:
                 memory_prompt = await self.memory_prompt_builder(
@@ -231,31 +350,42 @@ class AgentExecutor:
             system_parts.append(graph_context_prompt)
         if state.memory_entries:
             system_parts.append(f"Memory: {json.dumps(state.memory_entries)}")
-        if state.node_outputs:
-            system_parts.append(f"Previous node outputs: {json.dumps(state.node_outputs, default=str)}")
+        dependency_outputs = _dependency_outputs(workflow, task, state)
+        if dependency_outputs:
+            system_parts.append(f"Dependency outputs: {json.dumps(dependency_outputs, default=str)}")
 
+        runtime_context = _task_runtime_context(workflow, task, execution, state)
         user_content = {
             "workflow": workflow.name,
             "task": task.description,
             "input": execution_input,
         }
+        if runtime_context:
+            user_content["runtime_context"] = runtime_context
         return [
             ModelMessage(role="system", content="\n".join(part for part in system_parts if part)),
             ModelMessage(role="user", content=json.dumps(user_content, default=str)),
         ]
 
-    def _tool_payload(self, workflow: WorkflowDefinition, agent: AgentDefinition, task: TaskDefinition) -> List[
-        Dict[str, Any]]:
+    async def _tool_payload(
+            self,
+            workflow: WorkflowDefinition,
+            agent: AgentDefinition,
+            task: TaskDefinition,
+    ) -> List[Dict[str, Any]]:
         allowed_tool_ids = task.tool_ids or agent.tool_ids
-        workflow_tools_by_id = {tool.id: tool for tool in workflow.tool_definitions}
-        builtin_tools_by_id = {tool.id: tool for tool in list_builtin_tool_definitions()}
+        if self.tool_definition_loader is not None:
+            requested_tool_ids = set(allowed_tool_ids)
+            catalog_tools = await self.tool_definition_loader(requested_tool_ids)
+            self.tool_executor.register_catalog_tools(workflow.id, requested_tool_ids, catalog_tools)
         tools = []
         for tool_id in allowed_tool_ids:
             # Workflows often persist built-in Agency tools as IDs instead of embedding the
             # full definition. Resolve those IDs here so the model receives the same callable
             # surface the task/agent contract advertises.
-            tool = workflow_tools_by_id.get(tool_id) or builtin_tools_by_id.get(tool_id)
-            if tool is None:
+            try:
+                tool = self.tool_executor.resolve_tool(workflow, tool_id)
+            except ToolExecutionError:
                 continue
             tools.append(
                 {
@@ -951,6 +1081,211 @@ class AgentExecutor:
             tools=tool_payload if tool_payload else None,
         )
 
+    @staticmethod
+    def _approval_continuation(execution: Execution, task: TaskDefinition) -> dict[str, Any] | None:
+        output_payload = execution.output_payload if isinstance(execution.output_payload, dict) else {}
+        checkpoint = output_payload.get("checkpoint")
+        if not isinstance(checkpoint, dict):
+            return None
+        continuation = checkpoint.get(APPROVAL_CONTINUATION_KEY)
+        if not isinstance(continuation, dict) or continuation.get("task_id") != task.id:
+            return None
+        return continuation
+
+    async def _persist_approval_continuation(
+            self,
+            *,
+            execution: Execution,
+            state: NativeExecutionState,
+            task: TaskDefinition,
+            agent: AgentDefinition,
+            iteration: int,
+            messages: List[ModelMessage],
+            tool_calls: list[tuple[ModelToolCall, str]],
+            pending_tool_index: int,
+            pending_context_persisted: bool = True,
+    ) -> None:
+        store = self.tool_executor.approval_manager.execution_store
+        if store is None:
+            raise RuntimeError("Durable approval continuation requires an execution store.")
+        payload = dict(execution.output_payload or {})
+        payload["node_outputs"] = dict(state.node_outputs)
+        checkpoint = dict(payload.get("checkpoint") or {})
+        checkpoint.update({
+            "current_node_id": state.current_node_id,
+            "current_task_id": state.current_task_id,
+            "completed_node_ids": list(state.node_outputs.keys()),
+            "node_outcomes": dict(state.node_outcomes),
+            "node_errors": dict(state.node_errors),
+            # Tool-call evidence must survive an approval pause so delivery
+            # contracts cannot be bypassed or falsely failed after resume.
+            "task_tool_results": _json_safe(state.task_tool_results),
+            "planned_node_ids": list(state.planned_node_ids),
+            "terminal_node_ids": list(state.terminal_node_ids),
+            APPROVAL_CONTINUATION_KEY: {
+                "version": 1,
+                "task_id": task.id,
+                "agent_id": agent.id,
+                "iteration": iteration,
+                "pending_tool_index": pending_tool_index,
+                "pending_context_persisted": pending_context_persisted,
+                "messages": _json_safe([asdict(message) for message in messages]),
+                "tool_calls": _json_safe([
+                    {"id": call_id, "name": tool_call.name, "arguments": tool_call.arguments}
+                    for tool_call, call_id in tool_calls
+                ]),
+            },
+        })
+        payload["checkpoint"] = checkpoint
+        execution.output_payload = payload
+        await store.update_execution(execution)
+
+    async def _execute_tool_calls(
+            self,
+            *,
+            workflow: WorkflowDefinition,
+            task: TaskDefinition,
+            agent: AgentDefinition,
+            profile: ModelProfileDefinition,
+            execution: Execution,
+            state: NativeExecutionState,
+            emitter: ExecutionEventEmitter,
+            messages: List[ModelMessage],
+            tool_calls: list[tuple[ModelToolCall, str]],
+            context_health: ContextHealth,
+            budget_statuses: list[TokenBudgetStatus],
+            iteration: int,
+            start_index: int = 0,
+            first_context_already_persisted: bool = False,
+    ) -> List[ModelMessage]:
+        for tool_index in range(start_index, len(tool_calls)):
+            tool_call, call_id = tool_calls[tool_index]
+            resolved_tool = None
+            try:
+                resolved_tool = self.tool_executor.resolve_tool(
+                    workflow,
+                    call_id,
+                    tool_name=tool_call.name,
+                )
+            except Exception:
+                resolved_tool = None
+
+            skip_context = first_context_already_persisted and tool_index == start_index
+            if not skip_context:
+                proposal_context_entry = await self._maybe_retrieve_graph_context_before_proposal_tool(
+                    workflow=workflow,
+                    task=task,
+                    agent=agent,
+                    execution=execution,
+                    state=state,
+                    emitter=emitter,
+                    tool=resolved_tool,
+                    arguments=tool_call.arguments,
+                    tool_call_id=call_id,
+                    context_health=context_health,
+                    budget_statuses=budget_statuses,
+                )
+                if proposal_context_entry:
+                    graph_context_message = _graph_context_message(
+                        proposal_context_entry,
+                        trigger="proposal_tool",
+                    )
+                    projected_health = estimate_context_health(
+                        [*messages, graph_context_message],
+                        model_profile=profile,
+                        reserved_completion_tokens=profile.max_tokens,
+                    )
+                    if projected_health.status in {"critical", "overflow"}:
+                        await emitter.emit(
+                            state,
+                            ExecutionEventType.AGENT_MESSAGE_CREATED,
+                            actor=agent.name,
+                            payload={
+                                "source": "runtime_graph_context",
+                                "trigger": "proposal_tool",
+                                "status": "skipped",
+                                "reason": "projected_context_health_guard",
+                                "skip_reason": "graph_context_would_exceed_context_health",
+                                "context_status": projected_health.status,
+                                "context_usage_ratio": projected_health.usage_ratio,
+                                "remaining_context_tokens": projected_health.remaining_context_tokens,
+                                "tool_id": resolved_tool.id if resolved_tool is not None else None,
+                                "tool_name": resolved_tool.name if resolved_tool is not None else tool_call.name,
+                                "tool_call_id": call_id,
+                            },
+                            metadata={"runtime_graph_context": True, "auto_retrieval": True, "skipped": True},
+                            agent_id=agent.id,
+                            task_id=task.id,
+                        )
+                    else:
+                        messages.append(graph_context_message)
+
+            requires_approval = bool(
+                resolved_tool is not None and resolved_tool.security.approval_required
+            )
+            if requires_approval:
+                # Persist immediately before entering the approval boundary.
+                # Earlier tool results are already in messages, so resume starts
+                # at this exact call instead of replaying prior side effects.
+                await self._persist_approval_continuation(
+                    execution=execution,
+                    state=state,
+                    task=task,
+                    agent=agent,
+                    iteration=iteration,
+                    messages=messages,
+                    tool_calls=tool_calls,
+                    pending_tool_index=tool_index,
+                )
+
+            tool_result = await self.tool_executor.execute(
+                workflow,
+                state,
+                emitter,
+                tool_id=call_id,
+                tool_name=tool_call.name,
+                arguments=tool_call.arguments,
+            )
+            state.task_tool_results.setdefault(task.id, []).append(
+                {
+                    "tool_id": resolved_tool.id if resolved_tool is not None else tool_call.name,
+                    "result": tool_result,
+                }
+            )
+            state.memory_entries.append(
+                {"tool_name": tool_call.name, "arguments": tool_call.arguments, "output": tool_result}
+            )
+            messages.append(
+                ModelMessage(
+                    role="tool",
+                    content=json.dumps(tool_result, default=str),
+                    name=tool_call.name,
+                    tool_call_id=call_id,
+                )
+            )
+            if requires_approval:
+                current = await self.tool_executor.approval_manager.execution_store.get_execution(execution.id)
+                if current is not None:
+                    # Merge lifecycle fields changed by the approval request
+                    # before advancing the durable transcript past the side effect.
+                    execution.metadata = dict(current.metadata or {})
+                    execution.input_payload = dict(current.input_payload or {})
+                    execution.status = current.status
+                    execution.worker_id = current.worker_id
+                    execution.last_heartbeat_at = current.last_heartbeat_at
+                await self._persist_approval_continuation(
+                    execution=execution,
+                    state=state,
+                    task=task,
+                    agent=agent,
+                    iteration=iteration,
+                    messages=messages,
+                    tool_calls=tool_calls,
+                    pending_tool_index=tool_index + 1,
+                    pending_context_persisted=False,
+                )
+        return messages
+
     async def execute_task(
             self,
             workflow: WorkflowDefinition,
@@ -965,7 +1300,7 @@ class AgentExecutor:
     ) -> Tuple[Any, List[ModelMessage]]:
         messages = await self._build_messages(workflow, task, agent, execution, execution_input, state)
         max_iterations = int(agent.framework_hints.adapter_config.get("max_iterations", 5))
-        tool_payload = self._tool_payload(workflow, agent, task)
+        tool_payload = await self._tool_payload(workflow, agent, task)
         token_budget_policy = resolve_token_budget_policy(
             workflow=workflow,
             task=task,
@@ -973,7 +1308,61 @@ class AgentExecutor:
             execution=execution,
         )
 
-        for iteration in range(1, max_iterations + 1):
+        first_iteration = 1
+        structured_output_repair = False
+        continuation = self._approval_continuation(execution, task)
+        if continuation is not None:
+            persisted_messages = continuation.get("messages")
+            persisted_tool_calls = continuation.get("tool_calls")
+            if not isinstance(persisted_messages, list) or not isinstance(persisted_tool_calls, list):
+                raise ValueError("Approval continuation is missing its persisted agent transcript.")
+            messages = [
+                _model_message_from_payload(item)
+                for item in persisted_messages
+                if isinstance(item, dict)
+            ]
+            resumed_tool_calls = [
+                (
+                    ModelToolCall(
+                        id=item.get("id"),
+                        name=str(item.get("name") or ""),
+                        arguments=dict(item.get("arguments") or {}),
+                    ),
+                    str(item.get("id") or f"tool-call-{uuid4()}"),
+                )
+                for item in persisted_tool_calls
+                if isinstance(item, dict)
+            ]
+            resumed_iteration = max(1, int(continuation.get("iteration") or 1))
+            pending_tool_index = max(0, int(continuation.get("pending_tool_index") or 0))
+            resumed_context_health = estimate_context_health(
+                messages,
+                model_profile=profile,
+                reserved_completion_tokens=profile.max_tokens,
+            )
+            messages = await self._execute_tool_calls(
+                workflow=workflow,
+                task=task,
+                agent=agent,
+                profile=profile,
+                execution=execution,
+                state=state,
+                emitter=emitter,
+                messages=messages,
+                tool_calls=resumed_tool_calls,
+                context_health=resumed_context_health,
+                budget_statuses=[],
+                iteration=resumed_iteration,
+                start_index=pending_tool_index,
+                first_context_already_persisted=continuation.get("pending_context_persisted") is not False,
+            )
+            first_iteration = resumed_iteration + 1
+
+        # One schema-only repair turn is allowed beyond the ordinary tool loop.
+        # It receives no tools, preventing a formatting correction from replaying side effects.
+        for iteration in range(first_iteration, max_iterations + 2):
+            if iteration > max_iterations and not structured_output_repair:
+                break
             self._assert_not_interrupted(state)
             model_request_id = str(uuid4())
             log_prompts = bool(workflow.metadata.get("log_prompts", True))
@@ -1020,7 +1409,7 @@ class AgentExecutor:
                     state=state,
                     emitter=emitter,
                     messages=messages,
-                    tool_payload=tool_payload,
+                    tool_payload=[] if structured_output_repair else tool_payload,
                     context_health=context_health,
                     iteration=iteration,
                     model_request_id=model_request_id,
@@ -1076,7 +1465,7 @@ class AgentExecutor:
                     state=state,
                     emitter=emitter,
                     messages=messages,
-                    tool_payload=tool_payload,
+                    tool_payload=[] if structured_output_repair else tool_payload,
                     context_health=context_health,
                     iteration=iteration,
                     model_request_id=model_request_id,
@@ -1255,82 +1644,20 @@ class AgentExecutor:
                         agent_id=agent.id,
                         task_id=task.id,
                     )
-                for tool_call, call_id in normalized_tool_calls:
-                    resolved_tool = None
-                    try:
-                        resolved_tool = self.tool_executor.resolve_tool(
-                            workflow,
-                            call_id,
-                            tool_name=tool_call.name,
-                        )
-                    except Exception:
-                        resolved_tool = None
-                    proposal_context_entry = await self._maybe_retrieve_graph_context_before_proposal_tool(
-                        workflow=workflow,
-                        task=task,
-                        agent=agent,
-                        execution=execution,
-                        state=state,
-                        emitter=emitter,
-                        tool=resolved_tool,
-                        arguments=tool_call.arguments,
-                        tool_call_id=call_id,
-                        context_health=context_health,
-                        budget_statuses=budget_statuses,
-                    )
-                    if proposal_context_entry:
-                        graph_context_message = _graph_context_message(
-                            proposal_context_entry,
-                            trigger="proposal_tool",
-                        )
-                        projected_health = estimate_context_health(
-                            [*messages, graph_context_message],
-                            model_profile=profile,
-                            reserved_completion_tokens=profile.max_tokens,
-                        )
-                        if projected_health.status in {"critical", "overflow"}:
-                            await emitter.emit(
-                                state,
-                                ExecutionEventType.AGENT_MESSAGE_CREATED,
-                                actor=agent.name,
-                                payload={
-                                    "source": "runtime_graph_context",
-                                    "trigger": "proposal_tool",
-                                    "status": "skipped",
-                                    "reason": "projected_context_health_guard",
-                                    "skip_reason": "graph_context_would_exceed_context_health",
-                                    "context_status": projected_health.status,
-                                    "context_usage_ratio": projected_health.usage_ratio,
-                                    "remaining_context_tokens": projected_health.remaining_context_tokens,
-                                    "tool_id": resolved_tool.id if resolved_tool is not None else None,
-                                    "tool_name": resolved_tool.name if resolved_tool is not None else tool_call.name,
-                                    "tool_call_id": call_id,
-                                },
-                                metadata={"runtime_graph_context": True, "auto_retrieval": True, "skipped": True},
-                                agent_id=agent.id,
-                                task_id=task.id,
-                            )
-                        else:
-                            messages.append(graph_context_message)
-                    tool_result = await self.tool_executor.execute(
-                        workflow,
-                        state,
-                        emitter,
-                        tool_id=call_id,
-                        tool_name=tool_call.name,
-                        arguments=tool_call.arguments,
-                    )
-                    state.memory_entries.append(
-                        {"tool_name": tool_call.name, "arguments": tool_call.arguments, "output": tool_result}
-                    )
-                    messages.append(
-                        ModelMessage(
-                            role="tool",
-                            content=json.dumps(tool_result, default=str),
-                            name=tool_call.name,
-                            tool_call_id=call_id,
-                        )
-                    )
+                messages = await self._execute_tool_calls(
+                    workflow=workflow,
+                    task=task,
+                    agent=agent,
+                    profile=profile,
+                    execution=execution,
+                    state=state,
+                    emitter=emitter,
+                    messages=messages,
+                    tool_calls=normalized_tool_calls,
+                    context_health=context_health,
+                    budget_statuses=budget_statuses,
+                    iteration=iteration,
+                )
                 if token_budget_policy is not None and token_budget_policy.action == "compact_context":
                     messages = await self._enforce_token_budget_action(
                         workflow=workflow,
@@ -1361,7 +1688,19 @@ class AgentExecutor:
                     task_id=task.id,
                 )
 
-            return response.content, messages
+            try:
+                return _structured_model_output(response.content, task.output_schema), messages
+            except (JSONSchemaValidationError, json.JSONDecodeError) as exc:
+                if structured_output_repair:
+                    raise
+                messages.append(
+                    ModelMessage(
+                        role="user",
+                        content=_structured_output_repair_message(task.output_schema, exc),
+                    )
+                )
+                structured_output_repair = True
+                continue
 
         raise MaxIterationsReachedError(f"Max iterations reached for task '{task.id}'")
 

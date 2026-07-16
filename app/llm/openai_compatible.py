@@ -23,7 +23,7 @@ class OpenAICompatibleModelClient:
         self.api_key = (
                 profile.api_key_ref
                 or self._provider_env_api_key()
-                or env_config.local_openai_api_key
+                or self._local_endpoint_api_key()
                 or "not-required"
         )
         self.client = OpenAI(base_url=self.base_url, api_key=self.api_key)
@@ -39,13 +39,28 @@ class OpenAICompatibleModelClient:
             )
         return None
 
+    def _local_endpoint_api_key(self) -> Optional[str]:
+        configured_url = self.env_config.local_openai_base_url
+        if not configured_url or not self.env_config.local_openai_api_key or not self.base_url:
+            return None
+        if self.base_url.strip().rstrip("/") != configured_url.strip().rstrip("/"):
+            return None
+        # The local gateway credential is a destination-bound capability, not a
+        # fallback for every operator-allowlisted compatible endpoint.
+        return self.env_config.local_openai_api_key
+
     def _provider_env_api_key(self) -> Optional[str]:
         provider = self.profile.provider.strip().lower().replace("-", "_")
         if provider == "deepseek":
             return self.env_config.deepseek_api_key
         if provider == "qwen":
             return self.env_config.qwen_api_key
-        return self.env_config.openai_api_key
+        if provider == "openai":
+            return self.env_config.openai_api_key
+        # Custom compatible endpoints must never inherit the credential for the
+        # official OpenAI service; doing so turns an endpoint choice into a
+        # credential-exfiltration primitive.
+        return None
 
     def _to_openai_messages(self, messages: List[ModelMessage]) -> List[Dict[str, Any]]:
         payload = []

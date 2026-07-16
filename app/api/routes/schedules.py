@@ -5,7 +5,8 @@ from pydantic import ValidationError
 from typing import Any, Optional
 
 from app.api.context import ApiContext, get_default_api_context
-from app.api.identity import resolve_current_user_if_present
+from app.api.identity import resolve_current_user, resolve_current_user_if_present
+from app.core.config import get_settings
 from app.scheduler.scheduler import ScheduleConcurrencyError
 from app.services.schedules import ScheduleService
 from ._crud import serializable_validation_errors
@@ -16,9 +17,14 @@ def create_schedules_router(context: Optional[ApiContext] = None) -> APIRouter:
     service = ScheduleService(context)
     router = APIRouter(prefix="/schedules", tags=["Schedules"])
 
+    async def require_schedule_user(request: Request, *, scopes: list[str]):
+        if get_settings().app_env == "test":
+            return await resolve_current_user_if_present(request, context, required_scopes=scopes)
+        return await resolve_current_user(request, context, required_scopes=scopes)
+
     @router.post("", summary="Create Schedule")
     async def create_schedule(payload: dict[str, Any], request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["schedules:write"])
+        await require_schedule_user(request, scopes=["schedules:write"])
         try:
             created = await service.create_schedule(payload)
         except ValidationError as exc:
@@ -30,13 +36,13 @@ def create_schedules_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @router.get("", summary="List Schedules")
     async def list_schedules(request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["schedules:read"])
+        await require_schedule_user(request, scopes=["schedules:read"])
         items = await context.schedule_repo.list()
         return {"items": [item.model_dump(mode="json") for item in items]}
 
     @router.get("/{schedule_id}", summary="Get Schedule By Id")
     async def get_schedule(schedule_id: str, request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["schedules:read"])
+        await require_schedule_user(request, scopes=["schedules:read"])
         item = await context.schedule_repo.get(schedule_id)
         if item is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Schedule '{schedule_id}' not found")
@@ -44,7 +50,7 @@ def create_schedules_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @router.patch("/{schedule_id}", summary="Patch Schedule")
     async def patch_schedule(schedule_id: str, patch: dict[str, Any], request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["schedules:write"])
+        await require_schedule_user(request, scopes=["schedules:write"])
         try:
             item = await service.patch_schedule(schedule_id, patch)
         except ValidationError as exc:
@@ -62,7 +68,7 @@ def create_schedules_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @router.post("/{schedule_id}/enable", summary="Enable Schedule")
     async def enable_schedule(schedule_id: str, request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["schedules:write"])
+        await require_schedule_user(request, scopes=["schedules:write"])
         item = await service.enable_schedule(schedule_id)
         if item is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Schedule '{schedule_id}' not found")
@@ -70,7 +76,7 @@ def create_schedules_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @router.post("/{schedule_id}/disable", summary="Disable Schedule")
     async def disable_schedule(schedule_id: str, request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["schedules:write"])
+        await require_schedule_user(request, scopes=["schedules:write"])
         item = await service.disable_schedule(schedule_id)
         if item is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Schedule '{schedule_id}' not found")
@@ -78,7 +84,7 @@ def create_schedules_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @router.post("/{schedule_id}/trigger-now", summary="Trigger Schedule Now")
     async def trigger_schedule_now(schedule_id: str, request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["schedules:write"])
+        await require_schedule_user(request, scopes=["schedules:write"])
         try:
             result = await service.trigger_now(schedule_id)
         except ValueError as exc:
@@ -94,7 +100,7 @@ def create_schedules_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @router.post("/events/dispatch", summary="Dispatch Schedule Event")
     async def dispatch_schedule_event(payload: dict[str, Any], request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["schedules:write"])
+        await require_schedule_user(request, scopes=["schedules:write"])
         try:
             results = await service.dispatch_event(payload)
         except ValueError as exc:
@@ -114,7 +120,7 @@ def create_schedules_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @router.delete("/{schedule_id}", summary="Soft Delete Schedule")
     async def delete_schedule(schedule_id: str, request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["schedules:write"])
+        await require_schedule_user(request, scopes=["schedules:write"])
         deleted = await context.schedule_repo.soft_delete(schedule_id)
         if not deleted:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Schedule '{schedule_id}' not found")

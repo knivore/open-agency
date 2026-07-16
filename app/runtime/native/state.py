@@ -5,14 +5,22 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 from typing import Any, Dict, List, Optional, Protocol
 from uuid import uuid4
 
 from app.core.config import get_settings
 from app.core.time import utc_now
-from app.db.models import ApprovalRequestORM, ExecutionArtifactORM, ExecutionEventORM, ExecutionORM, ToolInvocationORM
+from app.db.models import (
+    ApprovalRequestORM,
+    ExecutionArtifactORM,
+    ExecutionEventORM,
+    ExecutionORM,
+    ExecutionWaitORM,
+    ToolInvocationORM,
+)
 from app.db.repositories import (
     InMemoryExecutionArtifactRepository,
     InMemoryExecutionEventRepository,
@@ -26,6 +34,8 @@ from app.domain import (
     ExecutionArtifact,
     ExecutionEvent,
     ExecutionEventType,
+    ExecutionWait,
+    ExecutionWaitStatus,
     GraphProjectionEvent,
     ModelProfileDefinition,
     WorkflowDefinition,
@@ -47,6 +57,12 @@ GRAPH_PROJECTED_EXECUTION_EVENT_TYPES = {
     ExecutionEventType.CONTEXT_COMPACTION_STARTED,
     ExecutionEventType.CONTEXT_HEALTH_RECORDED,
     ExecutionEventType.EXECUTION_STARTED,
+    ExecutionEventType.EXECUTION_CYCLE_STARTED,
+    ExecutionEventType.EXECUTION_CYCLE_COMPLETED,
+    ExecutionEventType.EXECUTION_CYCLE_FAILED,
+    ExecutionEventType.EXECUTION_CYCLE_GUARD_TRIGGERED,
+    ExecutionEventType.EXECUTION_WAITING,
+    ExecutionEventType.EXECUTION_WOKEN,
     ExecutionEventType.EXECUTION_COMPLETED,
     ExecutionEventType.EXECUTION_FAILED,
     ExecutionEventType.LLM_REQUEST_CREATED,
@@ -126,6 +142,9 @@ class NativeExecutionState:
     cancelled: bool = False
     sequence: int = 0
     node_outputs: Dict[str, Any] = field(default_factory=dict)
+    node_outcomes: Dict[str, str] = field(default_factory=dict)
+    node_errors: Dict[str, str] = field(default_factory=dict)
+    task_tool_results: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
     memory_entries: List[Dict[str, Any]] = field(default_factory=list)
     graph_context_entries: List[Dict[str, Any]] = field(default_factory=list)
     graph_working_sets: Dict[str, GraphWorkingSet] = field(default_factory=dict)
@@ -502,7 +521,51 @@ class ExecutionStore(Protocol):
     async def update_approval_request(self, request_id: str, *, status: str, response_payload: dict[str, Any],
                                       responded_by: str | None = None) -> None: ...
 
+    async def get_approval_request(self, request_id: str) -> dict[str, Any] | None: ...
+
+    async def resolve_pending_approval_request(
+            self,
+            *,
+            execution_id: str,
+            tool_id: str,
+            status: str,
+            response_payload: dict[str, Any],
+            responded_by: str | None = None,
+    ) -> dict[str, Any] | None: ...
+
     async def list_approval_requests(self, execution_id: str) -> list[dict[str, Any]]: ...
+
+    async def create_execution_wait(self, wait: ExecutionWait) -> ExecutionWait: ...
+
+    async def get_execution_wait(self, wait_id: str) -> ExecutionWait | None: ...
+
+    async def list_execution_waits(
+            self,
+            execution_id: str,
+            *,
+            status: ExecutionWaitStatus | None = None,
+    ) -> list[ExecutionWait]: ...
+
+    async def resolve_execution_wait(
+            self,
+            wait_id: str,
+            *,
+            status: ExecutionWaitStatus,
+            resolution_key: str,
+            resolution_payload: dict[str, Any],
+            resolved_by: str | None,
+    ) -> tuple[ExecutionWait | None, bool]: ...
+
+    async def list_due_execution_waits(self, *, before: datetime, limit: int = 100) -> list[ExecutionWait]: ...
+
+    async def list_expired_execution_waits(self, *, before: datetime, limit: int = 100) -> list[ExecutionWait]: ...
+
+    async def list_pending_execution_waits_by_correlation(
+            self,
+            correlation_key: str,
+            *,
+            limit: int = 100,
+    ) -> list[ExecutionWait]: ...
 
     async def acquire_lock(self, execution_id: str, worker_id: str, stale_after_seconds: int = 30) -> bool: ...
 
@@ -743,6 +806,57 @@ def _approval_request_from_orm(orm: ApprovalRequestORM) -> dict[str, Any]:
     }
 
 
+def _execution_wait_to_orm(wait: ExecutionWait) -> ExecutionWaitORM:
+    return ExecutionWaitORM(
+        id=wait.id,
+        execution_id=wait.execution_id,
+        kind=wait.kind.value,
+        status=wait.status.value,
+        idempotency_key=wait.idempotency_key,
+        active_slot="active" if wait.status == ExecutionWaitStatus.PENDING else None,
+        correlation_key=wait.correlation_key,
+        checkpoint_json=wait.checkpoint,
+        request_payload_json=wait.request_payload,
+        policy_json=wait.policy,
+        resolution_payload_json=wait.resolution_payload,
+        resolution_key=wait.resolution_key,
+        wake_at=wait.wake_at,
+        deadline_at=wait.deadline_at,
+        resolved_at=wait.resolved_at,
+        resolved_by=wait.resolved_by,
+        metadata_json=wait.metadata,
+        created_at=wait.created_at,
+        updated_at=wait.updated_at,
+    )
+
+
+def _execution_wait_from_orm(orm: ExecutionWaitORM) -> ExecutionWait:
+    return ExecutionWait.model_validate(
+        {
+            "id": orm.id,
+            "execution_id": orm.execution_id,
+            "kind": orm.kind,
+            "status": orm.status,
+            "idempotency_key": orm.idempotency_key,
+            "correlation_key": orm.correlation_key,
+            "checkpoint": dict(orm.checkpoint_json or {}),
+            "request_payload": dict(orm.request_payload_json or {}),
+            "policy": dict(orm.policy_json or {}),
+            "resolution_payload": (
+                dict(orm.resolution_payload_json) if isinstance(orm.resolution_payload_json, dict) else None
+            ),
+            "resolution_key": orm.resolution_key,
+            "wake_at": orm.wake_at,
+            "deadline_at": orm.deadline_at,
+            "resolved_at": orm.resolved_at,
+            "resolved_by": orm.resolved_by,
+            "created_at": orm.created_at,
+            "updated_at": orm.updated_at,
+            "metadata": dict(orm.metadata_json or {}),
+        }
+    )
+
+
 class InMemoryWorkflowRepository:
     def __init__(self):
         self._workflows: Dict[str, WorkflowDefinition] = {}
@@ -776,6 +890,7 @@ class InMemoryExecutionStore:
         self._events = self.event_repository._items
         self._artifacts = self.artifact_repository._items
         self._approval_requests: Dict[str, dict[str, Any]] = {}
+        self._waits: Dict[str, ExecutionWait] = {}
 
     async def save_execution(self, execution: Execution) -> Execution:
         existing = await self.execution_repository.get_execution(execution.id)
@@ -815,7 +930,16 @@ class InMemoryExecutionStore:
         return await self.artifact_repository.list_artifacts(execution_id)
 
     async def list_active_executions(self) -> List[Execution]:
-        active = {"queued", "running", "waiting_for_approval", "paused", "cancelling"}
+        active = {
+            "queued",
+            "running",
+            "waiting_for_input",
+            "waiting_for_approval",
+            "waiting_for_event",
+            "sleeping",
+            "paused",
+            "cancelling",
+        }
         return await self.execution_repository.list_executions(filters={"status_in": active})
 
     async def list_executions_by_workflow(self, workflow_id: str) -> List[Execution]:
@@ -837,11 +961,16 @@ class InMemoryExecutionStore:
             for request_id, request in self._approval_requests.items()
             if request.get("execution_id") != execution_id
         }
+        self._waits = {
+            wait_id: wait
+            for wait_id, wait in self._waits.items()
+            if wait.execution_id != execution_id
+        }
         return deleted
 
     async def create_approval_request(self, *, execution_id: str, event_id: str | None, tool_id: str, status: str,
                                       payload: dict[str, Any]) -> str:
-        request_id = f"{execution_id}:{tool_id}"[:64]
+        request_id = str(uuid4())
         self._approval_requests[request_id] = {
             "id": request_id,
             "execution_id": execution_id,
@@ -869,6 +998,39 @@ class InMemoryExecutionStore:
             "responded_by": responded_by,
         }
 
+    async def get_approval_request(self, request_id: str) -> dict[str, Any] | None:
+        current = self._approval_requests.get(request_id)
+        return dict(current) if current is not None else None
+
+    async def resolve_pending_approval_request(
+            self,
+            *,
+            execution_id: str,
+            tool_id: str,
+            status: str,
+            response_payload: dict[str, Any],
+            responded_by: str | None = None,
+    ) -> dict[str, Any] | None:
+        matches = [
+            item
+            for item in self._approval_requests.values()
+            if item.get("execution_id") == execution_id and item.get("tool_id") == tool_id
+        ]
+        if not matches:
+            return None
+        current = max(matches, key=lambda item: (item.get("requested_at") or "", item.get("id") or ""))
+        if current.get("status") == status:
+            return dict(current)
+        if current.get("status") != "pending":
+            return None
+        await self.update_approval_request(
+            str(current["id"]),
+            status=status,
+            response_payload=response_payload,
+            responded_by=responded_by,
+        )
+        return await self.get_approval_request(str(current["id"]))
+
     async def list_approval_requests(self, execution_id: str) -> list[dict[str, Any]]:
         items = [
             dict(item)
@@ -876,6 +1038,94 @@ class InMemoryExecutionStore:
             if item.get("execution_id") == execution_id
         ]
         return sorted(items, key=lambda item: (item.get("requested_at") or "", item.get("id") or ""))
+
+    async def create_execution_wait(self, wait: ExecutionWait) -> ExecutionWait:
+        existing = next(
+            (
+                item for item in self._waits.values()
+                if item.execution_id == wait.execution_id and item.idempotency_key == wait.idempotency_key
+            ),
+            None,
+        )
+        if existing is not None:
+            return existing
+        if wait.status == ExecutionWaitStatus.PENDING and any(
+                item.execution_id == wait.execution_id and item.status == ExecutionWaitStatus.PENDING
+                for item in self._waits.values()
+        ):
+            raise ValueError(f"Execution '{wait.execution_id}' already has a pending wait.")
+        self._waits[wait.id] = wait
+        return wait
+
+    async def get_execution_wait(self, wait_id: str) -> ExecutionWait | None:
+        return self._waits.get(wait_id)
+
+    async def list_execution_waits(
+            self,
+            execution_id: str,
+            *,
+            status: ExecutionWaitStatus | None = None,
+    ) -> list[ExecutionWait]:
+        items = [wait for wait in self._waits.values() if wait.execution_id == execution_id]
+        if status is not None:
+            items = [wait for wait in items if wait.status == status]
+        return sorted(items, key=lambda wait: (wait.created_at, wait.id))
+
+    async def resolve_execution_wait(
+            self,
+            wait_id: str,
+            *,
+            status: ExecutionWaitStatus,
+            resolution_key: str,
+            resolution_payload: dict[str, Any],
+            resolved_by: str | None,
+    ) -> tuple[ExecutionWait | None, bool]:
+        wait = self._waits.get(wait_id)
+        if wait is None:
+            return None, False
+        if wait.status != ExecutionWaitStatus.PENDING:
+            return (wait, False) if wait.resolution_key == resolution_key else (None, False)
+        now = utc_now()
+        updated = wait.model_copy(
+            update={
+                "status": status,
+                "resolution_key": resolution_key,
+                "resolution_payload": dict(resolution_payload),
+                "resolved_at": now,
+                "resolved_by": resolved_by,
+                "updated_at": now,
+            }
+        )
+        self._waits[wait_id] = updated
+        return updated, True
+
+    async def list_due_execution_waits(self, *, before: datetime, limit: int = 100) -> list[ExecutionWait]:
+        due = [
+            wait for wait in self._waits.values()
+            if wait.status == ExecutionWaitStatus.PENDING and wait.wake_at is not None and wait.wake_at <= before
+        ]
+        return sorted(due, key=lambda wait: (wait.wake_at, wait.created_at, wait.id))[:limit]
+
+    async def list_expired_execution_waits(self, *, before: datetime, limit: int = 100) -> list[ExecutionWait]:
+        expired = [
+            wait for wait in self._waits.values()
+            if wait.status == ExecutionWaitStatus.PENDING
+            and wait.deadline_at is not None
+            and wait.deadline_at <= before
+        ]
+        return sorted(expired, key=lambda wait: (wait.deadline_at, wait.created_at, wait.id))[:limit]
+
+    async def list_pending_execution_waits_by_correlation(
+            self,
+            correlation_key: str,
+            *,
+            limit: int = 100,
+    ) -> list[ExecutionWait]:
+        matches = [
+            wait for wait in self._waits.values()
+            if wait.status == ExecutionWaitStatus.PENDING and wait.correlation_key == correlation_key
+        ]
+        return sorted(matches, key=lambda wait: (wait.created_at, wait.id))[:limit]
 
     async def acquire_lock(self, execution_id: str, worker_id: str, stale_after_seconds: int = 30) -> bool:
         execution = self._executions.get(execution_id)
@@ -920,6 +1170,7 @@ class MongoExecutionStore:
         self._executions = self.execution_repository.collection
         self._events = self.event_repository.collection
         self._artifacts = self.artifact_repository.collection
+        self._waits = self._db["execution_waits"]
 
     async def save_execution(self, execution: Execution) -> Execution:
         existing = await self.execution_repository.get_execution(execution.id)
@@ -955,7 +1206,16 @@ class MongoExecutionStore:
         return await self.artifact_repository.list_artifacts(execution_id)
 
     async def list_active_executions(self) -> List[Execution]:
-        active = ["queued", "running", "waiting_for_approval", "paused", "cancelling"]
+        active = [
+            "queued",
+            "running",
+            "waiting_for_input",
+            "waiting_for_approval",
+            "waiting_for_event",
+            "sleeping",
+            "paused",
+            "cancelling",
+        ]
         return await self.execution_repository.list_executions(filters={"status_in": active})
 
     async def list_executions_by_workflow(self, workflow_id: str) -> List[Execution]:
@@ -974,7 +1234,111 @@ class MongoExecutionStore:
         deleted = await self.execution_repository.delete_execution(execution_id)
         await self._events.delete_many({"execution_id": execution_id})
         await self._artifacts.delete_many({"execution_id": execution_id})
+        await self._waits.delete_many({"execution_id": execution_id})
         return deleted
+
+    async def create_execution_wait(self, wait: ExecutionWait) -> ExecutionWait:
+        existing = await self._waits.find_one(
+            {"execution_id": wait.execution_id, "idempotency_key": wait.idempotency_key}
+        )
+        if existing is not None:
+            existing.pop("_id", None)
+            return ExecutionWait.model_validate(existing)
+        if wait.status == ExecutionWaitStatus.PENDING and await self._waits.find_one(
+                {"execution_id": wait.execution_id, "status": ExecutionWaitStatus.PENDING.value}
+        ) is not None:
+            raise ValueError(f"Execution '{wait.execution_id}' already has a pending wait.")
+        await self._waits.insert_one(wait.model_dump(mode="python"))
+        return wait
+
+    async def get_execution_wait(self, wait_id: str) -> ExecutionWait | None:
+        item = await self._waits.find_one({"id": wait_id})
+        if item is None:
+            return None
+        item.pop("_id", None)
+        return ExecutionWait.model_validate(item)
+
+    async def list_execution_waits(
+            self,
+            execution_id: str,
+            *,
+            status: ExecutionWaitStatus | None = None,
+    ) -> list[ExecutionWait]:
+        query: dict[str, Any] = {"execution_id": execution_id}
+        if status is not None:
+            query["status"] = status.value
+        cursor = self._waits.find(query).sort([("created_at", 1), ("id", 1)])
+        items: list[ExecutionWait] = []
+        async for item in cursor:
+            item.pop("_id", None)
+            items.append(ExecutionWait.model_validate(item))
+        return items
+
+    async def resolve_execution_wait(
+            self,
+            wait_id: str,
+            *,
+            status: ExecutionWaitStatus,
+            resolution_key: str,
+            resolution_payload: dict[str, Any],
+            resolved_by: str | None,
+    ) -> tuple[ExecutionWait | None, bool]:
+        now = utc_now()
+        result = await self._waits.update_one(
+            {"id": wait_id, "status": ExecutionWaitStatus.PENDING.value},
+            {"$set": {
+                "status": status.value,
+                "resolution_key": resolution_key,
+                "resolution_payload": dict(resolution_payload),
+                "resolved_at": now,
+                "resolved_by": resolved_by,
+                "updated_at": now,
+            }},
+        )
+        current = await self.get_execution_wait(wait_id)
+        if current is None:
+            return None, False
+        if result.modified_count == 1:
+            return current, True
+        if current.resolution_key == resolution_key:
+            return current, False
+        return None, False
+
+    async def list_due_execution_waits(self, *, before: datetime, limit: int = 100) -> list[ExecutionWait]:
+        cursor = self._waits.find(
+            {"status": ExecutionWaitStatus.PENDING.value, "wake_at": {"$lte": before}}
+        ).sort([("wake_at", 1), ("created_at", 1), ("id", 1)]).limit(limit)
+        items: list[ExecutionWait] = []
+        async for item in cursor:
+            item.pop("_id", None)
+            items.append(ExecutionWait.model_validate(item))
+        return items
+
+    async def list_expired_execution_waits(self, *, before: datetime, limit: int = 100) -> list[ExecutionWait]:
+        cursor = self._waits.find(
+            {"status": ExecutionWaitStatus.PENDING.value, "deadline_at": {"$lte": before}}
+        ).sort([("deadline_at", 1), ("created_at", 1), ("id", 1)]).limit(limit)
+        items: list[ExecutionWait] = []
+        async for item in cursor:
+            item.pop("_id", None)
+            items.append(ExecutionWait.model_validate(item))
+        return items
+
+    async def list_pending_execution_waits_by_correlation(
+            self,
+            correlation_key: str,
+            *,
+            limit: int = 100,
+    ) -> list[ExecutionWait]:
+        cursor = self._waits.find({
+            "status": ExecutionWaitStatus.PENDING.value,
+            "correlation_key": correlation_key,
+        }).sort([("created_at", 1), ("id", 1)]).limit(limit)
+        items: list[ExecutionWait] = []
+        async for item in cursor:
+            item.pop("_id", None)
+            items.append(ExecutionWait.model_validate(item))
+        return items
 
     async def acquire_lock(self, execution_id: str, worker_id: str, stale_after_seconds: int = 30) -> bool:
         now = utc_now()
@@ -1190,8 +1554,150 @@ class SQLExecutionStore:
             )
             return [_artifact_from_orm(item) for item in result.scalars().all()]
 
+    async def create_execution_wait(self, wait: ExecutionWait) -> ExecutionWait:
+        async with self.session_factory() as session:
+            entity = _execution_wait_to_orm(wait)
+            session.add(entity)
+            try:
+                await session.commit()
+                return _execution_wait_from_orm(entity)
+            except IntegrityError:
+                # The execution/idempotency-key constraint turns retries and
+                # concurrent creators into one durable suspension record.
+                await session.rollback()
+                result = await session.execute(
+                    select(ExecutionWaitORM).where(
+                        ExecutionWaitORM.execution_id == wait.execution_id,
+                        ExecutionWaitORM.idempotency_key == wait.idempotency_key,
+                    )
+                )
+                existing = result.scalar_one_or_none()
+                if existing is None:
+                    raise
+                return _execution_wait_from_orm(existing)
+
+    async def get_execution_wait(self, wait_id: str) -> ExecutionWait | None:
+        async with self.session_factory() as session:
+            entity = await session.get(ExecutionWaitORM, wait_id)
+            return None if entity is None else _execution_wait_from_orm(entity)
+
+    async def list_execution_waits(
+            self,
+            execution_id: str,
+            *,
+            status: ExecutionWaitStatus | None = None,
+    ) -> list[ExecutionWait]:
+        statement = select(ExecutionWaitORM).where(ExecutionWaitORM.execution_id == execution_id)
+        if status is not None:
+            statement = statement.where(ExecutionWaitORM.status == status.value)
+        statement = statement.order_by(ExecutionWaitORM.created_at.asc(), ExecutionWaitORM.id.asc())
+        async with self.session_factory() as session:
+            result = await session.execute(statement)
+            return [_execution_wait_from_orm(item) for item in result.scalars().all()]
+
+    async def resolve_execution_wait(
+            self,
+            wait_id: str,
+            *,
+            status: ExecutionWaitStatus,
+            resolution_key: str,
+            resolution_payload: dict[str, Any],
+            resolved_by: str | None,
+    ) -> tuple[ExecutionWait | None, bool]:
+        now = utc_now()
+        async with self.session_factory() as session:
+            result = await session.execute(
+                update(ExecutionWaitORM)
+                .where(
+                    ExecutionWaitORM.id == wait_id,
+                    ExecutionWaitORM.status == ExecutionWaitStatus.PENDING.value,
+                )
+                .values(
+                    status=status.value,
+                    resolution_key=resolution_key,
+                    resolution_payload_json=dict(resolution_payload),
+                    resolved_at=now,
+                    resolved_by=resolved_by,
+                    updated_at=now,
+                    active_slot=None,
+                )
+            )
+            await session.commit()
+            entity = await session.get(ExecutionWaitORM, wait_id)
+            if entity is None:
+                return None, False
+            resolved = _execution_wait_from_orm(entity)
+            if result.rowcount == 1:
+                return resolved, True
+            if resolved.resolution_key == resolution_key:
+                return resolved, False
+            return None, False
+
+    async def list_due_execution_waits(self, *, before: datetime, limit: int = 100) -> list[ExecutionWait]:
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ExecutionWaitORM)
+                .where(
+                    ExecutionWaitORM.status == ExecutionWaitStatus.PENDING.value,
+                    ExecutionWaitORM.wake_at.is_not(None),
+                    ExecutionWaitORM.wake_at <= before,
+                )
+                .order_by(
+                    ExecutionWaitORM.wake_at.asc(),
+                    ExecutionWaitORM.created_at.asc(),
+                    ExecutionWaitORM.id.asc(),
+                )
+                .limit(max(1, limit))
+            )
+            return [_execution_wait_from_orm(item) for item in result.scalars().all()]
+
+    async def list_expired_execution_waits(self, *, before: datetime, limit: int = 100) -> list[ExecutionWait]:
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ExecutionWaitORM)
+                .where(
+                    ExecutionWaitORM.status == ExecutionWaitStatus.PENDING.value,
+                    ExecutionWaitORM.deadline_at.is_not(None),
+                    ExecutionWaitORM.deadline_at <= before,
+                )
+                .order_by(
+                    ExecutionWaitORM.deadline_at.asc(),
+                    ExecutionWaitORM.created_at.asc(),
+                    ExecutionWaitORM.id.asc(),
+                )
+                .limit(max(1, limit))
+            )
+            return [_execution_wait_from_orm(item) for item in result.scalars().all()]
+
+    async def list_pending_execution_waits_by_correlation(
+            self,
+            correlation_key: str,
+            *,
+            limit: int = 100,
+    ) -> list[ExecutionWait]:
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ExecutionWaitORM)
+                .where(
+                    ExecutionWaitORM.status == ExecutionWaitStatus.PENDING.value,
+                    ExecutionWaitORM.correlation_key == correlation_key,
+                )
+                .order_by(ExecutionWaitORM.created_at.asc(), ExecutionWaitORM.id.asc())
+                .limit(max(1, limit))
+            )
+            return [_execution_wait_from_orm(item) for item in result.scalars().all()]
+
     async def list_active_executions(self) -> List[Execution]:
-        active = {"queued", "running", "waiting_for_approval", "paused", "cancelling"}
+        active = {
+            "queued",
+            "running",
+            "waiting_for_input",
+            "waiting_for_approval",
+            "waiting_for_event",
+            "sleeping",
+            "paused",
+            "cancelling",
+        }
         async with self.session_factory() as session:
             result = await session.execute(
                 select(ExecutionORM).where(ExecutionORM.status.in_(active)).order_by(ExecutionORM.created_at.desc())
@@ -1281,19 +1787,21 @@ class SQLExecutionStore:
 
     async def create_approval_request(self, *, execution_id: str, event_id: str | None, tool_id: str, status: str,
                                       payload: dict[str, Any]) -> str:
-        request_id = f"{execution_id}:{tool_id}"
+        request_id = str(uuid4())
         async with self.session_factory() as session:
             entity = ApprovalRequestORM(
-                id=request_id[:64],
+                id=request_id,
                 execution_id=execution_id,
                 event_id=event_id,
                 tool_id=tool_id,
                 status=status,
                 request_payload_json=payload,
             )
-            session.merge(entity)
+            # AsyncSession.merge must be awaited; otherwise the execution can enter
+            # waiting_for_approval without ever creating its actionable request row.
+            await session.merge(entity)
             await session.commit()
-        return request_id[:64]
+        return request_id
 
     async def update_approval_request(self, request_id: str, *, status: str, response_payload: dict[str, Any],
                                       responded_by: str | None = None) -> None:
@@ -1306,6 +1814,55 @@ class SQLExecutionStore:
             entity.responded_by = responded_by
             entity.responded_at = utc_now()
             await session.commit()
+
+    async def get_approval_request(self, request_id: str) -> dict[str, Any] | None:
+        async with self.session_factory() as session:
+            entity = await session.get(ApprovalRequestORM, request_id)
+            return _approval_request_from_orm(entity) if entity is not None else None
+
+    async def resolve_pending_approval_request(
+            self,
+            *,
+            execution_id: str,
+            tool_id: str,
+            status: str,
+            response_payload: dict[str, Any],
+            responded_by: str | None = None,
+    ) -> dict[str, Any] | None:
+        now = utc_now()
+        async with self.session_factory() as session:
+            selected = await session.execute(
+                select(ApprovalRequestORM.id)
+                .where(
+                    ApprovalRequestORM.execution_id == execution_id,
+                    ApprovalRequestORM.tool_id == tool_id,
+                )
+                .order_by(ApprovalRequestORM.requested_at.desc(), ApprovalRequestORM.id.desc())
+                .limit(1)
+            )
+            request_id = selected.scalar_one_or_none()
+            if request_id is None:
+                return None
+            result = await session.execute(
+                update(ApprovalRequestORM)
+                .where(
+                    ApprovalRequestORM.id == request_id,
+                    ApprovalRequestORM.status == "pending",
+                )
+                .values(
+                    status=status,
+                    response_payload_json=dict(response_payload),
+                    responded_by=responded_by,
+                    responded_at=now,
+                )
+            )
+            await session.commit()
+            entity = await session.get(ApprovalRequestORM, request_id)
+            if entity is None:
+                return None
+            if result.rowcount == 1 or entity.status == status:
+                return _approval_request_from_orm(entity)
+            return None
 
     async def list_approval_requests(self, execution_id: str) -> list[dict[str, Any]]:
         async with self.session_factory() as session:

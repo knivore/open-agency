@@ -9,6 +9,7 @@ from app.domain import (
     ConnectorCapabilitiesPayload,
     ConnectorCapabilityDefinition,
     ConnectorMetadataRequirementDefinition,
+    ConnectorOneCLISecretProfileDefinition,
     ConnectorSetupGuideDefinition,
     ConnectorSetupGuideFieldDefinition,
     ConnectorSetupGuideOptionDefinition,
@@ -17,8 +18,12 @@ from app.domain import (
     PlannedIntegrationDefinition,
 )
 from app.integrations.connectors import ConnectorRequirement, connector_target_scope_metadata, get_connector_definition
+from app.integrations.onecli_catalog import (
+    ONECLI_NATIVE_APP_BY_CONNECTOR,
+    ONECLI_SECRET_PROFILE_BY_CONNECTOR,
+)
 
-REGISTRY_UPDATED_AT = datetime(2026, 5, 7, 0, 0, tzinfo=UTC)
+REGISTRY_UPDATED_AT = datetime(2026, 7, 14, 0, 0, tzinfo=UTC)
 
 
 def _metadata_label(key: str) -> str:
@@ -132,10 +137,10 @@ def _setup_guide(
     notes: list[str] = [
         "Each connector installation gets its own Agency-generated id, so multiple bots or workspaces can coexist under separate OneCLI refs."]
     if provider == "telegram-bot":
-        # Telegram can store the bot token in OneCLI, but delivery still has to stay direct
-        # because the provider token is embedded in the request path rather than a header.
+        # OneCLI v1.40+ can replace the placeholder bot-token path segment at
+        # request time, so Agency no longer needs a mirrored Telegram token.
         notes.append(
-            "Store the Telegram bot token in OneCLI, but keep delivery and health checks direct because the token is embedded in the URL path. Agency mirrors the same secret into a runtime secret record at completion time, so OneCLI stays the setup/storage layer for direct transport."
+            "Use OneCLI URL path injection with the template /bot{value}. Agency sends only a fixed placeholder path segment, and OneCLI replaces it at request time without exposing the bot token to Agency."
         )
     elif provider == "discord-bot":
         notes.append(
@@ -161,8 +166,9 @@ def _setup_guide(
             "installation status",
         ],
         completionSignal=(
-            "OneCLI completes the Agency installation with only the onecli:// credential ref "
-            "and non-secret metadata; Agency then marks the installation active."
+            "After the credential is saved, Agency verifies the matching OneCLI resource through "
+            "OneCLI's metadata API, stores only its owner-scoped onecli:// reference, and marks the "
+            "installation active."
         ),
         notes=notes,
     )
@@ -198,7 +204,10 @@ class IntegrationsRegistryService:
                 IntegrationRegistryCategoryDefinition(
                     id="communications",
                     name="Communications",
-                    description="Messaging, chat, and email connectors that can be connected through Agency-owned OneCLI setup sessions.",
+                    description=(
+                        "Messaging, chat, and email connectors with researched setup guides; "
+                        "supported credential shapes can be activated through Agency-owned OneCLI sessions."
+                    ),
                     providers={
                         "Telegram": PlannedIntegrationDefinition(
                             backendKey="telegram-bot",
@@ -472,7 +481,36 @@ class IntegrationsRegistryService:
                     moduleCapabilities=_module_capabilities(planned.backendKey),
                     dependsOnAgencyCapabilities=_agency_capability_dependencies(planned.backendKey),
                     ownershipNotes=_ownership_notes(planned.backendKey),
-                    onecliTransportMode="direct" if planned.backendKey in {"telegram-bot", "discord-bot"} else "proxy",
+                    onecliTransportMode="proxy",
+                    runtimeSecretRequired=False,
+                    setupSupported=(
+                        planned.backendKey in ONECLI_NATIVE_APP_BY_CONNECTOR
+                        or planned.backendKey in ONECLI_SECRET_PROFILE_BY_CONNECTOR
+                    ),
+                    setupBlockReason=(
+                        None
+                        if planned.backendKey in ONECLI_NATIVE_APP_BY_CONNECTOR
+                        or planned.backendKey in ONECLI_SECRET_PROFILE_BY_CONNECTOR
+                        else (
+                            "This guide requires a multi-secret or OAuth-refresh flow that self-hosted "
+                            "OneCLI v1.41 cannot yet complete as a verified Agency connection."
+                        )
+                    ),
+                    onecliAppId=ONECLI_NATIVE_APP_BY_CONNECTOR.get(planned.backendKey),
+                    onecliSecretProfile=(
+                        ConnectorOneCLISecretProfileDefinition(
+                            hostPattern=profile.host_pattern,
+                            pathPattern=profile.path_pattern,
+                            injectionTarget=profile.injection_target,
+                            headerName=profile.header_name,
+                            valueFormat=profile.value_format,
+                            parameterName=profile.parameter_name,
+                            parameterFormat=profile.parameter_format,
+                            pathTemplate=profile.path_template,
+                        )
+                        if (profile := ONECLI_SECRET_PROFILE_BY_CONNECTOR.get(planned.backendKey))
+                        else None
+                    ),
                     healthSupported=bool(definition and definition.health_check is not None),
                     requiredMetadata=[
                         ConnectorMetadataRequirementDefinition(

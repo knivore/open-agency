@@ -5,7 +5,7 @@ from __future__ import annotations
 from jsonschema import validate
 from typing import Any
 
-from app.domain import ToolDefinition, ToolType
+from app.domain import ToolDefinition, ToolGroupDescriptor, ToolType
 from app.protocols.mcp.registry import MCPClientRegistry
 from app.runtime.native.approvals import ApprovalManager
 from app.runtime.native.errors import ToolExecutionError
@@ -25,6 +25,7 @@ from .executors import (
     ToolExecutionContext,
     WorkflowToolExecutor,
 )
+from .routing import compact_tool_groups, resolve_tool_groups, tool_catalogue_version
 
 
 class ToolRegistry:
@@ -39,6 +40,7 @@ class ToolRegistry:
             mcp_registry: MCPClientRegistry | None = None,
             execution_store: Any | None = None,
             tool_repository: Any | None = None,
+            api_tool_runtime_executor: Any | None = None,
     ):
         if isinstance(contracts, ToolContractRegistry):
             self.contract_registry = contracts
@@ -59,6 +61,7 @@ class ToolRegistry:
         self.mcp_registry = mcp_registry
         self.execution_store = execution_store
         self.tool_repository = tool_repository
+        self.api_tool_runtime_executor = api_tool_runtime_executor
         self.default_python_allowlist = ["tests.native_test_tools", *app_modules, *migrated_modules]
         self._executors: dict[ToolType, Any] = {
             ToolType.PYTHON_FUNCTION: PythonFunctionToolExecutor(self.default_python_allowlist),
@@ -87,6 +90,18 @@ class ToolRegistry:
             return None
         return await self.tool_repository.get(tool_id)
 
+    def describe_tool_groups(self, tools: list[ToolDefinition]) -> list[ToolGroupDescriptor]:
+        """Return router-safe metadata for an already permission-scoped tool set."""
+        return compact_tool_groups(tools)
+
+    def resolve_tool_groups(self, tools: list[ToolDefinition], group_ids: list[str]) -> list[ToolDefinition]:
+        """Resolve selected groups without bypassing the caller's agent/user allowlist."""
+        return resolve_tool_groups(tools, group_ids)
+
+    def tool_catalogue_version(self, tools: list[ToolDefinition]) -> str:
+        """Expose the compact-catalogue hash for routing cache invalidation."""
+        return tool_catalogue_version(tools)
+
     async def execute(
             self,
             tool: ToolDefinition,
@@ -113,6 +128,7 @@ class ToolRegistry:
             approval_manager=self.approval_manager,
             mcp_registry=self.mcp_registry,
             execution_store=self.execution_store,
+            api_tool_runtime_executor=self.api_tool_runtime_executor,
             connector_binding=connector_binding,
         )
         if getattr(executor, "async_execution", False):

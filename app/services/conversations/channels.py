@@ -36,6 +36,7 @@ class ConversationChannelService:
             channel_type=normalized_channel,
             channel_user_id=channel_user_id,
             supplied_internal_user_id=internal_user_id,
+            metadata=metadata,
         )
         items = await self.context.conversation_repo.list()
         for item in items:
@@ -182,6 +183,7 @@ class ConversationChannelService:
             channel_user_id: str,
             internal_user_id: str | None,
             reason: str | None,
+            metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         service = ConversationService(self.context)
         normalized_channel = ConversationChannelType(channel_type)
@@ -189,6 +191,7 @@ class ConversationChannelService:
             channel_type=normalized_channel,
             channel_user_id=channel_user_id,
             supplied_internal_user_id=internal_user_id,
+            metadata=metadata,
         ) or f"external:{channel_user_id}"
         if action == "approve":
             result = await service.approve_request(approval_request_id, actor_user_id=actor_user_id, reason=reason)
@@ -207,12 +210,14 @@ class ConversationChannelService:
             channel_type: ConversationChannelType,
             channel_user_id: str,
             supplied_internal_user_id: str | None,
+            metadata: dict[str, Any] | None = None,
     ) -> str | None:
         if channel_type in {ConversationChannelType.API, ConversationChannelType.WEB}:
             return supplied_internal_user_id
         return await ChannelIdentityMappingService(self.context).resolve_trusted_internal_user_id(
             channel_type=channel_type.value,
             channel_user_id=channel_user_id,
+            tenant_id=ChannelIdentityMappingService._tenant_id(metadata or {}),
         )
 
     def _transport_messages_from_result(self, result: dict[str, Any]) -> list[dict[str, Any]]:

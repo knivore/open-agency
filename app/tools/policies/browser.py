@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import urlparse
 
+from app.core.outbound_http import validate_outbound_http_url
 from app.tools.contracts.models import PolicyRuleResult, PolicyVerdict
 from .http import BLOCKED_HOSTS
 
@@ -30,8 +31,10 @@ def evaluate_browser_policy(
         rules.append(
             PolicyRuleResult(
                 id="browser-mutation-approval-context",
-                outcome="warn",
-                reason="browser mutation is policy-mediated but actor is not explicitly approved",
+                # The executor only stops on deny, so approval cannot be advisory
+                # for interactions that may submit forms or trigger remote actions.
+                outcome="deny",
+                reason="browser mutation requires an explicitly approved actor context",
             )
         )
     else:
@@ -56,25 +59,14 @@ def _evaluate_browser_open_url(payload: dict[str, Any], *, allowed_hosts: list[s
     host = (parsed_url.hostname or "").lower()
     if host in BLOCKED_HOSTS:
         return [PolicyRuleResult(id="browser-host-safety", outcome="deny", reason=f"blocked host: {host}")]
-    if not _host_allowed(host, allowed_hosts):
+    try:
+        validate_outbound_http_url(url, allowed_hosts=allowed_hosts)
+    except ValueError as exc:
         return [
             PolicyRuleResult(
                 id="browser-host-allowlist",
                 outcome="deny",
-                reason=f"host is not allowlisted: {host}",
+                reason=str(exc),
             )
         ]
     return [PolicyRuleResult(id="browser-host-allowlist", outcome="ok", reason="host is allowlisted")]
-
-
-def _host_allowed(host: str, allowed_hosts: list[str]) -> bool:
-    if not host:
-        return False
-    if "*" in allowed_hosts:
-        return True
-    for allowed in allowed_hosts:
-        if allowed.startswith("*.") and host.endswith(allowed[1:]):
-            return True
-        if host == allowed:
-            return True
-    return False

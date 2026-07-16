@@ -30,6 +30,8 @@ class ConnectorInstallationORM(TimestampMixin, Base):
     runtime_secret_encrypted: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     status: Mapped[str] = mapped_column(String(64), nullable=False, default="setup_pending")
     setup_session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    setup_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    setup_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_rotated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     metadata_json: Mapped[dict] = mapped_column(JSON_VARIANT, default=dict)

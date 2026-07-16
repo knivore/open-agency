@@ -11,7 +11,7 @@ import asyncio
 import logging
 import os
 import traceback
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Awaitable
 
 from app.core.time import utc_now
 from app.domain import ExecutionEventType, ExecutionStatus
@@ -24,6 +24,7 @@ from app.runtime.worker_protocol import (
     WORKER_EXIT_CANCELLED,
     WORKER_EXIT_INFRA_FAILED,
     WORKER_EXIT_SUCCESS,
+    WORKER_EXIT_SUSPENDED,
     WORKER_EXIT_WORKFLOW_FAILED,
 )
 
@@ -142,7 +143,12 @@ async def run_execution_worker(
         await context.execution_store.update_execution(execution)
         execution_coro = context.runtime_registry.start_execution(execution_id)
         if execution_timeout_seconds is not None:
-            result = await asyncio.wait_for(execution_coro, timeout=execution_timeout_seconds)
+            result = await _run_with_active_execution_timeout(
+                context=context,
+                execution_id=execution_id,
+                execution_coro=execution_coro,
+                timeout_seconds=execution_timeout_seconds,
+            )
         else:
             result = await execution_coro
         return _exit_code_for_execution(result)
@@ -184,6 +190,56 @@ async def run_execution_worker(
         await context.execution_store.release_lock(execution_id, worker_id)
 
 
+async def _run_with_active_execution_timeout(
+        *,
+        context: "ApiContext",
+        execution_id: str,
+        execution_coro: Awaitable,
+        timeout_seconds: float,
+):
+    """Enforce worker compute time without charging time spent waiting on a human."""
+    task = asyncio.ensure_future(execution_coro)
+    loop = asyncio.get_running_loop()
+    remaining_seconds = timeout_seconds
+    # Let the execution coroutine publish an immediate approval wait before the
+    # first timeout interval is classified as active work.
+    await asyncio.sleep(0)
+    current = await context.execution_store.get_execution(execution_id)
+    waiting_for_approval = current is not None and current.status == ExecutionStatus.WAITING_FOR_APPROVAL
+    last_checked_at = loop.time()
+    poll_interval_seconds = min(0.1, max(0.01, timeout_seconds / 4))
+    try:
+        while True:
+            wait_seconds = poll_interval_seconds if waiting_for_approval else min(
+                poll_interval_seconds,
+                max(remaining_seconds, 0),
+            )
+            done, _ = await asyncio.wait({task}, timeout=wait_seconds)
+            checked_at = loop.time()
+            if not waiting_for_approval:
+                remaining_seconds -= checked_at - last_checked_at
+            last_checked_at = checked_at
+            if done:
+                return await task
+
+            current = await context.execution_store.get_execution(execution_id)
+            waiting_for_approval = current is not None and current.status == ExecutionStatus.WAITING_FOR_APPROVAL
+            if remaining_seconds <= 0 and not waiting_for_approval:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                raise asyncio.TimeoutError
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+
 def _exit_code_for_execution(execution) -> int:
     if execution.status == ExecutionStatus.COMPLETED:
         return WORKER_EXIT_SUCCESS
@@ -191,6 +247,16 @@ def _exit_code_for_execution(execution) -> int:
         return WORKER_EXIT_CANCELLED
     if execution.status == ExecutionStatus.FAILED:
         return WORKER_EXIT_WORKFLOW_FAILED
+    if execution.status in {
+        ExecutionStatus.WAITING_FOR_INPUT,
+        ExecutionStatus.WAITING_FOR_APPROVAL,
+        ExecutionStatus.WAITING_FOR_EVENT,
+        ExecutionStatus.SLEEPING,
+        ExecutionStatus.PAUSED,
+    }:
+        # Durable suspension is a normal worker handoff. The next wake creates
+        # a fresh worker and resumes from the persisted checkpoint.
+        return WORKER_EXIT_SUSPENDED
     return WORKER_EXIT_INFRA_FAILED
 
 

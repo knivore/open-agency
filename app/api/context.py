@@ -113,6 +113,18 @@ from app.tools.service import ToolService
 from app.tools.builtins import builtin_tool_definitions
 
 
+def _catalog_tool_definition_loader(tool_repo):  # noqa: ANN001
+    async def load(tool_ids: set[str]):
+        tools = []
+        for tool_id in tool_ids:
+            tool = await tool_repo.get(tool_id)
+            if tool is not None:
+                tools.append(tool)
+        return tools
+
+    return load
+
+
 @dataclass
 class ApiContext:
     """Container for repositories and long-lived runtime collaborators.
@@ -202,9 +214,10 @@ class ApiContext:
 
     def _computer_use_server_specs(self) -> list[MCPServerDefinition]:
         macos_command = os.getenv("COMPUTER_USE_MACOS_MCP_COMMAND", "uvx")
-        macos_args = shlex.split(os.getenv("COMPUTER_USE_MACOS_MCP_ARGS", "macos-mcp"))
+        macos_args = shlex.split(os.getenv("COMPUTER_USE_MACOS_MCP_ARGS", "macos-mcp==0.3.10"))
         windows_command = os.getenv("COMPUTER_USE_WINDOWS_MCP_COMMAND", "uvx")
         windows_args = shlex.split(os.getenv("COMPUTER_USE_WINDOWS_MCP_ARGS", "windows-mcp"))
+        windows_enabled = self._env_bool("COMPUTER_USE_WINDOWS_MCP_ENABLED", default=False)
         return [
             MCPServerDefinition(
                 id=self.COMPUTER_USE_MACOS_MCP_SERVER_ID,
@@ -228,7 +241,7 @@ class ApiContext:
                 transport=MCPTransportType.STDIO,
                 command=windows_command,
                 args=windows_args,
-                enabled=True,
+                enabled=windows_enabled,
                 allowlisted_command=Path(windows_command).name,
                 metadata={
                     "system": True,
@@ -265,7 +278,8 @@ class ApiContext:
         settings = get_settings()
         command = self._optional_env_value("FIRECRAWL_MCP_COMMAND", settings.firecrawl_mcp_command) or "npx"
         args = shlex.split(
-            self._optional_env_value("FIRECRAWL_MCP_ARGS", settings.firecrawl_mcp_args) or "-y firecrawl-mcp"
+            self._optional_env_value("FIRECRAWL_MCP_ARGS", settings.firecrawl_mcp_args)
+            or "-y firecrawl-mcp@3.22.3"
         )
         api_key_ref = (
                 self._optional_env_value("FIRECRAWL_MCP_API_KEY_REF", settings.firecrawl_mcp_api_key_ref)
@@ -307,7 +321,7 @@ class ApiContext:
         command = self._optional_env_value("CONTEXT7_MCP_COMMAND", settings.context7_mcp_command) or "npx"
         args = shlex.split(
             self._optional_env_value("CONTEXT7_MCP_ARGS", settings.context7_mcp_args)
-            or "-y @upstash/context7-mcp"
+            or "-y @upstash/context7-mcp@3.2.3"
         )
         api_key_ref = (
                 self._optional_env_value("CONTEXT7_MCP_API_KEY_REF", settings.context7_mcp_api_key_ref)
@@ -350,11 +364,11 @@ class ApiContext:
     def builtin_computer_use_server_ids_for_host(self) -> list[str]:
         """Return the built-in Computer Use MCP server IDs that match the host platform."""
         host_platform = self._host_platform()
-        if host_platform == "macos":
-            return [self.COMPUTER_USE_MACOS_MCP_SERVER_ID]
-        if host_platform == "windows":
-            return [self.COMPUTER_USE_WINDOWS_MCP_SERVER_ID]
-        return []
+        return [
+            server.id
+            for server in self._computer_use_server_specs()
+            if server.enabled and server.metadata.get("platform") == host_platform
+        ]
 
     def builtin_mcp_server_ids_for_startup_discovery(self) -> list[str]:
         server_ids = list(self.builtin_computer_use_server_ids_for_host())
@@ -489,6 +503,16 @@ def _attach_goal_supervisor_waker(context: ApiContext) -> None:
     context.scheduler.goal_supervisor_waker = wake_goal_supervisor
 
 
+def _attach_native_api_tool_runtime(context: ApiContext) -> None:
+    # Import lazily because ToolRuntimeExecutor depends on services that type
+    # against ApiContext; wiring it here keeps ApiContext as the composition root.
+    from app.tools.runtime.executor import ToolRuntimeExecutor
+
+    executor = ToolRuntimeExecutor(context=context)
+    context.tool_service.tool_registry.api_tool_runtime_executor = executor
+    context.execution_engine.agent_executor.tool_executor.tool_registry.api_tool_runtime_executor = executor
+
+
 @lru_cache(maxsize=1)
 def get_default_api_context() -> ApiContext:
     if not is_database_configured():
@@ -543,6 +567,7 @@ def get_default_api_context() -> ApiContext:
         execution_store=execution_store,
         model_provider_registry=llm_provider_registry,
         approval_manager=approval_manager,
+        tool_definition_loader=_catalog_tool_definition_loader(tool_repo),
     )
     runtime_registry = RuntimeAdapterRegistry(
         workflow_repository=workflow_repo,
@@ -641,6 +666,7 @@ def get_default_api_context() -> ApiContext:
         runtime_reconciler=runtime_reconciler,
         runtime_operations=runtime_operations,
     )
+    _attach_native_api_tool_runtime(context)
 
     async def _persist_run_summary(execution, workflow):
         from app.services.execution_run_summary import ExecutionRunSummaryService
@@ -719,6 +745,7 @@ def create_test_api_context() -> ApiContext:
         execution_store=execution_store,
         model_provider_registry=llm_provider_registry,
         approval_manager=approval_manager,
+        tool_definition_loader=_catalog_tool_definition_loader(tool_repo),
     )
     runtime_registry = RuntimeAdapterRegistry(
         workflow_repository=workflow_repo,
@@ -820,6 +847,7 @@ def create_test_api_context() -> ApiContext:
         runtime_operations=runtime_operations,
         database_health_checks_enabled=False,
     )
+    _attach_native_api_tool_runtime(context)
 
     async def _persist_run_summary(execution, workflow):
         from app.services.execution_run_summary import ExecutionRunSummaryService
@@ -894,6 +922,7 @@ def create_database_test_api_context() -> ApiContext:
         execution_store=execution_store,
         model_provider_registry=llm_provider_registry,
         approval_manager=approval_manager,
+        tool_definition_loader=_catalog_tool_definition_loader(tool_repo),
     )
     runtime_registry = RuntimeAdapterRegistry(
         workflow_repository=workflow_repo,
@@ -993,6 +1022,7 @@ def create_database_test_api_context() -> ApiContext:
         runtime_reconciler=runtime_reconciler,
         runtime_operations=runtime_operations,
     )
+    _attach_native_api_tool_runtime(context)
 
     async def _persist_run_summary(execution, workflow):
         from app.services.execution_run_summary import ExecutionRunSummaryService

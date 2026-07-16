@@ -12,6 +12,7 @@ from app.services.document_ingestion import (
     DocumentIngestionError,
     DocumentIngestionService,
     DocumentUploadIntelligenceService,
+    MAX_DOCUMENT_UPLOAD_BYTES,
 )
 from app.services.memory import MemoryPermissionError
 
@@ -175,7 +176,9 @@ def create_documents_router(context: Optional[ApiContext] = None) -> APIRouter:
         current_user = await resolve_current_user(request, context, required_scopes=["memory:write"])
         try:
             filename = DocumentIngestionService._safe_filename(file.filename or "document")
-            raw = await file.read()
+            raw = await file.read(MAX_DOCUMENT_UPLOAD_BYTES + 1)
+            if len(raw) > MAX_DOCUMENT_UPLOAD_BYTES:
+                raise DocumentIngestionError("Uploaded document exceeds the 10 MiB size limit.")
             if not raw:
                 raise DocumentIngestionError("Uploaded document is empty.")
             text = DocumentIngestionService.extract_text(raw, filename=filename, content_type=file.content_type)

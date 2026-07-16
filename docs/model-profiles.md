@@ -31,6 +31,11 @@ When a connection is edited from the FE, the UI keeps linked presets in sync by 
 credential reference fields on every model preset that references that provider id. The provider id itself is
 intentionally not editable because existing presets, agents, and workflows may reference it.
 
+Custom `openai_compatible` and `ollama` endpoints must match `MODEL_PROVIDER_ALLOWED_HOSTS`. Official provider
+families require HTTPS and remain pinned to their known service hosts so a profile cannot redirect an ambient provider
+credential to an attacker-selected destination. Local gateway keys are bound to the exact configured local endpoint,
+and runtime overrides do not inherit a saved key when the provider or endpoint changes.
+
 ### OAuth-backed Connections
 
 For OAuth-capable providers such as `openai_codex`, the FE should treat OAuth as connection state, not model preset

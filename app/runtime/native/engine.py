@@ -9,7 +9,11 @@ depending on an external orchestration framework.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+from copy import deepcopy
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any, Awaitable, Callable, Dict, Optional
 from uuid import uuid4
 
@@ -20,6 +24,9 @@ from app.domain import (
     Execution,
     ExecutionEventType,
     ExecutionStatus,
+    ExecutionWait,
+    ExecutionWaitKind,
+    ExecutionWaitStatus,
     ModelProfileDefinition,
     RuntimeAdapterType,
     TaskDefinition,
@@ -29,16 +36,22 @@ from app.domain import (
 )
 from app.llm.registry import ModelProviderRegistry
 from app.observability.metrics import collect_system_metrics
-from app.runtime.execution_lifecycle import build_execution_lifecycle_metadata
+from app.runtime.execution_lifecycle import (
+    PersistentCyclePolicy,
+    build_execution_lifecycle_metadata,
+    resolve_persistent_cycle_policy,
+)
 from app.runtime.native.agent_executor import AgentExecutor
 from app.runtime.native.agent_executor import (
     ContextCompactionGraphContextRetriever,
     ContextCompactor,
     MemoryPromptBuilder,
     ProposalToolGraphContextRetriever,
+    ToolDefinitionLoader,
 )
 from app.runtime.native.approvals import ApprovalManager
 from app.runtime.native.errors import (
+    ApprovalRequiredError,
     ExecutionCancelledError,
     ExecutionNotFoundError,
     ExecutionPausedError,
@@ -56,6 +69,28 @@ from app.runtime.native.state import (
     record_graph_context_working_set_entry,
 )
 from app.runtime.native.tool_executor import ToolExecutor
+
+DURABLE_WAIT_EXECUTION_STATUSES = {
+    ExecutionStatus.WAITING_FOR_INPUT,
+    ExecutionStatus.WAITING_FOR_APPROVAL,
+    ExecutionStatus.WAITING_FOR_EVENT,
+    ExecutionStatus.SLEEPING,
+}
+TERMINAL_EXECUTION_STATUSES = {
+    ExecutionStatus.COMPLETED,
+    ExecutionStatus.FAILED,
+    ExecutionStatus.CANCELLED,
+}
+
+
+def _reject_terminal_execution_replay(execution: Execution) -> None:
+    if execution.status in TERMINAL_EXECUTION_STATUSES:
+        # Terminal records are immutable audit identities. A retry must create a
+        # replacement execution instead of clearing native state and replaying it.
+        raise ValueError(
+            f"Execution '{execution.id}' is terminal and must be retried through a replacement execution."
+        )
+
 
 GraphContextRetriever = Callable[
     [
@@ -85,6 +120,152 @@ WORKFLOW_APPROVAL_TOOL_ID_PREFIX = "workflow:"
 TASK_APPROVAL_POLICIES = {"none", "required", "on_failure"}
 TASK_RETRY_METADATA_KEY = "task_retry"
 WORKFLOW_APPROVAL_MODES = {"task_policy", "before_run", "all_tasks"}
+FAILURE_OUTCOME_STATUSES = {
+    "blocked",
+    "cancelled",
+    "canceled",
+    "error",
+    "failed",
+    "failure",
+    "incomplete",
+    "stopped",
+}
+SUCCESS_OUTCOME_STATUSES = {"complete", "completed", "ok", "sent", "success", "succeeded"}
+
+
+def _output_mapping(output: Any) -> dict[str, Any]:
+    if isinstance(output, dict):
+        return output
+    if isinstance(output, str):
+        stripped = output.strip()
+        if stripped.startswith("{"):
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _node_outcome(output: Any) -> str:
+    payload = _output_mapping(output)
+    status = str(payload.get("status") or "").strip().lower()
+    if status in FAILURE_OUTCOME_STATUSES:
+        return "failure"
+    if payload.get("completed_normally") is False or payload.get("ok") is False or payload.get("success") is False:
+        return "failure"
+    if status in SUCCESS_OUTCOME_STATUSES:
+        return "success"
+    return "success"
+
+
+def _node_failure_message(output: Any) -> str:
+    payload = _output_mapping(output)
+    for key in ("error", "reason", "outcome", "notice", "next_action"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    status = str(payload.get("status") or "failed").strip()
+    return f"Task returned non-success status '{status}'."
+
+
+def _required_tool_result_error(task: TaskDefinition, state: NativeExecutionState) -> str | None:
+    required_tool_ids = task.metadata.get("required_tool_ids")
+    if not isinstance(required_tool_ids, list) or not required_tool_ids:
+        return None
+    results = state.task_tool_results.get(task.id, [])
+    results_by_tool: dict[str, list[Any]] = {}
+    for item in results:
+        tool_id = str(item.get("tool_id") or "")
+        results_by_tool.setdefault(tool_id, []).append(item.get("result"))
+    missing = [tool_id for tool_id in required_tool_ids if not results_by_tool.get(str(tool_id))]
+    if missing:
+        return f"Task requires successful tool calls that were not recorded: {', '.join(map(str, missing))}."
+
+    success_statuses = task.metadata.get("required_tool_success_statuses")
+    if not isinstance(success_statuses, dict):
+        return None
+    for tool_id in required_tool_ids:
+        allowed = success_statuses.get(str(tool_id))
+        if not isinstance(allowed, list) or not allowed:
+            continue
+        normalized_allowed = {str(item).strip().lower() for item in allowed}
+        if not any(
+            isinstance(result, dict)
+            and str(result.get("status") or "").strip().lower() in normalized_allowed
+            for result in results_by_tool.get(str(tool_id), [])
+        ):
+            return f"Required tool '{tool_id}' did not return an allowed success status."
+    return None
+
+
+def _condition_signals(output: Any, outcome: str) -> set[str]:
+    payload = _output_mapping(output)
+    serialized = json.dumps(payload or output, sort_keys=True, default=str).lower()
+    status = str(payload.get("status") or "").strip().lower()
+    signals = {outcome}
+    if status:
+        signals.add(status)
+    if payload.get("completed_normally") is False:
+        signals.update({"run_incomplete", "incomplete"})
+    markers = {
+        "approval_rejected": ("approval rejected", "approval_rejected"),
+        "blocked": ("blocked",),
+        "discord_delivery_failed": ("discord delivery failed", "discord_delivery_failed", '"status": "not_sent"'),
+        "error": ("error",),
+        "memory_write_failed": ("memory write failed", "memory_write_failed"),
+        "run_incomplete": ("incomplete", "completed_normally\": false"),
+        "stopped": ("stopped", "cancelled", "canceled"),
+        "voice_failed": ("voice generation failed", "voice_failed"),
+        "voice_missing": ("voice_missing", "missing voice", "voice file does not exist"),
+    }
+    for signal, candidates in markers.items():
+        if any(candidate in serialized for candidate in candidates):
+            signals.add(signal)
+    if outcome == "failure":
+        signals.update({"failed", "run_incomplete"})
+    return signals
+
+
+def _edge_condition_matches(edge: WorkflowEdgeDefinition, source_output: Any, source_outcome: str) -> bool:
+    if edge.edge_type == EdgeType.FAILURE and source_outcome != "failure":
+        return False
+    if edge.edge_type in {EdgeType.DEFAULT, EdgeType.SUCCESS, EdgeType.HANDOFF, EdgeType.APPROVAL}:
+        if source_outcome != "success":
+            return False
+    condition = str(edge.condition or "").strip().lower()
+    if not condition:
+        return True
+    alternatives = [item.strip(" _") for item in condition.split("_or_") if item.strip(" _")]
+    signals = _condition_signals(source_output, source_outcome)
+    return any(alternative in signals for alternative in alternatives)
+
+
+def _incoming_edges(workflow: WorkflowDefinition) -> dict[str, list[WorkflowEdgeDefinition]]:
+    incoming: dict[str, list[WorkflowEdgeDefinition]] = {}
+    for edge in workflow.edges:
+        incoming.setdefault(edge.target_node_id, []).append(edge)
+    return incoming
+
+
+def _node_is_reachable(
+        node: WorkflowNodeDefinition,
+        *,
+        state: NativeExecutionState,
+        incoming_edges: dict[str, list[WorkflowEdgeDefinition]],
+) -> bool:
+    edges = incoming_edges.get(node.id, [])
+    if not edges:
+        return True
+    return any(
+        edge.source_node_id in state.node_outcomes
+        and _edge_condition_matches(
+            edge,
+            state.node_outputs.get(edge.source_node_id),
+            state.node_outcomes[edge.source_node_id],
+        )
+        for edge in edges
+    )
 
 
 @dataclass
@@ -199,19 +380,54 @@ def _workflow_runtime_policy(workflow: WorkflowDefinition) -> dict[str, Any]:
     return policy
 
 
-def _execution_checkpoint_payload(state: NativeExecutionState) -> dict[str, Any]:
+def _execution_checkpoint_payload(
+        state: NativeExecutionState,
+        *,
+        prior_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     node_outputs = dict(state.node_outputs)
+    checkpoint = {
+        "current_node_id": state.current_node_id,
+        "current_task_id": state.current_task_id,
+        "completed_node_ids": list(node_outputs.keys()),
+        "node_outcomes": dict(state.node_outcomes),
+        "node_errors": dict(state.node_errors),
+        "task_tool_results": deepcopy(state.task_tool_results),
+        "planned_node_ids": list(state.planned_node_ids),
+        "terminal_node_ids": list(state.terminal_node_ids),
+    }
+    prior_checkpoint = (
+        prior_payload.get("checkpoint")
+        if isinstance(prior_payload, dict)
+        else None
+    )
+    if isinstance(prior_checkpoint, dict) and isinstance(prior_checkpoint.get("approval_continuation"), dict):
+        checkpoint["approval_continuation"] = deepcopy(prior_checkpoint["approval_continuation"])
     return {
         "node_outputs": node_outputs,
         "final_output": next(reversed(node_outputs.values()), None) if node_outputs else None,
-        "checkpoint": {
-            "current_node_id": state.current_node_id,
-            "current_task_id": state.current_task_id,
-            "completed_node_ids": list(node_outputs.keys()),
-            "planned_node_ids": list(state.planned_node_ids),
-            "terminal_node_ids": list(state.terminal_node_ids),
-        },
+        "checkpoint": checkpoint,
     }
+
+
+def _cycle_progress_signature(output_payload: dict[str, Any]) -> str:
+    serialized = json.dumps(output_payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _cycle_delay_with_jitter(
+        *,
+        execution_id: str,
+        cycle_number: int,
+        delay_seconds: float,
+        jitter_ratio: float,
+) -> float:
+    if jitter_ratio <= 0:
+        return delay_seconds
+    digest = hashlib.sha256(f"{execution_id}:{cycle_number}".encode("utf-8")).digest()
+    unit = int.from_bytes(digest[:8], "big") / float((1 << 64) - 1)
+    multiplier = 1.0 + ((unit * 2.0) - 1.0) * jitter_ratio
+    return max(0.001, delay_seconds * multiplier)
 
 
 def _terminal_executable_node_ids(workflow: WorkflowDefinition, ordered_nodes: list[WorkflowNodeDefinition]) -> list[str]:
@@ -259,6 +475,8 @@ def _checkpoint_payload_summary(payload: Any) -> dict[str, Any] | None:
         checkpoint = {}
     return {
         "completed_node_ids": list(node_outputs.keys()),
+        "node_outcomes": dict(checkpoint.get("node_outcomes") or {}),
+        "node_errors": dict(checkpoint.get("node_errors") or {}),
         "current_node_id": checkpoint.get("current_node_id"),
         "current_task_id": checkpoint.get("current_task_id"),
         "planned_node_ids": [
@@ -281,6 +499,7 @@ class ExecutionEngine:
             execution_store: ExecutionStore,
             model_provider_registry: ModelProviderRegistry,
             approval_manager: Optional[ApprovalManager] = None,
+            tool_definition_loader: ToolDefinitionLoader | None = None,
             execution_completion_handler: Optional[
                 Callable[[Execution, WorkflowDefinition], Awaitable[None]]
             ] = None,
@@ -307,6 +526,7 @@ class ExecutionEngine:
         self.emitter = ExecutionEventEmitter(execution_store)
         self.agent_executor = AgentExecutor(
             ToolExecutor(self.approval_manager),
+            tool_definition_loader=tool_definition_loader,
             memory_prompt_builder=memory_prompt_builder,
             context_compactor=context_compactor,
             context_compaction_graph_context_retriever=context_compaction_graph_context_retriever,
@@ -405,6 +625,7 @@ class ExecutionEngine:
         execution = await self.execution_store.get_execution(execution_id)
         if execution is None:
             raise ExecutionNotFoundError(f"Execution '{execution_id}' was not found")
+        _reject_terminal_execution_replay(execution)
         workflow = await self.workflow_repository.get_workflow(execution.workflow_id)
         if workflow is None:
             raise WorkflowNotFoundError(f"Workflow '{execution.workflow_id}' was not found")
@@ -417,6 +638,8 @@ class ExecutionEngine:
         state.paused = False
         state.cancelled = False
         await self._hydrate_state_position(state)
+        cycle_policy = resolve_persistent_cycle_policy(execution)
+        cycle_number = self._mark_persistent_cycle_started(execution, cycle_policy)
 
         execution.status = ExecutionStatus.RUNNING
         if execution.started_at is None:
@@ -436,9 +659,16 @@ class ExecutionEngine:
                 "resume_checkpoint": resume_checkpoint,
             },
         )
+        if cycle_number is not None:
+            await self.emitter.emit(
+                state,
+                ExecutionEventType.EXECUTION_CYCLE_STARTED,
+                payload={"cycle_number": cycle_number, "policy": cycle_policy.model_dump()},
+            )
 
         try:
             ordered_nodes = self.planner.order_nodes(workflow)
+            incoming_edges = _incoming_edges(workflow)
             state.planned_node_ids = [node.id for node in ordered_nodes]
             state.terminal_node_ids = _terminal_executable_node_ids(workflow, ordered_nodes)
             retry_metadata = _task_retry_metadata(execution.metadata)
@@ -447,6 +677,8 @@ class ExecutionEngine:
             prior_node_outputs = retry_metadata.get("prior_node_outputs")
             if isinstance(prior_node_outputs, dict):
                 state.node_outputs = dict(prior_node_outputs)
+            for completed_node_id, completed_output in state.node_outputs.items():
+                state.node_outcomes.setdefault(completed_node_id, _node_outcome(completed_output))
             previous_task_context: tuple[WorkflowNodeDefinition, TaskDefinition, AgentDefinition] | None = None
 
             if workflow_policy.get("approval_mode") == "before_run":
@@ -461,7 +693,22 @@ class ExecutionEngine:
                 self._raise_if_cancelled(state)
                 if execution.worker_id:
                     await self.execution_store.heartbeat(execution.id, execution.worker_id)
-                if node.node_type != "task":
+                if node.node_type not in {"task", "approval"}:
+                    continue
+                if not _node_is_reachable(
+                        node,
+                        state=state,
+                        incoming_edges=incoming_edges,
+                ):
+                    await self.emitter.emit(
+                        state,
+                        ExecutionEventType.ROUTING_DECISION_RECORDED,
+                        payload={
+                            "node_id": node.id,
+                            "decision": "skipped",
+                            "reason": "No incoming edge matched completed source outcomes.",
+                        },
+                    )
                     continue
                 task = self._resolve_task(workflow, node.task_id)
                 if not retry_started:
@@ -476,6 +723,8 @@ class ExecutionEngine:
                 state.current_agent_id = agent.id
                 state.current_task_id = task.id
                 task_overrides = _task_runtime_overrides(task)
+                if task.human_approval_required or node.node_type == "approval":
+                    task_overrides["approval_policy"] = "required"
                 if "max_retries" not in task_overrides and "max_retries" in workflow_policy:
                     task_overrides["max_retries"] = workflow_policy["max_retries"]
                 if workflow_policy.get("approval_mode") == "all_tasks":
@@ -522,29 +771,64 @@ class ExecutionEngine:
                     task_id=task.id,
                 )
 
-                await self._maybe_request_task_approval(
-                    workflow=workflow,
-                    task=task,
-                    agent=agent,
-                    execution=execution,
-                    state=state,
-                    approval_policy=task_overrides.get("approval_policy"),
-                )
-
-                model_client = self.model_provider_registry.resolve(profile)
-                output, _messages = await self._execute_task_with_runtime_overrides(
-                    workflow=workflow,
-                    task=task,
-                    agent=agent,
-                    profile=profile,
-                    model_client=model_client,
-                    state=state,
-                    execution=execution,
-                    task_overrides=task_overrides,
-                    workflow_timeout_seconds=workflow_timeout_seconds,
-                )
+                try:
+                    await self._maybe_request_task_approval(
+                        workflow=workflow,
+                        task=task,
+                        agent=agent,
+                        execution=execution,
+                        state=state,
+                        approval_policy=task_overrides.get("approval_policy"),
+                    )
+                    model_client = self.model_provider_registry.resolve(profile)
+                    output, _messages = await self._execute_task_with_runtime_overrides(
+                        workflow=workflow,
+                        task=task,
+                        agent=agent,
+                        profile=profile,
+                        model_client=model_client,
+                        state=state,
+                        execution=execution,
+                        task_overrides=task_overrides,
+                        workflow_timeout_seconds=workflow_timeout_seconds,
+                    )
+                except (ExecutionPausedError, ExecutionCancelledError):
+                    raise
+                except Exception as exc:
+                    failure_edges = [
+                        edge
+                        for edge in workflow.edges
+                        if edge.source_node_id == node.id and edge.edge_type == EdgeType.FAILURE
+                    ]
+                    if not failure_edges:
+                        raise
+                    output = {
+                        "status": "failed",
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                        "approval_rejected": isinstance(exc, ApprovalRequiredError),
+                    }
+                    state.node_errors[node.id] = str(exc)
                 self._raise_if_cancelled(state)
+                required_tool_error = (
+                    _required_tool_result_error(task, state)
+                    if _node_outcome(output) == "success"
+                    else None
+                )
+                if required_tool_error is not None:
+                    # A model-authored "sent" response is not delivery proof.
+                    # Only recorded tool execution with the configured result
+                    # status can satisfy a task's side-effect contract.
+                    output = {
+                        "status": "failed",
+                        "error": required_tool_error,
+                        "error_type": "RequiredToolResultError",
+                    }
+                    state.node_errors[node.id] = required_tool_error
                 state.node_outputs[node.id] = output
+                state.node_outcomes[node.id] = _node_outcome(output)
+                if state.node_outcomes[node.id] == "failure":
+                    state.node_errors.setdefault(node.id, _node_failure_message(output))
                 execution.output_payload = _execution_checkpoint_payload(state)
                 await self.execution_store.update_execution(execution)
                 if handoff_edge is not None and previous_task_context is not None:
@@ -568,11 +852,55 @@ class ExecutionEngine:
                     f"Retry task '{retry_task_id}' was not found in workflow '{workflow.id}'"
                 )
 
-            execution.status = ExecutionStatus.COMPLETED
-            execution.output_payload = {
+            cycle_output = {
                 "node_outputs": state.node_outputs,
                 "final_output": next(reversed(state.node_outputs.values()), None) if state.node_outputs else None,
             }
+            execution.output_payload = cycle_output
+            if await self._handle_persistent_cycle_success(
+                    execution=execution,
+                    state=state,
+                    policy=cycle_policy,
+                    cycle_output=cycle_output,
+            ):
+                return execution
+
+            if state.node_errors:
+                error_message = next(iter(state.node_errors.values()))
+                if cycle_policy.enabled:
+                    await self._handle_persistent_cycle_failure(
+                        execution=execution,
+                        workflow=workflow,
+                        state=state,
+                        policy=cycle_policy,
+                        error=RuntimeError(error_message),
+                    )
+                    return execution
+                execution.status = ExecutionStatus.FAILED
+                execution.error = error_message
+                execution.completed_at = utc_now()
+                await self.execution_store.update_execution(execution)
+                failure_event = await self.emitter.emit(
+                    state,
+                    ExecutionEventType.EXECUTION_FAILED,
+                    payload={
+                        "error": error_message,
+                        "node_errors": dict(state.node_errors),
+                        "output": execution.output_payload,
+                    },
+                    metrics=collect_system_metrics(),
+                )
+                await self._maybe_retrieve_graph_context_after_execution_failure(
+                    workflow=workflow,
+                    execution=execution,
+                    state=state,
+                    error=error_message,
+                    failure_event_id=failure_event.id,
+                )
+                await self._maybe_handle_execution_completion(execution, workflow)
+                return execution
+
+            execution.status = ExecutionStatus.COMPLETED
             execution.completed_at = utc_now()
             await self.execution_store.update_execution(execution)
             await self.emitter.emit(
@@ -588,9 +916,36 @@ class ExecutionEngine:
             await self._maybe_handle_execution_completion(execution, workflow)
             return execution
         except ExecutionPausedError:
-            execution.status = ExecutionStatus.PAUSED
-            execution.output_payload = _execution_checkpoint_payload(state)
+            current = await self.execution_store.get_execution(execution.id)
+            if current is not None and current.status in DURABLE_WAIT_EXECUTION_STATUSES:
+                # A wait callback may pause the worker from another request.
+                # Preserve that durable status while the active coroutine unwinds.
+                execution.status = current.status
+                execution.metadata = current.metadata
+                execution.input_payload = current.input_payload
+            else:
+                execution.status = ExecutionStatus.PAUSED
+            execution.output_payload = _execution_checkpoint_payload(
+                state,
+                prior_payload=(current.output_payload if current is not None else execution.output_payload),
+            )
             await self.execution_store.update_execution(execution)
+            active_wait = (execution.metadata or {}).get("active_wait")
+            if (
+                execution.status == ExecutionStatus.WAITING_FOR_APPROVAL
+                and isinstance(active_wait, dict)
+                and isinstance(active_wait.get("wait_id"), str)
+            ):
+                await self.emitter.emit(
+                    state,
+                    ExecutionEventType.EXECUTION_WAITING,
+                    payload={
+                        "wait_id": active_wait["wait_id"],
+                        "kind": ExecutionWaitKind.APPROVAL.value,
+                        "status": ExecutionWaitStatus.PENDING.value,
+                        "source": "approval_manager",
+                    },
+                )
             await self.emitter.emit(state, ExecutionEventType.EXECUTION_PAUSED, payload={"execution_id": execution.id})
             return execution
         except ExecutionCancelledError:
@@ -602,6 +957,15 @@ class ExecutionEngine:
                                     payload={"execution_id": execution.id})
             return execution
         except Exception as exc:
+            if cycle_policy.enabled:
+                await self._handle_persistent_cycle_failure(
+                    execution=execution,
+                    workflow=workflow,
+                    state=state,
+                    policy=cycle_policy,
+                    error=exc,
+                )
+                return execution
             execution.status = ExecutionStatus.FAILED
             execution.error = str(exc)
             execution.output_payload = _execution_checkpoint_payload(state)
@@ -626,13 +990,15 @@ class ExecutionEngine:
     async def pause_execution(self, execution_id: str) -> Execution:
         execution, state = await self._require_execution_and_state(execution_id)
         state.paused = True
-        execution.status = ExecutionStatus.PAUSED
+        if execution.status not in DURABLE_WAIT_EXECUTION_STATUSES:
+            execution.status = ExecutionStatus.PAUSED
         await self.execution_store.update_execution(execution)
         await self.emitter.emit(state, ExecutionEventType.EXECUTION_PAUSED, payload={"execution_id": execution_id})
         return execution
 
     async def resume_execution(self, execution_id: str) -> Execution:
         execution, state = await self._require_execution_and_state(execution_id)
+        _reject_terminal_execution_replay(execution)
         state.paused = False
         execution.status = ExecutionStatus.QUEUED
         await self.execution_store.update_execution(execution)
@@ -668,6 +1034,357 @@ class ExecutionEngine:
         if execution is None:
             raise ExecutionNotFoundError(f"Execution '{execution_id}' was not found")
         return ExecutionStateSnapshot(execution=execution, state=self._states.get(execution_id))
+
+    @staticmethod
+    def _cycle_metadata(execution: Execution) -> dict[str, Any]:
+        metadata = dict(execution.metadata or {})
+        cycle = metadata.get("persistent_cycle")
+        cycle = dict(cycle) if isinstance(cycle, dict) else {}
+        metadata["persistent_cycle"] = cycle
+        execution.metadata = metadata
+        return cycle
+
+    def _mark_persistent_cycle_started(
+            self,
+            execution: Execution,
+            policy: PersistentCyclePolicy,
+    ) -> int | None:
+        if not policy.enabled:
+            return None
+        cycle = self._cycle_metadata(execution)
+        next_cycle = _positive_int(cycle.get("next_cycle_number"))
+        cycle_number = next_cycle or _positive_int(cycle.get("cycle_number")) or 1
+        cycle.update({
+            "enabled": True,
+            "cycle_number": cycle_number,
+            "phase": "running",
+            "cycle_started_at": utc_now().isoformat(),
+        })
+        cycle.pop("next_cycle_number", None)
+        cycle.pop("next_wake_at", None)
+        return cycle_number
+
+    async def _handle_persistent_cycle_success(
+            self,
+            *,
+            execution: Execution,
+            state: NativeExecutionState,
+            policy: PersistentCyclePolicy,
+            cycle_output: dict[str, Any],
+    ) -> bool:
+        if not policy.enabled:
+            return False
+        now = utc_now()
+        cycle = self._cycle_metadata(execution)
+        cycle_number = _positive_int(cycle.get("cycle_number")) or 1
+        signature = _cycle_progress_signature(cycle_output)
+        prior_signature = cycle.get("last_progress_signature")
+        no_progress_cycles = (
+            (_non_negative_int(cycle.get("no_progress_cycles")) or 0) + 1
+            if prior_signature == signature
+            else 0
+        )
+        cycle.update({
+            "cycle_number": cycle_number,
+            "consecutive_failures": 0,
+            "no_progress_cycles": no_progress_cycles,
+            "last_progress_signature": signature,
+            "last_cycle_completed_at": now.isoformat(),
+            "last_cycle_status": "completed",
+        })
+        cycle.pop("last_error", None)
+        execution.error = None
+        self._append_cycle_history(
+            cycle,
+            policy,
+            {
+                "cycle_number": cycle_number,
+                "status": "completed",
+                "completed_at": now.isoformat(),
+                "progress_signature": signature,
+            },
+        )
+
+        terminal_reason = None
+        if policy.max_cycles is not None and cycle_number >= policy.max_cycles:
+            terminal_reason = "max_cycles_reached"
+        elif policy.deadline_at is not None and now + timedelta(seconds=policy.interval_seconds) >= policy.deadline_at:
+            terminal_reason = "deadline_reached"
+        await self.emitter.emit(
+            state,
+            ExecutionEventType.EXECUTION_CYCLE_COMPLETED,
+            payload={
+                "cycle_number": cycle_number,
+                "progress_signature": signature,
+                "no_progress_cycles": no_progress_cycles,
+                "terminal_reason": terminal_reason,
+            },
+        )
+        if terminal_reason is not None:
+            cycle.update({"phase": "completed", "terminal_reason": terminal_reason})
+            return False
+
+        if (
+                policy.max_no_progress_cycles is not None
+                and no_progress_cycles >= policy.max_no_progress_cycles
+        ):
+            await self._pause_persistent_cycle_for_guard(
+                execution=execution,
+                state=state,
+                cycle_output=cycle_output,
+                reason="no_progress_limit_reached",
+                detail={"no_progress_cycles": no_progress_cycles},
+            )
+            return True
+
+        await self._schedule_persistent_cycle(
+            execution=execution,
+            state=state,
+            policy=policy,
+            cycle_output=cycle_output,
+            delay_seconds=policy.interval_seconds,
+            reason="cycle_completed",
+        )
+        return True
+
+    async def _handle_persistent_cycle_failure(
+            self,
+            *,
+            execution: Execution,
+            workflow: WorkflowDefinition,
+            state: NativeExecutionState,
+            policy: PersistentCyclePolicy,
+            error: Exception,
+    ) -> None:
+        now = utc_now()
+        cycle = self._cycle_metadata(execution)
+        cycle_number = _positive_int(cycle.get("cycle_number")) or 1
+        consecutive_failures = (_non_negative_int(cycle.get("consecutive_failures")) or 0) + 1
+        failed_output = _execution_checkpoint_payload(state)
+        execution.error = str(error)
+        cycle.update({
+            "cycle_number": cycle_number,
+            "consecutive_failures": consecutive_failures,
+            "last_cycle_completed_at": now.isoformat(),
+            "last_cycle_status": "failed",
+            "last_error": str(error),
+        })
+        self._append_cycle_history(
+            cycle,
+            policy,
+            {
+                "cycle_number": cycle_number,
+                "status": "failed",
+                "completed_at": now.isoformat(),
+                "error": str(error),
+            },
+        )
+        failure_event = await self.emitter.emit(
+            state,
+            ExecutionEventType.EXECUTION_CYCLE_FAILED,
+            payload={
+                "cycle_number": cycle_number,
+                "error": str(error),
+                "consecutive_failures": consecutive_failures,
+            },
+            metrics=collect_system_metrics(),
+        )
+        await self._maybe_retrieve_graph_context_after_execution_failure(
+            workflow=workflow,
+            execution=execution,
+            state=state,
+            error=str(error),
+            failure_event_id=failure_event.id,
+        )
+
+        if consecutive_failures >= policy.max_consecutive_failures:
+            await self._pause_persistent_cycle_for_guard(
+                execution=execution,
+                state=state,
+                cycle_output=failed_output,
+                reason="max_consecutive_failures_reached",
+                detail={"consecutive_failures": consecutive_failures},
+            )
+            return
+
+        delay_seconds = min(
+            policy.max_interval_seconds,
+            policy.interval_seconds * (policy.failure_backoff_multiplier ** (consecutive_failures - 1)),
+        )
+        if policy.deadline_at is not None and now + timedelta(seconds=delay_seconds) >= policy.deadline_at:
+            await self._pause_persistent_cycle_for_guard(
+                execution=execution,
+                state=state,
+                cycle_output=failed_output,
+                reason="deadline_reached_after_failure",
+                detail={"consecutive_failures": consecutive_failures},
+            )
+            return
+        await self._schedule_persistent_cycle(
+            execution=execution,
+            state=state,
+            policy=policy,
+            cycle_output=failed_output,
+            delay_seconds=delay_seconds,
+            reason="cycle_failed",
+        )
+
+    async def _schedule_persistent_cycle(
+            self,
+            *,
+            execution: Execution,
+            state: NativeExecutionState,
+            policy: PersistentCyclePolicy,
+            cycle_output: dict[str, Any],
+            delay_seconds: float,
+            reason: str,
+    ) -> None:
+        cycle = self._cycle_metadata(execution)
+        cycle_number = _positive_int(cycle.get("cycle_number")) or 1
+        next_cycle_number = cycle_number + 1
+        effective_delay_seconds = _cycle_delay_with_jitter(
+            execution_id=execution.id,
+            cycle_number=next_cycle_number,
+            delay_seconds=delay_seconds,
+            jitter_ratio=policy.jitter_ratio,
+        )
+        wake_at = utc_now() + timedelta(seconds=effective_delay_seconds)
+        cycle.update({
+            "phase": "sleeping",
+            "next_cycle_number": next_cycle_number,
+            "next_wake_at": wake_at.isoformat(),
+            "last_base_delay_seconds": delay_seconds,
+            "last_delay_seconds": effective_delay_seconds,
+        })
+        self._reset_cycle_checkpoint(execution, state, cycle_output)
+
+        # Persist the checkpoint before the wait. This mirrors other durable
+        # suspension paths and ensures a restart can reconstruct the next cycle.
+        execution.status = ExecutionStatus.PAUSED
+        execution.completed_at = None
+        await self.execution_store.update_execution(execution)
+        idempotency_key = f"persistent-cycle:{next_cycle_number}"
+        wait = ExecutionWait(
+            execution_id=execution.id,
+            kind=ExecutionWaitKind.SLEEP,
+            idempotency_key=idempotency_key,
+            checkpoint=deepcopy(execution.output_payload or {}),
+            request_payload={
+                "reason": reason,
+                "completed_cycle_number": cycle_number,
+                "next_cycle_number": next_cycle_number,
+            },
+            policy=policy.model_dump(),
+            wake_at=wake_at,
+            metadata={"source": "persistent_cycle", "reason": reason},
+        )
+        try:
+            wait = await self.execution_store.create_execution_wait(wait)
+        except ValueError:
+            pending = await self.execution_store.list_execution_waits(
+                execution.id,
+                status=ExecutionWaitStatus.PENDING,
+            )
+            if not pending or pending[0].idempotency_key != idempotency_key:
+                raise
+            wait = pending[0]
+
+        execution.status = ExecutionStatus.SLEEPING
+        execution.metadata = {
+            **(execution.metadata or {}),
+            "active_wait": {
+                "wait_id": wait.id,
+                "kind": wait.kind.value,
+                "created_at": wait.created_at.isoformat(),
+                "wake_at": wake_at.isoformat(),
+                "deadline_at": None,
+            },
+        }
+        await self.execution_store.update_execution(execution)
+        await self.emitter.emit(
+            state,
+            ExecutionEventType.EXECUTION_WAITING,
+            payload={
+                "wait_id": wait.id,
+                "kind": wait.kind.value,
+                "status": wait.status.value,
+                "wake_at": wake_at.isoformat(),
+                "source": "persistent_cycle",
+                "next_cycle_number": next_cycle_number,
+            },
+        )
+
+    async def _pause_persistent_cycle_for_guard(
+            self,
+            *,
+            execution: Execution,
+            state: NativeExecutionState,
+            cycle_output: dict[str, Any],
+            reason: str,
+            detail: dict[str, Any],
+    ) -> None:
+        cycle = self._cycle_metadata(execution)
+        cycle_number = _positive_int(cycle.get("cycle_number")) or 1
+        cycle.update({
+            "phase": "guarded",
+            "guard_reason": reason,
+            "next_cycle_number": cycle_number + 1,
+        })
+        self._reset_cycle_checkpoint(execution, state, cycle_output)
+        execution.status = ExecutionStatus.PAUSED
+        execution.completed_at = None
+        await self.execution_store.update_execution(execution)
+        await self.emitter.emit(
+            state,
+            ExecutionEventType.EXECUTION_CYCLE_GUARD_TRIGGERED,
+            payload={"cycle_number": cycle_number, "reason": reason, **detail},
+        )
+        await self.emitter.emit(
+            state,
+            ExecutionEventType.EXECUTION_PAUSED,
+            payload={"execution_id": execution.id, "reason": reason, "source": "persistent_cycle"},
+        )
+
+    @staticmethod
+    def _append_cycle_history(
+            cycle: dict[str, Any],
+            policy: PersistentCyclePolicy,
+            item: dict[str, Any],
+    ) -> None:
+        history = cycle.get("history")
+        history = list(history) if isinstance(history, list) else []
+        history.append(item)
+        cycle["history"] = history[-policy.history_limit:]
+
+    @staticmethod
+    def _reset_cycle_checkpoint(
+            execution: Execution,
+            state: NativeExecutionState,
+            cycle_output: dict[str, Any],
+    ) -> None:
+        execution.output_payload = {
+            "node_outputs": {},
+            "final_output": None,
+            "checkpoint": {
+                "current_node_id": None,
+                "current_task_id": None,
+                "completed_node_ids": [],
+                "node_outcomes": {},
+                "node_errors": {},
+                "task_tool_results": {},
+                "planned_node_ids": [],
+                "terminal_node_ids": [],
+            },
+            "last_cycle_output": deepcopy(cycle_output),
+        }
+        state.node_outputs = {}
+        state.node_outcomes = {}
+        state.node_errors = {}
+        state.task_tool_results = {}
+        state.current_node_id = None
+        state.current_task_id = None
+        state.planned_node_ids = []
+        state.terminal_node_ids = []
 
     async def _maybe_handle_execution_completion(
             self,
@@ -1060,7 +1777,7 @@ class ExecutionEngine:
                 agent_id=agent.id,
                 task_id=task.id,
             )
-            raise ExecutionPausedError(decision.reason or f"Task '{task.id}' approval was rejected.")
+            raise ApprovalRequiredError(decision.reason or f"Task '{task.id}' approval was rejected.")
         await self.emitter.emit(
             state,
             ExecutionEventType.APPROVAL_GRANTED,
@@ -1321,6 +2038,9 @@ class ExecutionEngine:
             if isinstance(checkpoint, dict):
                 state.current_node_id = checkpoint.get("current_node_id")
                 state.current_task_id = checkpoint.get("current_task_id")
+                state.node_outcomes = dict(checkpoint.get("node_outcomes") or {})
+                state.node_errors = dict(checkpoint.get("node_errors") or {})
+                state.task_tool_results = dict(checkpoint.get("task_tool_results") or {})
                 state.planned_node_ids = list(summary.get("planned_node_ids") or [])
                 state.terminal_node_ids = list(summary.get("terminal_node_ids") or [])
             return {
@@ -1353,6 +2073,9 @@ class ExecutionEngine:
         if isinstance(checkpoint, dict):
             state.current_node_id = checkpoint.get("current_node_id")
             state.current_task_id = checkpoint.get("current_task_id")
+            state.node_outcomes = dict(checkpoint.get("node_outcomes") or {})
+            state.node_errors = dict(checkpoint.get("node_errors") or {})
+            state.task_tool_results = dict(checkpoint.get("task_tool_results") or {})
             state.planned_node_ids = list(summary.get("planned_node_ids") or [])
             state.terminal_node_ids = list(summary.get("terminal_node_ids") or [])
         return {

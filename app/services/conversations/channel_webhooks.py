@@ -8,10 +8,9 @@ import time
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NoReturn
 
 from app.api.context import ApiContext
-from app.core.config import get_settings
 from app.domain import CredentialDefinition, CredentialStatus
 from app.integrations.connectors import normalize_connector_provider_key
 from app.integrations.secrets import resolve_secret_ref
@@ -29,13 +28,14 @@ class ChannelWebhookVerificationService:
             credential_id: str | None,
             headers: dict[str, str],
             body: bytes,
+            payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized = normalize_chat_channel_provider(provider) or provider.strip().lower()
         credential = await self._credential_for(provider=normalized, credential_id=credential_id)
         if credential is None:
-            if get_settings().app_env == "production":
-                raise ValueError("A connector credential is required to verify production webhooks.")
-            return {"verified": False, "required": False, "reason": "No connector credential supplied."}
+            # Environment labels do not establish a network boundary: development
+            # and test servers can still be tunneled or accidentally exposed.
+            raise ValueError("A connector credential is required to verify webhooks.")
 
         if credential.status != CredentialStatus.ACTIVE:
             raise ValueError(f"Credential '{credential.id}' is not active.")
@@ -47,7 +47,7 @@ class ChannelWebhookVerificationService:
         if normalized == "whatsapp":
             return self._verify_whatsapp(headers=headers, body=body, credential=credential)
         if normalized == "slack":
-            return self._verify_slack(headers=headers, body=body, credential=credential)
+            return self._verify_slack(headers=headers, body=body, credential=credential, payload=payload or {})
         if normalized == "microsoft-teams":
             return self._verify_teams(headers=headers, body=body, credential=credential)
         raise ValueError(f"Unsupported chat channel adapter '{provider}'")
@@ -67,11 +67,19 @@ class ChannelWebhookVerificationService:
         return chat_channel_connector_provider_key(provider)
 
     def _verify_telegram(self, *, headers: dict[str, str], credential: CredentialDefinition) -> dict[str, Any]:
-        expected = self._metadata_secret(credential, "webhook_secret_ref", "webhook_secret_token")
-        if expected is None:
-            return self._not_required_or_production_error("Telegram credential metadata requires webhook_secret_ref.")
         actual = headers.get("x-telegram-bot-api-secret-token", "")
-        if not hmac.compare_digest(actual, expected):
+        expected_hash = credential.metadata.get("webhook_secret_token_sha256")
+        if isinstance(expected_hash, str) and expected_hash.strip():
+            actual_hash = hashlib.sha256(actual.encode("utf-8")).hexdigest()
+            verified = hmac.compare_digest(actual_hash, expected_hash.strip().lower())
+        else:
+            expected = self._metadata_secret(credential, "webhook_secret_ref", "webhook_secret_token")
+            if expected is None:
+                self._verification_configuration_error(
+                    "Telegram credential metadata requires webhook_secret_ref."
+                )
+            verified = hmac.compare_digest(actual, expected)
+        if not verified:
             raise ValueError("Telegram webhook secret token verification failed.")
         return {"verified": True, "required": True, "provider": "telegram", "credential_id": credential.id}
 
@@ -79,7 +87,7 @@ class ChannelWebhookVerificationService:
         str, Any]:
         public_key = str(credential.metadata.get("webhook_public_key") or "").strip()
         if not public_key:
-            return self._not_required_or_production_error("Discord credential metadata requires webhook_public_key.")
+            self._verification_configuration_error("Discord credential metadata requires webhook_public_key.")
         signature = headers.get("x-signature-ed25519", "")
         timestamp = headers.get("x-signature-timestamp", "")
         if not signature or not timestamp:
@@ -95,7 +103,7 @@ class ChannelWebhookVerificationService:
         str, Any]:
         app_secret = self._metadata_secret(credential, "app_secret_ref", "app_secret")
         if app_secret is None:
-            return self._not_required_or_production_error("WhatsApp credential metadata requires app_secret_ref.")
+            self._verification_configuration_error("WhatsApp credential metadata requires app_secret_ref.")
         signature = headers.get("x-hub-signature-256", "")
         if not signature.startswith("sha256="):
             raise ValueError("WhatsApp x-hub-signature-256 header is required.")
@@ -104,11 +112,17 @@ class ChannelWebhookVerificationService:
             raise ValueError("WhatsApp webhook signature verification failed.")
         return {"verified": True, "required": True, "provider": "whatsapp", "credential_id": credential.id}
 
-    def _verify_slack(self, *, headers: dict[str, str], body: bytes, credential: CredentialDefinition) -> dict[
-        str, Any]:
+    def _verify_slack(
+            self,
+            *,
+            headers: dict[str, str],
+            body: bytes,
+            credential: CredentialDefinition,
+            payload: dict[str, Any],
+    ) -> dict[str, Any]:
         signing_secret = self._metadata_secret(credential, "signing_secret_ref", "signing_secret")
         if signing_secret is None:
-            return self._not_required_or_production_error("Slack credential metadata requires signing_secret_ref.")
+            self._verification_configuration_error("Slack credential metadata requires signing_secret_ref.")
         signature = headers.get("x-slack-signature", "")
         timestamp = headers.get("x-slack-request-timestamp", "")
         if not signature or not timestamp:
@@ -126,6 +140,19 @@ class ChannelWebhookVerificationService:
         ).hexdigest()
         if not hmac.compare_digest(signature, expected):
             raise ValueError("Slack webhook signature verification failed.")
+        expected_team_id = str(
+            credential.metadata.get("workspace_id")
+            or credential.metadata.get("team_id")
+            or ""
+        ).strip()
+        team = payload.get("team") if isinstance(payload.get("team"), dict) else {}
+        actual_team_id = str(payload.get("team_id") or team.get("id") or "").strip()
+        if not expected_team_id or not actual_team_id:
+            raise ValueError("Slack webhook team binding is required.")
+        if not hmac.compare_digest(actual_team_id, expected_team_id):
+            # An app-wide signing secret proves Slack origin, not which saved
+            # installation is entitled to receive or answer the event.
+            raise ValueError("Slack webhook team does not match the connector credential.")
         return {"verified": True, "required": True, "provider": "slack", "credential_id": credential.id}
 
     def _verify_teams(self, *, headers: dict[str, str], body: bytes, credential: CredentialDefinition) -> dict[
@@ -135,7 +162,7 @@ class ChannelWebhookVerificationService:
         # adapter boundary in place without blocking the backend-first channel path.
         secret = self._metadata_secret(credential, "webhook_secret_ref", "webhook_secret")
         if secret is None:
-            return self._not_required_or_production_error(
+            self._verification_configuration_error(
                 "Microsoft Teams credential metadata requires webhook_secret_ref.")
         signature = headers.get("x-ms-signature", "")
         if not signature:
@@ -163,10 +190,8 @@ class ChannelWebhookVerificationService:
             return value.strip()
         return None
 
-    def _not_required_or_production_error(self, reason: str) -> dict[str, Any]:
-        if get_settings().app_env == "production":
-            raise ValueError(reason)
-        return {"verified": False, "required": False, "reason": reason}
+    def _verification_configuration_error(self, reason: str) -> NoReturn:
+        raise ValueError(reason)
 
 
 __all__ = ["ChannelWebhookVerificationService"]

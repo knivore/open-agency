@@ -8,7 +8,12 @@ from app.runtime.containers import RuntimeContainerState
 from app.runtime.native.events import ExecutionEventEmitter
 from app.runtime.native.state import InMemoryExecutionStore, NativeExecutionState
 from app.runtime.reconcile import RuntimeReconciler
-from app.runtime.worker_protocol import WORKER_EXIT_CANCELLED, WORKER_EXIT_SUCCESS, WORKER_EXIT_WORKFLOW_FAILED
+from app.runtime.worker_protocol import (
+    WORKER_EXIT_CANCELLED,
+    WORKER_EXIT_SUCCESS,
+    WORKER_EXIT_SUSPENDED,
+    WORKER_EXIT_WORKFLOW_FAILED,
+)
 
 
 class _FakeRuntimeContainerManager:
@@ -212,6 +217,54 @@ class RuntimeReconcilerTests(unittest.IsolatedAsyncioTestCase):
         event_types = [event.event_type.value for event in events]
         self.assertIn("container.stopped", event_types)
         self.assertIn("execution.cancelled", event_types)
+
+    async def test_reconcile_preserves_sleeping_execution_when_worker_suspends(self) -> None:
+        finished_at = utc_now()
+        execution = await self._save_execution(
+            execution_id="exec-sleeping",
+            status=ExecutionStatus.SLEEPING,
+            container_id="container-sleeping",
+            container_status="running",
+        )
+        execution.metadata["execution_lifecycle"] = {
+            "run_mode": "always_on",
+            "terminate_container_on_completion": True,
+            "persistent_cycle": {"enabled": True},
+        }
+        await self.execution_store.update_execution(execution)
+        manager = _FakeRuntimeContainerManager(
+            [
+                RuntimeContainerState(
+                    container_id="container-sleeping",
+                    name="agency-execution-exec-sleeping",
+                    image="agency-runtime:rev-1",
+                    status="exited",
+                    labels={"agency.execution_id": execution.id},
+                    finished_at=finished_at,
+                    exit_code=WORKER_EXIT_SUSPENDED,
+                )
+            ]
+        )
+        reconciler = RuntimeReconciler(execution_store=self.execution_store, runtime_container_manager=manager)
+
+        report = await reconciler.reconcile_once()
+
+        current = await self.execution_store.get_execution(execution.id)
+        events = await self.execution_store.list_events(execution.id)
+        assert current is not None
+        self.assertEqual(current.status, ExecutionStatus.SLEEPING)
+        self.assertIsNone(current.completed_at)
+        self.assertEqual(current.container_status, "removed")
+        self.assertIsNone(current.container_id)
+        self.assertEqual(manager.removed, [("container-sleeping", True)])
+        self.assertEqual(
+            [action.action for action in report.actions],
+            ["execution_container_exited", "execution_container_removed"],
+        )
+        event_types = [event.event_type.value for event in events]
+        self.assertIn("container.stopped", event_types)
+        self.assertNotIn("execution.completed", event_types)
+        self.assertNotIn("execution.failed", event_types)
 
     async def test_reconcile_can_retain_finished_container_for_always_on_execution(self) -> None:
         finished_at = utc_now()

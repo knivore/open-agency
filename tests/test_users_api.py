@@ -65,6 +65,71 @@ class UsersApiTests(unittest.TestCase):
         unsynced_response = self.client.get("/me", headers={"x-agency-user-email": "missing@example.com"})
         self.assertEqual(unsynced_response.status_code, 404)
 
+    def test_current_user_can_update_profile_settings_that_survive_identity_sync(self) -> None:
+        self.client.post(
+            "/users/sync",
+            json={
+                "id": "user-1",
+                "email": "owner@example.com",
+                "display_name": "Identity Name",
+                "provider": "nextauth",
+                "provider_subject": "provider-subject-1",
+            },
+        )
+
+        response = self.client.patch(
+            "/me/profile",
+            headers={"x-agency-user-email": "owner@example.com"},
+            json={"display_name": "Preferred Name", "timezone": "Asia/Singapore"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["display_name"], "Preferred Name")
+        self.assertEqual(
+            response.json()["metadata"]["profile_preferences"]["timezone"],
+            "Asia/Singapore",
+        )
+
+        resync = self.client.post(
+            "/users/sync",
+            json={
+                "email": "owner@example.com",
+                "display_name": "Identity Name Again",
+                "provider": "nextauth",
+                "provider_subject": "provider-subject-1",
+            },
+        )
+        self.assertEqual(resync.status_code, 200)
+        self.assertEqual(resync.json()["display_name"], "Preferred Name")
+
+    def test_current_user_profile_rejects_unknown_timezone(self) -> None:
+        self.client.post(
+            "/users/sync",
+            json={"id": "user-1", "email": "owner@example.com"},
+        )
+
+        response = self.client.patch(
+            "/me/profile",
+            headers={"x-agency-user-email": "owner@example.com"},
+            json={"display_name": "Owner", "timezone": "Mars/Olympus"},
+        )
+
+        self.assertEqual(response.status_code, 422)
+
+    def test_current_user_profile_rejects_blank_display_name(self) -> None:
+        self.client.post(
+            "/users/sync",
+            json={"id": "user-1", "email": "owner@example.com"},
+        )
+
+        response = self.client.patch(
+            "/me/profile",
+            headers={"x-agency-user-email": "owner@example.com"},
+            json={"display_name": "   ", "timezone": "UTC"},
+        )
+
+        self.assertEqual(response.status_code, 422)
+
     def test_me_falls_back_to_trusted_identity_when_bearer_token_is_invalid(self) -> None:
         self.client.post(
             "/users/sync",

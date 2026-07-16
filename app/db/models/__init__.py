@@ -18,6 +18,7 @@ from .executions import (
     ExecutionArtifactORM,
     ExecutionEventORM,
     ExecutionORM,
+    ExecutionWaitORM,
     ToolInvocationORM,
 )
 from .goals import GoalORM
@@ -63,6 +64,7 @@ __all__ = [
     "ExecutionArtifactORM",
     "ExecutionEventORM",
     "ExecutionORM",
+    "ExecutionWaitORM",
     "GoalORM",
     "GraphProjectionEventORM",
     "MainAgentProfileORM",

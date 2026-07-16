@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from app.core.config import get_settings
+from app.core.outbound_http import validate_outbound_http_url
 from app.core.onecli_http import ONECLI_BLOCKED_HEADER_NAMES, ONECLI_BLOCKED_QUERY_PARAM_NAMES
 from app.integrations.onecli import build_onecli_proxy_url
 from app.tools.input_mapping import convert_str_to_dict, interpolate
@@ -50,8 +51,15 @@ def execute_custom_api(
         tool_context: Any | None = None,
         **kwargs: Any,
 ) -> dict[str, Any]:
-    interpolation_context = _connector_interpolation_context(tool_context)
-    interpolation_context.update(kwargs)
+    trusted_context = _connector_interpolation_context(tool_context)
+    collisions = sorted(set(kwargs).intersection(trusted_context))
+    if collisions:
+        # Runtime-selected connector identity is authoritative; rejecting the
+        # collision makes attempted tenant/credential substitution auditable.
+        raise ValueError(
+            "Dynamic HTTP arguments cannot override connector context keys: " + ", ".join(collisions)
+        )
+    interpolation_context = {**kwargs, **trusted_context}
 
     resolved_url = interpolate(str(url).rstrip("/"), interpolation_context)
     resolved_method = method.upper()
@@ -123,6 +131,10 @@ def execute_custom_api(
                 onecli_metadata=onecli_metadata,
             )
 
+    # Reject credential-policy violations before URL policy so callers receive
+    # the most actionable denial, but validate the destination before any I/O.
+    validate_outbound_http_url(resolved_url, allowed_hosts=settings.parsed_tool_http_allowed_hosts)
+
     try:
         response = requests.request(
             method=resolved_method,
@@ -133,6 +145,8 @@ def execute_custom_api(
             json=resolved_body,
             verify=ca_bundle_path or verify_ssl,
             proxies=proxies,
+            allow_redirects=False,
+            timeout=30,
         )
     except Exception as exc:
         if onecli_metadata is not None and emit_onecli_events:

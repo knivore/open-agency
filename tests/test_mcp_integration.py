@@ -18,7 +18,7 @@ from app.domain import AgentDefinition, MCPServerDefinition, MCPTransportType, M
     UserDefinition, WorkflowDefinition, WorkflowNodeDefinition
 from app.llm.base import ModelResponse, ModelToolCall
 from app.protocols.mcp.computer_use_adapter import adapt_computer_use_arguments, normalize_computer_use_response
-from app.protocols.mcp.client import build_mcp_process_environment, resolve_mcp_command
+from app.protocols.mcp.client import MCPClientError, build_mcp_process_environment, resolve_mcp_command
 from app.protocols.mcp.registry import MCPClientRegistry, MCPRegistryError
 from app.protocols.mcp.schemas import MCPToolDescriptor
 from app.protocols.mcp.tool_adapter import mcp_tool_to_definition
@@ -35,7 +35,13 @@ class MCPModelClient:
 
     def generate_text(self, messages, *, temperature=None, max_tokens=None, **kwargs):
         self.calls += 1
-        if self.calls == 1:
+        # A resumed worker gets a fresh client, so the durable transcript rather
+        # than process-local call count determines whether the tool already ran.
+        has_tool_result = any(
+            getattr(message, "role", None) == "tool"
+            for message in messages
+        )
+        if not has_tool_result:
             return ModelResponse(
                 content="Use the MCP tool",
                 tool_calls=[
@@ -121,6 +127,87 @@ class MCPIntegrationTests(unittest.TestCase):
         with self.assertRaisesRegex(MCPRegistryError, "does not match command"):
             registry.discover("mcp-mismatch")
 
+    def test_production_mcp_package_runners_require_exact_versions(self):
+        settings = type(
+            "MCPSettings",
+            (),
+            {"app_env": "production", "parsed_mcp_server_allowed_commands": {"npx", "uvx"}},
+        )()
+        cases = (
+            ("npx", ["-y", "firecrawl-mcp@1.2.3"], True),
+            ("npx", ["-y", "@upstash/context7-mcp@1.2.3-beta.1"], True),
+            ("npx", ["-y", "firecrawl-mcp"], False),
+            ("npx", ["-y", "firecrawl-mcp@latest"], False),
+            ("npx", ["-y", "firecrawl-mcp@^1.2.3"], False),
+            ("npx", ["--package=mutable-package", "firecrawl-mcp@1.2.3"], False),
+            ("uvx", ["macos-mcp==0.3.0"], True),
+            ("uvx", ["macos-mcp==0.3.0rc1"], True),
+            ("uvx", ["macos-mcp"], False),
+            ("uvx", ["macos-mcp>=0.3.0"], False),
+            ("uvx", ["macos-mcp==latest"], False),
+            ("uvx", ["macos-mcp==*"], False),
+            ("uvx", ["macos-mcp==0.3.*"], False),
+            ("uvx", ["macos-mcp~=0.3.0rc1"], False),
+            ("uvx", ["git+https://example.test/macos-mcp.git"], False),
+            ("uvx", ["/tmp/macos-mcp"], False),
+            ("uvx", ["--with", "mutable-package", "macos-mcp==0.3.0"], False),
+            ("uvx", ["--editable", "/tmp/mutable-package", "macos-mcp==0.3.0"], False),
+        )
+
+        with patch("app.protocols.mcp.registry.get_settings", return_value=settings):
+            for command, args, accepted in cases:
+                with self.subTest(command=command, args=args):
+                    definition = MCPServerDefinition(
+                        id=f"mcp-package-pin-{command}",
+                        name="Package Pin Test",
+                        transport=MCPTransportType.STDIO,
+                        command=command,
+                        args=args,
+                        enabled=True,
+                        allowlisted_command=command,
+                    )
+                    if accepted:
+                        MCPClientRegistry()._validate_server(definition)
+                    else:
+                        with self.assertRaisesRegex(MCPRegistryError, "exact package version"):
+                            MCPClientRegistry()._validate_server(definition)
+
+    def test_production_mcp_rejects_package_runner_outside_operator_allowlist(self):
+        settings = type(
+            "MCPSettings",
+            (),
+            {"app_env": "production", "parsed_mcp_server_allowed_commands": {"uvx"}},
+        )()
+        definition = MCPServerDefinition(
+            id="mcp-command-not-allowed",
+            name="Disallowed Package Runner",
+            transport=MCPTransportType.STDIO,
+            command="npx",
+            args=["firecrawl-mcp@1.2.3"],
+            enabled=True,
+            allowlisted_command="npx",
+        )
+
+        with patch("app.protocols.mcp.registry.get_settings", return_value=settings):
+            with self.assertRaisesRegex(MCPRegistryError, "MCP_SERVER_ALLOWED_COMMANDS"):
+                MCPClientRegistry()._validate_server(definition)
+
+    def test_production_builtin_mcp_rejects_override_until_operator_pins_version(self):
+        settings = type(
+            "MCPSettings",
+            (),
+            {"app_env": "production", "parsed_mcp_server_allowed_commands": {"npx", "uvx"}},
+        )()
+        with patch("app.protocols.mcp.registry.get_settings", return_value=settings):
+            with patch.dict(os.environ, {"COMPUTER_USE_MACOS_MCP_ARGS": "macos-mcp"}):
+                default_server = self.context._computer_use_server_specs()[0]
+            with self.assertRaisesRegex(MCPRegistryError, "exact package version"):
+                MCPClientRegistry()._validate_server(default_server)
+
+            with patch.dict(os.environ, {"COMPUTER_USE_MACOS_MCP_ARGS": "macos-mcp==0.3.0"}):
+                pinned_server = self.context._computer_use_server_specs()[0]
+            MCPClientRegistry()._validate_server(pinned_server)
+
     async def _assert_discovery_syncs_tools_resources_and_prompts(self):
         sync = await self.context.sync_mcp_catalog(server_id="mcp-mock")
         self.assertTrue(sync["tools"])
@@ -146,11 +233,12 @@ class MCPIntegrationTests(unittest.TestCase):
         windows_server = first[self.context.COMPUTER_USE_WINDOWS_MCP_SERVER_ID]
 
         self.assertEqual(macos_server.command, "uvx")
-        self.assertEqual(macos_server.args, ["macos-mcp"])
+        self.assertEqual(macos_server.args, ["macos-mcp==0.3.10"])
         self.assertEqual(macos_server.metadata["platform"], "macos")
         self.assertEqual(macos_server.allowlisted_command, "uvx")
         self.assertEqual(windows_server.command, "uvx")
         self.assertEqual(windows_server.args, ["windows-mcp"])
+        self.assertFalse(windows_server.enabled)
         self.assertEqual(windows_server.metadata["platform"], "windows")
         self.assertEqual(windows_server.allowlisted_command, "uvx")
 
@@ -161,7 +249,7 @@ class MCPIntegrationTests(unittest.TestCase):
         server = seeded[self.context.FIRECRAWL_MCP_SERVER_ID]
         self.assertTrue(server.enabled)
         self.assertEqual(server.command, "npx")
-        self.assertEqual(server.args, ["-y", "firecrawl-mcp"])
+        self.assertEqual(server.args, ["-y", "firecrawl-mcp@3.22.3"])
         self.assertEqual(server.allowlisted_command, "npx")
         self.assertEqual(server.env_refs[0].ref, "env://FIRECRAWL_API_KEY")
         self.assertEqual(server.env_refs[0].key, "FIRECRAWL_API_KEY")
@@ -173,7 +261,7 @@ class MCPIntegrationTests(unittest.TestCase):
         server = seeded[self.context.CONTEXT7_MCP_SERVER_ID]
         self.assertTrue(server.enabled)
         self.assertEqual(server.command, "npx")
-        self.assertEqual(server.args, ["-y", "@upstash/context7-mcp"])
+        self.assertEqual(server.args, ["-y", "@upstash/context7-mcp@3.2.3"])
         self.assertEqual(server.allowlisted_command, "npx")
         self.assertEqual(server.env_refs[0].ref, "env://CONTEXT7_API_KEY")
         self.assertEqual(server.env_refs[0].key, "CONTEXT7_API_KEY")
@@ -220,6 +308,29 @@ class MCPIntegrationTests(unittest.TestCase):
         self.assertEqual(env["PATH"].split(os.pathsep)[0], temp_dir)
         self.assertIn("/opt/homebrew/bin", env["PATH"].split(os.pathsep))
         self.assertEqual(resolved_command, str(npx_path))
+
+    def test_stdio_mcp_env_ref_cannot_launder_disallowed_source_into_allowed_target(self):
+        server = MCPServerDefinition(
+            id="mcp-env-source",
+            name="Env MCP Source",
+            transport=MCPTransportType.STDIO,
+            command="npx",
+            env_refs=[
+                {
+                    "ref": "env://DATABASE_URL",
+                    "key": "FIRECRAWL_API_KEY",
+                    "source": "env",
+                }
+            ],
+            enabled=True,
+            allowlisted_command="npx",
+        )
+        with patch("app.protocols.mcp.client.get_settings") as settings:
+            settings.return_value.app_env = "development"
+            settings.return_value.mcp_server_extra_paths = ""
+            settings.return_value.parsed_mcp_server_allowed_env_vars = {"FIRECRAWL_API_KEY"}
+            with self.assertRaisesRegex(MCPClientError, "source env var is not allowed"):
+                build_mcp_process_environment(server)
 
     async def _seed_builtin_computer_use_servers(self) -> tuple[
         dict[str, MCPServerDefinition], dict[str, MCPServerDefinition]]:
@@ -270,6 +381,38 @@ class MCPIntegrationTests(unittest.TestCase):
         self.assertEqual(snapshot_definition.name, "snapshot")
         self.assertEqual(snapshot_definition.display_name, "Snapshot")
         self.assertEqual(snapshot_definition.framework_hints.metadata["remote_tool_name"], "Snapshot")
+
+    def test_neutral_remote_descriptor_fails_closed_for_approval_and_redaction(self):
+        server = MCPServerDefinition(
+            id="mcp-neutral-descriptor",
+            name="Neutral Descriptor MCP",
+            transport=MCPTransportType.STDIO,
+            command="synthetic-mcp",
+            enabled=True,
+            allowlisted_command="synthetic-mcp",
+        )
+        descriptor = MCPToolDescriptor(
+            name="process_data",
+            description="Transform an input payload",
+            input_schema={
+                "type": "object",
+                "properties": {"api_token": {"type": "string"}},
+            },
+            # A remote server controls these claims, so benign hints cannot relax
+            # Agency's approval or execution-event redaction boundary.
+            annotations={"readOnlyHint": True},
+            metadata={"risk_level": "low"},
+        )
+
+        definition = mcp_tool_to_definition(server, descriptor)
+
+        self.assertTrue(definition.security.requires_approval)
+        self.assertTrue(definition.security.redaction_enabled)
+        self.assertEqual(definition.security.allowlisted_mcp_servers, [server.id])
+        self.assertEqual(
+            definition.security.redaction_rules,
+            ["authorization", "token", "secret", "password"],
+        )
 
     def test_computer_use_argument_adapter_uses_remote_schema_hints(self):
         server = MCPServerDefinition(
@@ -364,6 +507,37 @@ class MCPIntegrationTests(unittest.TestCase):
         self.assertEqual(normalized["artifact_media_type"], "image/png")
         self.assertEqual(normalized["request"]["display"], [1])
         self.assertEqual(normalized["raw_result"], raw_result)
+
+    def test_computer_use_type_and_clipboard_tools_redact_content_containers(self):
+        server = MCPServerDefinition(
+            id=self.context.COMPUTER_USE_MACOS_MCP_SERVER_ID,
+            name="Computer Use macOS MCP",
+            transport=MCPTransportType.STDIO,
+            command="uvx",
+            args=["macos-mcp"],
+            enabled=True,
+            allowlisted_command="uvx",
+            metadata={"family": "computer_use", "platform": "macos"},
+        )
+
+        for name in ("Type", "Clipboard"):
+            with self.subTest(name=name):
+                definition = mcp_tool_to_definition(
+                    server,
+                    MCPToolDescriptor(
+                        name=name,
+                        description=f"{name} content",
+                        input_schema={"type": "object", "properties": {"text": {"type": "string"}}},
+                        annotations={"readOnlyHint": False},
+                        metadata={},
+                    ),
+                )
+                self.assertTrue(definition.security.redaction_enabled)
+                self.assertTrue(
+                    {"request", "raw_result", "data", "text", "content"}.issubset(
+                        set(definition.security.redaction_rules)
+                    )
+                )
 
     def test_computer_use_response_normalizer_uses_file_backed_screenshot_artifact(self):
         server = MCPServerDefinition(
@@ -507,7 +681,11 @@ class MCPIntegrationTests(unittest.TestCase):
 
         approved = await self.context.control_plane.approve(execution.id, risky_tool.id, "approved")
         self.assertTrue(approved)
-        await asyncio.sleep(0.05)
+        for _ in range(40):
+            final = await self.context.execution_store.get_execution(execution.id)
+            if final is not None and final.status.value == "completed":
+                break
+            await asyncio.sleep(0.01)
 
         final = await self.context.execution_store.get_execution(execution.id)
         self.assertEqual(final.status.value, "completed")

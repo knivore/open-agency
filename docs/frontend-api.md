@@ -694,7 +694,8 @@ payloads. The expected UI flow is:
 2. Runtime creates an approval request when a gated tool is about to execute.
 3. Frontend reads approval state from execution and event data.
 4. User approves or rejects.
-5. Runtime resumes and records the decision in execution events and approval request state.
+5. Runtime resolves the durable wait, starts a fresh worker, resumes the saved tool-call checkpoint, and records the
+   decision in execution events and approval request state.
 
 Workflow monitoring controls include `delegate_hitl_to_main_agent`. When enabled, the main-agent monitor can treat
 HITL review steering as delegated to the main agent instead of creating a human conversation approval. The run detail UI
@@ -707,6 +708,11 @@ render approve/reject controls. Run detail reconstructs native approval activity
 `approval.granted`, `approval.rejected`, `execution.metadata.pending_approval`, and persisted rows from
 `GET /executions/{execution_id}/approvals`; conversation approvals remain a separate section because they use the
 conversation approval API.
+
+While an execution is `waiting_for_approval`, run detail should expose the active checkpoint before the general evidence
+tabs. Show the requested tool, task, wait id, whether the worker has been released, and direct **Approve and resume** and
+**Reject and resume** controls when a persisted request id exists. Keep historical and delegated decisions in the full
+Approvals tab. An event-only pending activity without a persisted request is informative, not actionable.
 
 `GET /executions/{execution_id}/approvals` returns the durable native approval rows for an execution:
 

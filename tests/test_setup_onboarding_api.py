@@ -15,9 +15,22 @@ class SetupOnboardingApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.preference_path = Path(self.temp_dir.name) / "tunnel-preference.json"
+        self.openvoice_root = Path(self.temp_dir.name) / "openvoice"
+        self.openvoice_checkpoints = Path(self.temp_dir.name) / "checkpoints"
+        self.openvoice_settings = Path(self.temp_dir.name) / "openvoice-settings.json"
+        (self.openvoice_root / ".venv" / "bin").mkdir(parents=True)
+        (self.openvoice_root / ".venv" / "bin" / "python").write_text("", encoding="utf-8")
+        (self.openvoice_checkpoints / "base_speakers" / "EN").mkdir(parents=True)
+        (self.openvoice_checkpoints / "base_speakers" / "EN" / "config.json").write_text("{}")
+        (self.openvoice_checkpoints / "base_speakers" / "EN" / "checkpoint.pth").write_bytes(b"model")
         self.env_patch = patch.dict(
             os.environ,
-            {"AGENCY_TUNNEL_PREFERENCE_PATH": str(self.preference_path)},
+            {
+                "AGENCY_TUNNEL_PREFERENCE_PATH": str(self.preference_path),
+                "AGENCY_OPENVOICE_ROOT": str(self.openvoice_root),
+                "AGENCY_OPENVOICE_CHECKPOINTS_DIR": str(self.openvoice_checkpoints),
+                "AGENCY_OPENVOICE_SETTINGS_PATH": str(self.openvoice_settings),
+            },
         )
         self.env_patch.start()
         self.context = create_test_api_context()
@@ -92,6 +105,47 @@ class SetupOnboardingApiTests(unittest.TestCase):
         self.assertEqual(body["embedding_agent_id"], "embedding")
         self.assertEqual(body["embedding_model_profile_id"], "embedding-nemotron-nano")
         self.assertEqual(body["evaluation_agent_id"], "evaluation")
+
+    def test_setup_can_manage_optional_openvoice_voice(self) -> None:
+        initial = self.client.get("/setup/openvoice", headers=self.auth_headers)
+        self.assertEqual(initial.status_code, 200)
+        self.assertTrue(initial.json()["ready"])
+        self.assertEqual(initial.json()["settings"]["default_voice"], "friendly")
+
+        updated = self.client.put(
+            "/setup/openvoice",
+            headers=self.auth_headers,
+            json={"default_voice": "cheerful"},
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json()["settings"]["default_voice"], "cheerful")
+        self.assertTrue(self.openvoice_settings.is_file())
+
+        setup_status = self.client.get("/setup/status")
+        self.assertEqual(setup_status.status_code, 200)
+        self.assertTrue(setup_status.json()["openvoice"]["optional"])
+        self.assertNotIn("openvoice_not_configured", setup_status.json()["blockers"])
+
+    def test_openvoice_diagnostic_samples_use_unique_storage_keys(self) -> None:
+        audio_path = Path(self.temp_dir.name) / "sample.wav"
+        audio_path.write_bytes(b"RIFFtest-audio")
+        generated = {
+            "status": "generated",
+            "provider": "openvoice_local",
+            "voice": "friendly",
+            "file_path": str(audio_path),
+            "content_type": "audio/wav",
+        }
+
+        with patch("app.api.routes.setup.generate_voice", return_value=generated) as generate:
+            first = self.client.post("/setup/openvoice/test", headers=self.auth_headers, json={})
+            second = self.client.post("/setup/openvoice/test", headers=self.auth_headers, json={})
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        output_names = [call.kwargs["output_name"] for call in generate.call_args_list]
+        self.assertEqual(len(output_names), 2)
+        self.assertNotEqual(output_names[0], output_names[1])
 
     def test_setup_rejects_openai_without_api_key(self) -> None:
         response = self.client.post(

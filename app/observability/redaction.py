@@ -6,8 +6,10 @@ from typing import Any
 
 DEFAULT_SECRET_PATTERNS = [
     r"sk-[A-Za-z0-9_\-]{10,}",
-    r"Bearer\s+[A-Za-z0-9._\-]+",
-    r"(?i)(api[_-]?key|token|password|secret)",
+    r"(?i)Bearer\s+[A-Za-z0-9._~+/=\-]+",
+    # Redact the label and adjacent value together. Matching only labels leaves
+    # the reusable credential visible in logs and persisted event payloads.
+    r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|token|password|secret|authorization)\b(?:\s*[:=]\s*|\s+(?:is|value)\s+)[\"']?[^\s,\"'}&]+",
 ]
 
 SECRET_KEY_NAMES = {

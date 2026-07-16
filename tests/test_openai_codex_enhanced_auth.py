@@ -245,7 +245,9 @@ class TestOpenAICodexEnhancedAuth(unittest.TestCase):
                 return completed
 
             client = OpenAICodexModelClient(profile, env_config)
-            with patch("app.llm.openai_codex.shutil.which", return_value="codex"), patch(
+            with patch.dict(
+                "os.environ", {"CODEX_CLI_SANDBOX": "workspace-write", "CODEX_CLI_CWD": tmpdir}, clear=False
+            ), patch("app.llm.openai_codex.shutil.which", return_value="codex"), patch(
                 "app.llm.openai_codex.subprocess.run",
                 side_effect=fake_run,
             ) as mock_run, patch("app.llm.openai_codex.tempfile.NamedTemporaryFile") as mock_tmp:
@@ -255,9 +257,11 @@ class TestOpenAICodexEnhancedAuth(unittest.TestCase):
                 response = client.generate_text([])
 
         self.assertEqual(response.content, "CLI response")
-        self.assertIn("--sandbox", mock_run.call_args.args[0])
+        command = mock_run.call_args.args[0]
+        sandbox_index = command.index("--sandbox")
+        self.assertEqual(command[sandbox_index + 1], "workspace-write")
 
-    def test_codex_client_cli_sandbox_is_configurable(self):
+    def test_codex_client_profile_cannot_weaken_operator_sandbox_or_change_cwd(self):
         profile = ModelProfileDefinition(
             id="test-profile",
             name="Test Profile",
@@ -268,6 +272,8 @@ class TestOpenAICodexEnhancedAuth(unittest.TestCase):
                 "auth_mode": "chatgpt",
                 "access_token": "chatgpt-token",
                 "codex_cli_sandbox": "danger-full-access",
+                "codex_binary": "/profile/controlled/codex",
+                "codex_cwd": "/profile/controlled/workspace",
             },
         )
         env_config = MagicMock()
@@ -287,9 +293,16 @@ class TestOpenAICodexEnhancedAuth(unittest.TestCase):
                 return completed
 
             client = OpenAICodexModelClient(profile, env_config)
-            with patch("app.llm.openai_codex.shutil.which", return_value="codex"), patch(
-                "app.llm.openai_codex.subprocess.run",
-                side_effect=fake_run,
+            with patch.dict(
+                "os.environ",
+                {
+                    "CODEX_CLI_BINARY": "operator-codex",
+                    "CODEX_CLI_SANDBOX": "workspace-write",
+                    "CODEX_CLI_CWD": tmpdir,
+                },
+                clear=False,
+            ), patch("app.llm.openai_codex.shutil.which", return_value="/operator/codex") as mock_which, patch(
+                "app.llm.openai_codex.subprocess.run", side_effect=fake_run
             ) as mock_run, patch("app.llm.openai_codex.tempfile.NamedTemporaryFile") as mock_tmp:
                 handle = MagicMock()
                 handle.name = str(output_path)
@@ -299,7 +312,47 @@ class TestOpenAICodexEnhancedAuth(unittest.TestCase):
         command = mock_run.call_args.args[0]
         sandbox_index = command.index("--sandbox")
         self.assertEqual(response.content, "CLI response")
-        self.assertEqual(command[sandbox_index + 1], "danger-full-access")
+        self.assertEqual(command[0], "/operator/codex")
+        self.assertEqual(command[sandbox_index + 1], "read-only")
+        self.assertEqual(mock_run.call_args.kwargs["cwd"], tmpdir)
+        mock_which.assert_called_once_with("operator-codex")
+
+    def test_codex_client_invalid_operator_sandbox_fails_closed(self):
+        profile = ModelProfileDefinition(
+            id="test-profile",
+            name="Test Profile",
+            provider="openai_codex",
+            model="gpt-5.1-codex",
+            base_url="https://api.openai.com/v1",
+            parameters={"auth_mode": "chatgpt", "access_token": "chatgpt-token"},
+        )
+        env_config = MagicMock(openai_api_key=None, model_provider_repo=None)
+
+        with TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "last-message.txt"
+
+            def fake_run(command, **kwargs):
+                output_index = command.index("--output-last-message") + 1
+                Path(command[output_index]).write_text("CLI response", encoding="utf-8")
+                return MagicMock(returncode=0, stdout="", stderr="")
+
+            client = OpenAICodexModelClient(profile, env_config)
+            with patch.dict(
+                "os.environ",
+                {"CODEX_CLI_SANDBOX": "danger-full-access", "CODEX_CLI_CWD": tmpdir},
+                clear=False,
+            ), patch("app.llm.openai_codex.shutil.which", return_value="codex"), patch(
+                "app.llm.openai_codex.subprocess.run", side_effect=fake_run
+            ) as mock_run, patch("app.llm.openai_codex.tempfile.NamedTemporaryFile") as mock_tmp:
+                handle = MagicMock()
+                handle.name = str(output_path)
+                mock_tmp.return_value.__enter__.return_value = handle
+                response = client.generate_text([])
+
+        command = mock_run.call_args.args[0]
+        sandbox_index = command.index("--sandbox")
+        self.assertEqual(response.content, "CLI response")
+        self.assertEqual(command[sandbox_index + 1], "read-only")
 
     def test_codex_oauth_cli_returns_agency_native_tool_call(self):
         profile = ModelProfileDefinition(

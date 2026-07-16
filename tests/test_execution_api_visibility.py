@@ -40,7 +40,12 @@ class ExecutionApiVisibilityTests(unittest.TestCase):
         )
         asyncio.run(
             cls.context.user_repo.create(
-                UserDefinition(id="user-executions", email="executions@example.com", display_name="Executions User")
+                UserDefinition(
+                    id="user-executions",
+                    email="executions@example.com",
+                    display_name="Executions User",
+                    roles=["admin"],
+                )
             )
         )
 
@@ -64,6 +69,7 @@ class ExecutionApiVisibilityTests(unittest.TestCase):
             container_name="agency-execution-old",
             container_image="agency-runtime:rev-0",
             container_status="running",
+            created_by="user-executions",
         )
         current_execution = Execution(
             id="execution-current",
@@ -78,6 +84,7 @@ class ExecutionApiVisibilityTests(unittest.TestCase):
             container_status="running",
             replacement_of_execution_id="execution-old",
             restart_reason="runtime_revision_superseded",
+            created_by="user-executions",
         )
         next_execution = Execution(
             id="execution-next",
@@ -88,6 +95,7 @@ class ExecutionApiVisibilityTests(unittest.TestCase):
             status="created",
             replacement_of_execution_id="execution-current",
             restart_reason="manual_retry",
+            created_by="user-executions",
         )
         asyncio.run(cls.context.execution_store.save_execution(old_execution))
         asyncio.run(cls.context.execution_store.save_execution(current_execution))

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.domain import UserDefinition
+from app.domain.users import apply_profile_preference_overrides
 from .catalog import InMemoryCatalogRepository
 
 
@@ -48,6 +49,9 @@ class InMemoryUserRepository(InMemoryCatalogRepository[UserDefinition]):
             return await self.create(item)
         merged: dict[str, Any] = existing.model_dump(mode="json")
         incoming = item.model_dump(mode="json", exclude_none=True)
+        # Identity providers re-sync on app load; preserve fields the user has
+        # explicitly taken ownership of through Profile settings.
+        incoming = apply_profile_preference_overrides(existing, incoming)
         if "roles" not in item.model_fields_set:
             incoming.pop("roles", None)
         if "metadata" in item.model_fields_set:

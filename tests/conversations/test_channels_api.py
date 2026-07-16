@@ -7,7 +7,6 @@ import httpx
 import json
 import time
 import unittest
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from urllib.parse import urlencode, urlparse
 from cryptography.hazmat.primitives import serialization
@@ -307,6 +306,14 @@ class ConversationChannelsRouterTests(unittest.TestCase):
         self.assertEqual(len(messages), 2)
 
     def test_telegram_adapter_webhook_handles_message_and_duplicate_replay(self) -> None:
+        token = "telegram-replay-webhook-secret"
+        self._create_delivery_user_and_credential(
+            user_id="user-telegram-replay",
+            credential_id="credential-telegram-replay",
+            provider="telegram",
+            secret_ref="env://TELEGRAM_BOT_TOKEN",
+            metadata={"webhook_secret_token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest()},
+        )
         payload = {
             "update_id": 1001,
             "message": {
@@ -316,7 +323,12 @@ class ConversationChannelsRouterTests(unittest.TestCase):
                 "text": "Hello through Telegram adapter",
             },
         }
-        first = self.client.post("/integrations/conversations/adapters/telegram/webhook", json=payload)
+        first = self.client.post(
+            "/integrations/conversations/adapters/telegram/webhook",
+            params={"credential_id": "credential-telegram-replay"},
+            headers={"x-telegram-bot-api-secret-token": token},
+            json=payload,
+        )
         self.assertEqual(first.status_code, 200)
         body = first.json()
         self.assertTrue(body["handled"])
@@ -327,7 +339,12 @@ class ConversationChannelsRouterTests(unittest.TestCase):
         self.assertEqual(body["provider_outbound_messages"][0]["method"], "sendMessage")
         self.assertEqual(body["provider_outbound_messages"][0]["payload"]["chat_id"], "3003")
 
-        second = self.client.post("/integrations/conversations/adapters/telegram/webhook", json=payload)
+        second = self.client.post(
+            "/integrations/conversations/adapters/telegram/webhook",
+            params={"credential_id": "credential-telegram-replay"},
+            headers={"x-telegram-bot-api-secret-token": token},
+            json=payload,
+        )
         self.assertEqual(second.status_code, 200)
         replay = second.json()
         self.assertTrue(replay["result"]["idempotent"])
@@ -375,12 +392,52 @@ class ConversationChannelsRouterTests(unittest.TestCase):
         self.assertEqual(accepted.status_code, 200)
         self.assertTrue(accepted.json()["webhook_verification"]["verified"])
 
+    def test_telegram_adapter_webhook_verifies_generated_token_hash(self) -> None:
+        token = "generated-telegram-webhook-secret"
+        self._create_delivery_user_and_credential(
+            user_id="user-telegram-webhook-hash",
+            credential_id="credential-telegram-webhook-hash",
+            provider="telegram",
+            secret_ref="env://TELEGRAM_BOT_TOKEN",
+            metadata={
+                "webhook_secret_token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+            },
+        )
+        payload = {
+            "update_id": 1102,
+            "message": {
+                "message_id": 2103,
+                "chat": {"id": 3104, "type": "private"},
+                "from": {"id": 4105, "username": "telegram_webhook_hash"},
+                "text": "Verified Telegram webhook hash",
+            },
+        }
+
+        rejected = self.client.post(
+            "/integrations/conversations/adapters/telegram/webhook",
+            params={"credential_id": "credential-telegram-webhook-hash"},
+            headers={"x-telegram-bot-api-secret-token": "wrong"},
+            json=payload,
+        )
+        accepted = self.client.post(
+            "/integrations/conversations/adapters/telegram/webhook",
+            params={"credential_id": "credential-telegram-webhook-hash"},
+            headers={"x-telegram-bot-api-secret-token": token},
+            json=payload,
+        )
+
+        self.assertEqual(rejected.status_code, 422)
+        self.assertEqual(accepted.status_code, 200)
+        self.assertTrue(accepted.json()["webhook_verification"]["verified"])
+
     def test_telegram_adapter_webhook_delivers_outbound_messages_when_credential_supplied(self) -> None:
+        token = "telegram-delivery-webhook-secret"
         self._create_delivery_user_and_credential(
             user_id="user-telegram-webhook-delivery",
             credential_id="credential-telegram-webhook-delivery",
             provider="telegram",
             secret_ref="env://TELEGRAM_BOT_TOKEN",
+            metadata={"webhook_secret_token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest()},
         )
         payload = {
             "update_id": 1201,
@@ -399,6 +456,7 @@ class ConversationChannelsRouterTests(unittest.TestCase):
             response = self.client.post(
                 "/integrations/conversations/adapters/telegram/webhook",
                 params={"credential_id": "credential-telegram-webhook-delivery"},
+                headers={"x-telegram-bot-api-secret-token": token},
                 json=payload,
             )
 
@@ -409,11 +467,13 @@ class ConversationChannelsRouterTests(unittest.TestCase):
         delivery_mock.assert_awaited_once()
 
     def test_telegram_adapter_webhook_treats_delivery_failures_as_best_effort(self) -> None:
+        token = "telegram-delivery-failure-webhook-secret"
         self._create_delivery_user_and_credential(
             user_id="user-telegram-webhook-delivery-failure",
             credential_id="credential-telegram-webhook-delivery-failure",
             provider="telegram",
             secret_ref="env://TELEGRAM_BOT_TOKEN",
+            metadata={"webhook_secret_token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest()},
         )
         payload = {
             "update_id": 1202,
@@ -432,6 +492,7 @@ class ConversationChannelsRouterTests(unittest.TestCase):
             response = self.client.post(
                 "/integrations/conversations/adapters/telegram/webhook",
                 params={"credential_id": "credential-telegram-webhook-delivery-failure"},
+                headers={"x-telegram-bot-api-secret-token": token},
                 json=payload,
             )
 
@@ -442,7 +503,7 @@ class ConversationChannelsRouterTests(unittest.TestCase):
         self.assertTrue(body["delivery"]["skipped"])
         self.assertIn("Outbound delivery failed", body["delivery"]["reason"])
 
-    def test_adapter_webhook_requires_connector_credential_in_production(self) -> None:
+    def test_adapter_webhook_requires_connector_credential_in_test_environment(self) -> None:
         payload = {
             "update_id": 1201,
             "message": {
@@ -453,16 +514,45 @@ class ConversationChannelsRouterTests(unittest.TestCase):
             },
         }
 
-        with patch(
-            "app.services.conversations.channel_webhooks.get_settings",
-            return_value=SimpleNamespace(app_env="production"),
-        ):
-            response = self.client.post("/integrations/conversations/adapters/telegram/webhook", json=payload)
+        response = self.client.post("/integrations/conversations/adapters/telegram/webhook", json=payload)
 
         self.assertEqual(response.status_code, 422)
         self.assertIn("connector credential is required", response.json()["detail"])
 
+    def test_telegram_webhook_requires_verification_secret_in_test_environment(self) -> None:
+        self._create_delivery_user_and_credential(
+            user_id="user-telegram-missing-verification",
+            credential_id="credential-telegram-missing-verification",
+            provider="telegram",
+            secret_ref="env://TELEGRAM_BOT_TOKEN",
+        )
+        response = self.client.post(
+            "/integrations/conversations/adapters/telegram/webhook",
+            params={"credential_id": "credential-telegram-missing-verification"},
+            headers={"x-telegram-bot-api-secret-token": "attacker-selected"},
+            json={
+                "update_id": 1203,
+                "message": {
+                    "message_id": 2204,
+                    "chat": {"id": 3205, "type": "private"},
+                    "from": {"id": 4206, "username": "telegram_missing_verification"},
+                    "text": "Credential without a verification secret",
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("requires webhook_secret_ref", response.json()["detail"])
+
     def test_telegram_adapter_webhook_handles_approval_callback(self) -> None:
+        token = "telegram-approval-webhook-secret"
+        self._create_delivery_user_and_credential(
+            user_id="user-telegram-approval",
+            credential_id="credential-telegram-approval",
+            provider="telegram",
+            secret_ref="env://TELEGRAM_BOT_TOKEN",
+            metadata={"webhook_secret_token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest()},
+        )
         response = self.client.post(
             "/integrations/conversations/channels/telegram/messages",
             json={
@@ -482,17 +572,27 @@ class ConversationChannelsRouterTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         approval_id = response.json()["result"]["approval_request"]["id"]
 
+        callback_payload = {
+            "update_id": 1002,
+            "callback_query": {
+                "id": "callback-1",
+                "from": {"id": "telegram-approval-user", "username": "approver"},
+                "data": f"approval:approve:{approval_id}",
+            },
+        }
+        unsigned = self.client.post(
+            "/integrations/conversations/adapters/telegram/webhook",
+            params={"credential_id": "credential-telegram-approval"},
+            json=callback_payload,
+        )
         callback = self.client.post(
             "/integrations/conversations/adapters/telegram/webhook",
-            json={
-                "update_id": 1002,
-                "callback_query": {
-                    "id": "callback-1",
-                    "from": {"id": "telegram-approval-user", "username": "approver"},
-                    "data": f"approval:approve:{approval_id}",
-                },
-            },
+            params={"credential_id": "credential-telegram-approval"},
+            headers={"x-telegram-bot-api-secret-token": token},
+            json=callback_payload,
         )
+        self.assertEqual(unsigned.status_code, 422)
+        self.assertIn("secret token verification failed", unsigned.json()["detail"])
         self.assertEqual(callback.status_code, 200)
         body = callback.json()
         self.assertTrue(body["handled"])
@@ -519,16 +619,20 @@ class ConversationChannelsRouterTests(unittest.TestCase):
         )
         self.assertEqual(mapping.status_code, 200)
 
-        response = self.client.post(
-            "/integrations/conversations/adapters/discord/webhook",
-            json={
-                "id": "discord-message-1",
-                "channel_id": "discord-channel-1",
-                "guild_id": "discord-guild-1",
-                "author": {"id": "discord-user-1", "username": "discord_user"},
-                "content": "Hello through Discord adapter",
-            },
-        )
+        with patch(
+            "app.services.conversations.channel_webhooks.ChannelWebhookVerificationService.verify",
+            new=AsyncMock(return_value={"verified": True, "required": True, "provider": "discord"}),
+        ):
+            response = self.client.post(
+                "/integrations/conversations/adapters/discord/webhook",
+                json={
+                    "id": "discord-message-1",
+                    "channel_id": "discord-channel-1",
+                    "guild_id": "discord-guild-1",
+                    "author": {"id": "discord-user-1", "username": "discord_user"},
+                    "content": "Hello through Discord adapter",
+                },
+            )
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertTrue(body["handled"])
@@ -604,9 +708,13 @@ class ConversationChannelsRouterTests(unittest.TestCase):
         )
         self.assertEqual(mapping.status_code, 200)
 
-        response = self.client.post(
-            "/integrations/conversations/adapters/whatsapp/webhook",
-            json={
+        with patch(
+            "app.services.conversations.channel_webhooks.ChannelWebhookVerificationService.verify",
+            new=AsyncMock(return_value={"verified": True, "required": True, "provider": "whatsapp"}),
+        ):
+            response = self.client.post(
+                "/integrations/conversations/adapters/whatsapp/webhook",
+                json={
                 "entry": [
                     {
                         "changes": [
@@ -626,8 +734,8 @@ class ConversationChannelsRouterTests(unittest.TestCase):
                         ]
                     }
                 ]
-            },
-        )
+                },
+            )
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertTrue(body["handled"])
@@ -806,7 +914,7 @@ class ConversationChannelsRouterTests(unittest.TestCase):
             credential_id="credential-slack-webhook",
             provider="slack",
             secret_ref="env://SLACK_BOT_TOKEN",
-            metadata={"workspace_id": "workspace-slack", "signing_secret_ref": "env://SLACK_SIGNING_SECRET"},
+            metadata={"workspace_id": "T-slack", "signing_secret_ref": "env://SLACK_SIGNING_SECRET"},
         )
         payload = {
             "type": "event_callback",
@@ -857,7 +965,57 @@ class ConversationChannelsRouterTests(unittest.TestCase):
         self.assertEqual(accepted.json()["provider_outbound_messages"][0]["method"], "chat.postMessage")
         self.assertEqual(accepted.json()["provider_outbound_messages"][0]["payload"]["channel"], "C-slack-2")
 
+    def test_slack_webhook_rejects_credential_from_another_workspace(self) -> None:
+        self._create_delivery_user_and_credential(
+            user_id="user-slack-workspace-a",
+            credential_id="credential-slack-workspace-a",
+            provider="slack",
+            secret_ref="env://SLACK_BOT_TOKEN",
+            metadata={"workspace_id": "T-workspace-a", "signing_secret_ref": "env://SLACK_SIGNING_SECRET"},
+        )
+        payload = {
+            "type": "event_callback",
+            "team_id": "T-workspace-b",
+            "event_id": "Ev-cross-workspace",
+            "event": {
+                "type": "message",
+                "channel": "C-cross-workspace",
+                "user": "U-cross-workspace",
+                "text": "must not cross installation boundary",
+                "ts": "1712345678.000300",
+            },
+        }
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        timestamp = str(int(time.time()))
+        signature = "v0=" + hmac.new(
+            b"slack-signing-secret",
+            f"v0:{timestamp}:".encode("utf-8") + body,
+            hashlib.sha256,
+        ).hexdigest()
+
+        with patch.dict("os.environ", {"SLACK_SIGNING_SECRET": "slack-signing-secret"}, clear=False):
+            response = self.client.post(
+                "/integrations/conversations/adapters/slack/webhook",
+                params={"credential_id": "credential-slack-workspace-a"},
+                headers={
+                    "content-type": "application/json",
+                    "x-slack-signature": signature,
+                    "x-slack-request-timestamp": timestamp,
+                },
+                content=body,
+            )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("team does not match", response.json()["detail"])
+
     def test_slack_adapter_webhook_handles_block_action_approval_callback(self) -> None:
+        self._create_delivery_user_and_credential(
+            user_id="user-slack-approval",
+            credential_id="credential-slack-approval",
+            provider="slack",
+            secret_ref="env://SLACK_BOT_TOKEN",
+            metadata={"workspace_id": "T-slack", "signing_secret_ref": "env://SLACK_SIGNING_SECRET"},
+        )
         response = self.client.post(
             "/integrations/conversations/channels/slack/messages",
             json={
@@ -897,12 +1055,10 @@ class ConversationChannelsRouterTests(unittest.TestCase):
             hashlib.sha256,
         ).hexdigest()
 
-        with patch.dict("os.environ", {"SLACK_SIGNING_SECRET": "slack-signing-secret"}, clear=False), patch(
-            "app.services.conversations.channel_webhooks.get_settings",
-            return_value=SimpleNamespace(app_env="development"),
-        ):
+        with patch.dict("os.environ", {"SLACK_SIGNING_SECRET": "slack-signing-secret"}, clear=False):
             callback = self.client.post(
                 "/integrations/conversations/adapters/slack/webhook",
+                params={"credential_id": "credential-slack-approval"},
                 headers={
                     "content-type": "application/x-www-form-urlencoded",
                     "x-slack-signature": signature,
@@ -1214,9 +1370,13 @@ class ConversationChannelsRouterTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         approval_id = response.json()["result"]["approval_request"]["id"]
 
-        callback = self.client.post(
-            "/integrations/conversations/adapters/whatsapp/webhook",
-            json={
+        with patch(
+            "app.services.conversations.channel_webhooks.ChannelWebhookVerificationService.verify",
+            new=AsyncMock(return_value={"verified": True, "required": True, "provider": "whatsapp"}),
+        ):
+            callback = self.client.post(
+                "/integrations/conversations/adapters/whatsapp/webhook",
+                json={
                 "entry": [
                     {
                         "changes": [
@@ -1240,8 +1400,8 @@ class ConversationChannelsRouterTests(unittest.TestCase):
                         ]
                     }
                 ]
-            },
-        )
+                },
+            )
         self.assertEqual(callback.status_code, 200)
         body = callback.json()
         self.assertTrue(body["handled"])
@@ -1757,7 +1917,7 @@ class ConversationChannelsRouterTests(unittest.TestCase):
         self.assertEqual(request_kwargs["json"]["to"], "15550002222")
         self.assertNotIn("whatsapp/dev-phone", str(request_kwargs))
 
-    def test_delivery_hook_rejects_telegram_onecli_token_in_url_shape(self) -> None:
+    def test_delivery_hook_uses_telegram_onecli_url_path_injection(self) -> None:
         self._create_delivery_user_and_credential(
             user_id="user-telegram-onecli-delivery",
             credential_id="credential-telegram-onecli-delivery",
@@ -1772,7 +1932,10 @@ class ConversationChannelsRouterTests(unittest.TestCase):
                 "ONECLI_GATEWAY_URL": "http://onecli:10255",
             },
             clear=False,
-        ), patch("app.services.conversations.channel_delivery.httpx.request") as request_mock:
+        ), patch(
+            "app.services.conversations.channel_delivery.httpx.request",
+            return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 1}}),
+        ) as request_mock:
             reset_settings_cache()
             response = self.client.post(
                 "/integrations/conversations/adapters/telegram/deliver",
@@ -1789,9 +1952,16 @@ class ConversationChannelsRouterTests(unittest.TestCase):
             )
             reset_settings_cache()
 
-        self.assertEqual(response.status_code, 422)
-        self.assertIn("runtime-resolvable secret ref", response.json()["detail"])
-        request_mock.assert_not_called()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["ok"])
+        request_mock.assert_called_once()
+        request_kwargs = request_mock.call_args.kwargs
+        self.assertEqual(
+            request_kwargs["url"],
+            "https://api.telegram.org/botonecli-managed/sendMessage",
+        )
+        self.assertIn("onecli", request_kwargs["proxy"])
+        self.assertNotIn("dev-bot", str(request_kwargs))
 
     def test_delivery_hook_rejects_cross_provider_credential(self) -> None:
         self._create_delivery_user_and_credential(
@@ -2663,7 +2833,10 @@ class ConversationChannelsRouterTests(unittest.TestCase):
                         callable_name="echo_tool",
                         config={"tool_family": "computer_use", "canonical_tool_name": "click"},
                     ),
-                    security=SecuritySettings(requires_approval=True),
+                    security=SecuritySettings(
+                        requires_approval=True,
+                        function_allowlist=["echo_tool"],
+                    ),
                     mcp_exposure=MCPExposureSettings(),
                     tags=["computer_use"],
                 )

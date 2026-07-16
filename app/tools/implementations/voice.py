@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from app.core import storage
 from app.runtime.native.errors import ToolExecutionError
+from app.services.openvoice_setup import get_openvoice_default_voice
 from app.tools.implementations.media import publish_media
 
 
@@ -31,10 +32,13 @@ class VoiceGenerateInput(BaseModel):
         default="auto",
         description="Voice provider. auto uses openvoice_local when a consented reference voice is supplied.",
     )
-    voice: str | None = Field(default=None, description="Provider-specific voice preset or local OS voice name.")
+    voice: str | None = Field(
+        default=None,
+        description="Provider-specific voice preset or local OS voice name. OpenVoice defaults to friendly.",
+    )
     reference_voice_path: str | None = Field(
         default=None,
-        description="Reference voice path for local OpenVoice generation.",
+        description="Optional reference voice path for local OpenVoice cloning. Omit it to use a built-in preset.",
     )
     output_name: str | None = Field(
         default=None,
@@ -48,7 +52,7 @@ class VoiceGenerateInput(BaseModel):
     )
     consent_confirmed: bool = Field(
         default=False,
-        description="Must be true when a reference or cloned voice provider is used.",
+        description="Must be true when a reference voice is used for cloning.",
     )
     dry_run: bool = Field(default=True, description="Preview provider, guardrails, and storage target without synthesis.")
     metadata: dict[str, Any] = Field(default_factory=dict, description="Optional workflow or delivery metadata.")
@@ -59,11 +63,9 @@ class VoiceGenerateInput(BaseModel):
             raise ValueError("text is required.")
         if not self.ai_disclosure:
             raise ValueError("ai_disclosure must be true for generated voice output.")
-        if self.provider == "openvoice_local" or self.reference_voice_path:
+        if self.reference_voice_path:
             if not self.consent_confirmed:
-                raise ValueError("consent_confirmed must be true for reference or cloned voice generation.")
-            if not (self.reference_voice_path or "").strip():
-                raise ValueError("reference_voice_path is required for openvoice_local voice generation.")
+                raise ValueError("consent_confirmed must be true for reference voice generation.")
         _safe_output_name(self.output_name)
         return self
 
@@ -278,7 +280,7 @@ def _base_result(request: VoiceGenerateInput, *, provider: str, storage_key: str
     return {
         "provider": provider,
         "text": request.text.strip(),
-        "voice": request.voice,
+        "voice": _openvoice_style(request) if provider == "openvoice_local" else request.voice,
         "reference_voice_path": request.reference_voice_path,
         "storage_key": storage_key,
         "storage_uri": None,
@@ -298,6 +300,8 @@ def _provider_warnings(requested_provider: str, resolved_provider: str) -> list[
         warnings.append("system_tts uses the local host TTS engine and may vary by operating system.")
     if requested_provider == "auto" and resolved_provider == "openvoice_local":
         warnings.append("auto selected openvoice_local because a consented reference_voice_path was supplied.")
+    if resolved_provider == "openvoice_local" and not requested_provider == "auto":
+        warnings.append("openvoice_local uses its built-in friendly voice when reference_voice_path is omitted.")
     return warnings
 
 
@@ -313,9 +317,10 @@ def _setup_instructions(provider: str) -> dict[str, Any]:
             "required": [
                 "Set AGENCY_OPENVOICE_ROOT to a local OpenVoice checkout, or install it at external/openvoice.",
                 "Set AGENCY_OPENVOICE_CHECKPOINTS_DIR, or place V1 checkpoints under external/openvoice/checkpoints.",
-                "Provide reference_voice_path and consent_confirmed=true.",
             ],
             "optional": [
+                "Omit reference_voice_path to use the built-in friendly voice.",
+                "For cloning, provide reference_voice_path and consent_confirmed=true.",
                 "Use AGENCY_OPENVOICE_TIMEOUT_SECONDS to adjust long local generation timeouts.",
             ],
         }
@@ -324,9 +329,10 @@ def _setup_instructions(provider: str) -> dict[str, Any]:
 
 def _openvoice_readiness(request: VoiceGenerateInput) -> list[str]:
     warnings: list[str] = []
-    reference_path = Path(str(request.reference_voice_path or "")).expanduser()
-    if not reference_path.is_file():
-        warnings.append(f"reference_voice_path does not exist: {reference_path}")
+    if request.reference_voice_path:
+        reference_path = _resolve_reference_voice_path(request.reference_voice_path)
+        if not reference_path.is_file():
+            warnings.append(f"reference_voice_path does not exist: {reference_path}")
     if not OPENVOICE_ROOT.exists():
         warnings.append(f"OpenVoice root does not exist: {OPENVOICE_ROOT}")
     if not OPENVOICE_CHECKPOINTS_DIR.exists():
@@ -336,13 +342,9 @@ def _openvoice_readiness(request: VoiceGenerateInput) -> list[str]:
 
 def _openvoice_args(request: VoiceGenerateInput, output_path: Path) -> list[str]:
     language = str(request.metadata.get("language") or "English")
-    style = request.voice or str(request.metadata.get("style") or "default")
-    return [
+    args = [
         _openvoice_python(),
-        "-m",
-        "app.tools.implementations.openvoice_runner",
-        "--reference",
-        str(Path(str(request.reference_voice_path)).expanduser()),
+        str(Path(__file__).with_name("openvoice_runner.py")),
         "--text",
         request.text,
         "--output",
@@ -352,8 +354,15 @@ def _openvoice_args(request: VoiceGenerateInput, output_path: Path) -> list[str]
         "--language",
         language,
         "--style",
-        style,
+        _openvoice_style(request),
     ]
+    if request.reference_voice_path:
+        args.extend(["--reference", str(_resolve_reference_voice_path(request.reference_voice_path))])
+    return args
+
+
+def _openvoice_style(request: VoiceGenerateInput) -> str:
+    return request.voice or str(request.metadata.get("style") or get_openvoice_default_voice())
 
 
 def _openvoice_python() -> str:
@@ -370,6 +379,19 @@ def _openvoice_env() -> dict[str, str]:
         python_paths.append(env["PYTHONPATH"])
     env["PYTHONPATH"] = os.pathsep.join(python_paths)
     return env
+
+
+def _resolve_reference_voice_path(reference_voice_path: str | None) -> Path:
+    path = Path(str(reference_voice_path or "")).expanduser()
+    if path.is_absolute() or path.is_file():
+        return path
+    # Workflow definitions use repository-relative media paths, while the API
+    # process runs from /app inside Docker. Resolve them against the mounted
+    # backend workspace so the same saved workflow works on host and container.
+    workspace = str(os.getenv("AGENCY_BACKEND_WORKSPACE") or "").strip()
+    if workspace:
+        return Path(workspace).expanduser() / path
+    return path
 
 
 def _storage_key_for(request: VoiceGenerateInput, *, suffix: str) -> str:

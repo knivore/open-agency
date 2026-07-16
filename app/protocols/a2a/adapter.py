@@ -5,6 +5,8 @@ import json
 from typing import Any
 from urllib.parse import urlparse
 
+from app.core.config import get_settings
+from app.core.outbound_http import validate_outbound_http_url
 from app.domain import ExecutionArtifact, ExecutionEvent, ExecutionEventType, ToolDefinition
 from app.runtime.native.errors import ToolExecutionError
 from .artifacts import execution_artifact_to_a2a_artifact
@@ -53,6 +55,11 @@ class A2AAdapter:
             raise ToolExecutionError(f"A2A remote URL scheme '{parsed.scheme or '<missing>'}' is not allowed")
         if parsed.hostname and tool.security.allowlisted_domains and parsed.hostname not in tool.security.allowlisted_domains:
             raise ToolExecutionError(f"A2A remote host '{parsed.hostname}' is not allowlisted for tool '{tool.id}'")
+        try:
+            validate_outbound_http_url(target, allowed_hosts=tool.security.allowlisted_domains)
+            validate_outbound_http_url(target, allowed_hosts=get_settings().parsed_tool_http_allowed_hosts)
+        except ValueError as exc:
+            raise ToolExecutionError(str(exc)) from exc
         message = {
             "role": arguments.get("role", "user"),
             "content": arguments.get("content", arguments),
@@ -63,7 +70,11 @@ class A2AAdapter:
             "trigger": {"created_by": "a2a_remote_agent"},
             "message": message,
         }
-        async with httpx.AsyncClient(timeout=tool.implementation.config.get("timeout", 30)) as client:
+        async with httpx.AsyncClient(
+                timeout=tool.implementation.config.get("timeout", 30),
+                follow_redirects=False,
+                trust_env=False,
+        ) as client:
             response = await client.post(
                 target.rstrip("/") + "/tasks",
                 content=json.dumps(payload).encode("utf-8"),

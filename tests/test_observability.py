@@ -25,6 +25,7 @@ from app.llm.registry import LLMEnvironmentConfig
 from app.observability.event_bus import EventBus, set_default_event_bus
 from app.observability.exporters.jsonl import JSONLExporter
 from app.observability.exporters.langfuse import LangfuseExporter
+from app.observability.redaction import Redactor
 from app.runtime.native.events import ExecutionEventEmitter
 from app.runtime.native.state import NativeExecutionState
 from app.services.connector_retention import ConnectorRetentionService
@@ -197,6 +198,23 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(line["metrics"]["credential_token"], "[REDACTED]")
         self.assertEqual(line["metrics"]["latency_ms"], 5)
 
+    async def test_free_text_redaction_removes_adjacent_secret_values(self):
+        redactor = Redactor()
+
+        for value in (
+            "password=hunter2",
+            "token: abc123",
+            "secret value xyz",
+            "authorization is BasicCredential",
+        ):
+            with self.subTest(value=value):
+                redacted, fields = redactor.redact_text(value)
+                self.assertEqual(redacted, "[REDACTED]")
+                self.assertTrue(fields)
+
+        # Ordinary operational prose must not be treated as a credential pair.
+        self.assertEqual(redactor.redact_text("token budget remains")[0], "token budget remains")
+
     async def test_langfuse_exporter_maps_llm_and_tool_events_to_observations(self):
         client = _FakeLangfuseClient()
         exporter = LangfuseExporter(client=client)
@@ -259,7 +277,7 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
         generation = observations[1]
         self.assertEqual(generation["model"], "fake-model")
         self.assertEqual(generation["usage_details"], {"input": 3, "output": 2, "total": 5})
-        self.assertEqual(generation["input"][0]["content"], "Use [REDACTED] [REDACTED]")
+        self.assertEqual(generation["input"][0]["content"], "Use token [REDACTED]")
         self.assertEqual(generation["metadata"]["agent_id"], "agent-langfuse")
         self.assertEqual(generation["metadata"]["execution_id"], "exec-langfuse")
         self.assertEqual(generation["trace_context"]["trace_id"], state.trace_id.replace("-", ""))

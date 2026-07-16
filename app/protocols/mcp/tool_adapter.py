@@ -64,7 +64,9 @@ def _is_high_risk(tool: MCPToolDescriptor) -> bool:
 def mcp_tool_to_definition(server: MCPServerDefinition, tool: MCPToolDescriptor) -> ToolDefinition:
     from app.tools.names import make_tool_display_name
 
-    requires_approval = _is_high_risk(tool)
+    # Remote descriptors are attacker-controlled claims. Treat every MCP call as
+    # approval- and redaction-sensitive even when its name/annotations look benign.
+    requires_approval = True
     canonical_name = _normalized_tool_name(server, tool)
     remote_input_schema = tool.input_schema or {"type": "object"}
     input_schema = (
@@ -72,6 +74,11 @@ def mcp_tool_to_definition(server: MCPServerDefinition, tool: MCPToolDescriptor)
         if server.metadata.get("family") == "computer_use"
         else remote_input_schema
     )
+    redaction_rules = ["authorization", "token", "secret", "password"]
+    if server.metadata.get("family") == "computer_use" and canonical_name in {"type", "clipboard"}:
+        # Typed and clipboard content can be secret without a descriptive key.
+        # Redact the normalized request and response containers before persistence.
+        redaction_rules.extend(["request", "raw_result", "data", "text", "value", "input", "content"])
     return ToolDefinition(
         id=f"mcp:{server.id}:{canonical_name}",
         name=canonical_name,
@@ -96,7 +103,7 @@ def mcp_tool_to_definition(server: MCPServerDefinition, tool: MCPToolDescriptor)
             requires_approval=requires_approval,
             allowlisted_mcp_servers=[server.id],
             redaction_enabled=requires_approval,
-            redaction_rules=["authorization", "token", "secret", "password"],
+            redaction_rules=redaction_rules,
         ),
         mcp_exposure=MCPExposureSettings(expose_as_mcp_tool=False),
         tags=[

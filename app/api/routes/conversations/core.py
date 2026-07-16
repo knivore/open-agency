@@ -8,6 +8,7 @@ from starlette.responses import StreamingResponse
 from typing import Any, Optional
 
 from app.api.context import ApiContext, get_default_api_context
+from app.api.identity import resolve_current_user, resolve_current_user_if_present
 from app.core.config import get_settings
 from app.services.conversation_compact import (
     ConversationCompactService,
@@ -86,8 +87,31 @@ def create_conversations_router(context: Optional[ApiContext] = None) -> APIRout
     router = APIRouter(prefix="/conversations", tags=["Conversations"])
     service = ConversationService(context)
 
+    async def resolve_conversation_user(request: Request, *, scopes: list[str]):
+        if get_settings().app_env == "test":
+            # Direct in-memory route fixtures omit identity. Deployable modes
+            # authenticate here as well as at the shared API edge so alternate
+            # router assemblies cannot lose the ownership boundary.
+            return await resolve_current_user_if_present(request, context, required_scopes=scopes)
+        return await resolve_current_user(request, context, required_scopes=scopes)
+
+    async def require_conversation_access(request: Request, conversation_id: str, *, scopes: list[str]):
+        conversation = await service.get_conversation(conversation_id)
+        if conversation is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+        current_user = await resolve_conversation_user(request, scopes=scopes)
+        if current_user is None:  # Test-only fixture compatibility.
+            return conversation
+        if "admin" in current_user.roles or conversation.created_by_user_id == current_user.id:
+            return conversation
+        # Keep missing and unauthorized conversations indistinguishable.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+
     @router.post("", summary="Create Conversation")
-    async def create_conversation(payload: dict[str, Any]):
+    async def create_conversation(payload: dict[str, Any], request: Request):
+        current_user = await resolve_conversation_user(request, scopes=["conversations:write"])
+        if current_user is not None:
+            payload = {**payload, "created_by_user_id": current_user.id}
         try:
             created = await service.create_conversation(payload)
         except ValidationError as exc:
@@ -100,11 +124,21 @@ def create_conversations_router(context: Optional[ApiContext] = None) -> APIRout
         return created.model_dump(mode="json")
 
     @router.get("", summary="List Conversations")
-    async def list_conversations():
-        return await service.list_conversations()
+    async def list_conversations(request: Request):
+        current_user = await resolve_conversation_user(request, scopes=["conversations:read"])
+        items = await service.list_conversations()
+        if current_user is None or "admin" in current_user.roles:
+            return items
+        return {
+            "items": [
+                item for item in items.get("items", [])
+                if item.get("created_by_user_id") == current_user.id
+            ]
+        }
 
     @router.get("/main-agent-profile", summary="Get Active Main-Agent Profile")
-    async def get_active_main_agent_profile():
+    async def get_active_main_agent_profile(request: Request):
+        await resolve_conversation_user(request, scopes=["conversations:read"])
         try:
             profile = await MainAgentSetupService(context).require_active_main_agent_profile()
         except MainAgentSetupRequiredError as exc:
@@ -114,7 +148,10 @@ def create_conversations_router(context: Optional[ApiContext] = None) -> APIRout
         return profile.model_dump(mode="json")
 
     @router.patch("/main-agent-profile", summary="Update Active Main-Agent Profile")
-    async def update_active_main_agent_profile(patch: MainAgentProfilePatch):
+    async def update_active_main_agent_profile(patch: MainAgentProfilePatch, request: Request):
+        current_user = await resolve_conversation_user(request, scopes=["conversations:write"])
+        if current_user is not None and "admin" not in current_user.roles:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Administrator role is required")
         try:
             profile = await MainAgentSetupService(context).update_active_main_agent_profile(
                 name=patch.name,
@@ -128,16 +165,17 @@ def create_conversations_router(context: Optional[ApiContext] = None) -> APIRout
         return profile.model_dump(mode="json")
 
     @router.get("/{conversation_id}", summary="Get Conversation By Id")
-    async def get_conversation(conversation_id: str):
-        item = await service.get_conversation(conversation_id)
-        if item is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-                                detail=f"Conversation '{conversation_id}' not found")
+    async def get_conversation(conversation_id: str, request: Request):
+        item = await require_conversation_access(request, conversation_id, scopes=["conversations:read"])
         return item.model_dump(mode="json")
 
     @router.patch("/{conversation_id}", summary="Update Conversation")
-    async def update_conversation(conversation_id: str, patch: ConversationPatch):
+    async def update_conversation(conversation_id: str, patch: ConversationPatch, request: Request):
+        await require_conversation_access(request, conversation_id, scopes=["conversations:write"])
         payload = patch.model_dump(exclude_unset=True)
+        # Ownership comes from the authenticated principal and cannot be moved
+        # through a general metadata patch.
+        payload.pop("created_by_user_id", None)
         try:
             item = await service.update_conversation(conversation_id, payload)
         except ValidationError as exc:
@@ -151,7 +189,8 @@ def create_conversations_router(context: Optional[ApiContext] = None) -> APIRout
         return item.model_dump(mode="json")
 
     @router.post("/{conversation_id}/messages", summary="Append Conversation Message")
-    async def append_message(conversation_id: str, payload: dict[str, Any]):
+    async def append_message(conversation_id: str, payload: dict[str, Any], request: Request):
+        await require_conversation_access(request, conversation_id, scopes=["conversations:write"])
         try:
             return await service.post_message(conversation_id, payload)
         except ValidationError as exc:
@@ -165,21 +204,24 @@ def create_conversations_router(context: Optional[ApiContext] = None) -> APIRout
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
 
     @router.get("/{conversation_id}/messages", summary="List Conversation Messages")
-    async def list_messages(conversation_id: str):
+    async def list_messages(conversation_id: str, request: Request):
+        await require_conversation_access(request, conversation_id, scopes=["conversations:read"])
         try:
             return await service.list_messages(conversation_id)
         except ConversationNotFoundError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
     @router.get("/{conversation_id}/context-usage", summary="Get Conversation Context Usage")
-    async def get_context_usage(conversation_id: str):
+    async def get_context_usage(conversation_id: str, request: Request):
+        await require_conversation_access(request, conversation_id, scopes=["conversations:read"])
         try:
             return await service.get_context_usage(conversation_id)
         except ConversationNotFoundError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
     @router.post("/{conversation_id}/compact", summary="Compact Conversation")
-    async def compact_conversation(conversation_id: str, payload: ConversationCompactRequest):
+    async def compact_conversation(conversation_id: str, payload: ConversationCompactRequest, request: Request):
+        await require_conversation_access(request, conversation_id, scopes=["conversations:write"])
         if not get_settings().memory_context_pack_enabled:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -269,10 +311,12 @@ def create_conversations_router(context: Optional[ApiContext] = None) -> APIRout
     @router.get("/{conversation_id}/compact-packs", summary="List Conversation Compact Packs")
     async def list_compact_packs(
             conversation_id: str,
+            request: Request,
             mode: str | None = None,
             limit: int = 20,
             include_superseded: bool = False,
     ):
+        await require_conversation_access(request, conversation_id, scopes=["conversations:read"])
         if not get_settings().memory_context_pack_enabled:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -301,7 +345,8 @@ def create_conversations_router(context: Optional[ApiContext] = None) -> APIRout
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
     @router.get("/{conversation_id}/approval-requests", summary="List Conversation Approval Requests")
-    async def list_approval_requests(conversation_id: str):
+    async def list_approval_requests(conversation_id: str, request: Request):
+        await require_conversation_access(request, conversation_id, scopes=["conversations:read"])
         try:
             return await service.list_approval_requests(conversation_id)
         except ConversationNotFoundError as exc:
@@ -314,9 +359,7 @@ def create_conversations_router(context: Optional[ApiContext] = None) -> APIRout
             after: str | None = None,
             idle_timeout_seconds: float = 5.0,
     ):
-        if await service.get_conversation(conversation_id) is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-                                detail=f"Conversation '{conversation_id}' not found")
+        await require_conversation_access(request, conversation_id, scopes=["conversations:read"])
         try:
             return StreamingResponse(
                 service.stream_conversation_events(
@@ -331,11 +374,12 @@ def create_conversations_router(context: Optional[ApiContext] = None) -> APIRout
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
     @router.post("/approval-requests/{approval_request_id}/approve", summary="Approve Conversation Approval Request")
-    async def approve_approval_request(approval_request_id: str, payload: ApprovalDecisionRequest):
+    async def approve_approval_request(approval_request_id: str, payload: ApprovalDecisionRequest, request: Request):
+        current_user = await resolve_conversation_user(request, scopes=["conversations:write"])
         try:
             return await service.approve_request(
                 approval_request_id,
-                actor_user_id=payload.user_id,
+                actor_user_id=current_user.id if current_user is not None else payload.user_id,
                 reason=payload.reason,
                 steering_parameters=payload.steering_parameters,
             )
@@ -347,11 +391,12 @@ def create_conversations_router(context: Optional[ApiContext] = None) -> APIRout
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
     @router.post("/approval-requests/{approval_request_id}/reject", summary="Reject Conversation Approval Request")
-    async def reject_approval_request(approval_request_id: str, payload: ApprovalDecisionRequest):
+    async def reject_approval_request(approval_request_id: str, payload: ApprovalDecisionRequest, request: Request):
+        current_user = await resolve_conversation_user(request, scopes=["conversations:write"])
         try:
             return await service.reject_request(
                 approval_request_id,
-                actor_user_id=payload.user_id,
+                actor_user_id=current_user.id if current_user is not None else payload.user_id,
                 reason=payload.reason,
                 store_reason_as_memory=payload.store_reason_as_memory,
             )
@@ -366,11 +411,14 @@ def create_conversations_router(context: Optional[ApiContext] = None) -> APIRout
         "/approval-requests/{approval_request_id}/request-changes",
         summary="Request Changes To Conversation Approval Request",
     )
-    async def request_changes_to_approval_request(approval_request_id: str, payload: ApprovalDecisionRequest):
+    async def request_changes_to_approval_request(
+            approval_request_id: str, payload: ApprovalDecisionRequest, request: Request
+    ):
+        current_user = await resolve_conversation_user(request, scopes=["conversations:write"])
         try:
             return await service.request_changes_to_approval(
                 approval_request_id,
-                actor_user_id=payload.user_id,
+                actor_user_id=current_user.id if current_user is not None else payload.user_id,
                 reason=payload.reason,
             )
         except ConversationApprovalNotFoundError as exc:
@@ -384,11 +432,12 @@ def create_conversations_router(context: Optional[ApiContext] = None) -> APIRout
         "/approval-requests/{approval_request_id}/split",
         summary="Split Conversation Approval Request",
     )
-    async def split_approval_request(approval_request_id: str, payload: ApprovalDecisionRequest):
+    async def split_approval_request(approval_request_id: str, payload: ApprovalDecisionRequest, request: Request):
+        current_user = await resolve_conversation_user(request, scopes=["conversations:write"])
         try:
             return await service.split_approval_request(
                 approval_request_id,
-                actor_user_id=payload.user_id,
+                actor_user_id=current_user.id if current_user is not None else payload.user_id,
                 reason=payload.reason,
             )
         except ConversationApprovalNotFoundError as exc:

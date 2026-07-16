@@ -31,6 +31,18 @@ API_TOKEN_SCOPE_DEFINITIONS: tuple[ApiTokenScopeDefinition, ...] = (
         category="agents",
     ),
     ApiTokenScopeDefinition(
+        id="conversations:read",
+        label="Conversations read",
+        description="Read conversations, messages, context usage, and the active main-agent profile.",
+        category="conversations",
+    ),
+    ApiTokenScopeDefinition(
+        id="conversations:write",
+        label="Conversations write",
+        description="Create or update conversations, messages, approvals, and main-agent settings.",
+        category="conversations",
+    ),
+    ApiTokenScopeDefinition(
         id="workflows:read",
         label="Workflows read",
         description="Read workflow definitions and workflow metadata.",

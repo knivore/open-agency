@@ -195,6 +195,37 @@ class CrewAIRuntimeOverrideTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(profile.api_key_ref, "ollama")
         self.assertEqual(profile.temperature, 0.4)
 
+    async def test_runtime_llm_override_does_not_rebind_saved_key_to_new_endpoint(self):
+        workflow_repo = InMemoryWorkflowRepository()
+        profile_repo = InMemoryModelProfileRepository()
+        execution_store = InMemoryExecutionStore()
+        adapter = CrewAIRuntimeAdapter(
+            workflow_repository=workflow_repo,
+            model_profile_repository=profile_repo,
+            execution_store=execution_store,
+        )
+        base_profile = ModelProfileDefinition(
+            id="profile-sensitive",
+            name="Sensitive Profile",
+            provider="openai",
+            model="gpt-4o-mini",
+            api_key_ref="env://OPENAI_API_KEY",
+        )
+        await profile_repo.save_profile(base_profile)
+        workflow = _simple_workflow()
+        workflow.agent_definitions[0].model_profile_id = base_profile.id
+        workflow.agent_definitions[0].metadata["runtime_config"] = {
+            "llm_override": {
+                "provider": "openai_compatible",
+                "model": "custom/model",
+                "base_url": "https://allowed-custom-provider.example/v1",
+            }
+        }
+
+        profiles = await adapter._resolve_model_profiles(workflow)
+
+        self.assertIsNone(profiles["agent-1"].api_key_ref)
+
 
 class CrewAIExecutionEventTests(unittest.IsolatedAsyncioTestCase):
     async def test_registry_defaults_unspecified_runtime_to_native(self):

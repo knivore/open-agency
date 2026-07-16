@@ -585,7 +585,10 @@ class MainAgentWorkflowMonitorService:
                 ExecutionStatus.CREATED,
                 ExecutionStatus.QUEUED,
                 ExecutionStatus.RUNNING,
+                ExecutionStatus.WAITING_FOR_INPUT,
                 ExecutionStatus.WAITING_FOR_APPROVAL,
+                ExecutionStatus.WAITING_FOR_EVENT,
+                ExecutionStatus.SLEEPING,
                 ExecutionStatus.PAUSED,
             }:
                 return True

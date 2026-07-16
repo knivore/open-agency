@@ -18,17 +18,34 @@ class ChannelIdentityMappingService:
     async def get_mapping(self, mapping_id: str) -> ChannelIdentityMapping | None:
         return await self.context.channel_identity_mapping_repo.get(mapping_id)
 
-    async def find_mapping(self, *, channel_type: str, channel_user_id: str) -> ChannelIdentityMapping | None:
+    async def find_mapping(
+            self,
+            *,
+            channel_type: str,
+            channel_user_id: str,
+            tenant_id: str | None = None,
+    ) -> ChannelIdentityMapping | None:
         repo = self.context.channel_identity_mapping_repo
+        lookup_user_id = self._scoped_channel_user_id(channel_type, channel_user_id, tenant_id)
         if hasattr(repo, "find_by_channel_identity"):
-            return await repo.find_by_channel_identity(channel_type, channel_user_id)
+            return await repo.find_by_channel_identity(channel_type, lookup_user_id)
         for item in await repo.list():
-            if item.channel_type.value == channel_type and item.channel_user_id == channel_user_id:
+            if item.channel_type.value == channel_type and item.channel_user_id == lookup_user_id:
                 return item
         return None
 
-    async def resolve_trusted_internal_user_id(self, *, channel_type: str, channel_user_id: str) -> str | None:
-        mapping = await self.find_mapping(channel_type=channel_type, channel_user_id=channel_user_id)
+    async def resolve_trusted_internal_user_id(
+            self,
+            *,
+            channel_type: str,
+            channel_user_id: str,
+            tenant_id: str | None = None,
+    ) -> str | None:
+        mapping = await self.find_mapping(
+            channel_type=channel_type,
+            channel_user_id=channel_user_id,
+            tenant_id=tenant_id,
+        )
         if mapping is None or not mapping.trusted:
             return None
         user = await self.context.user_repo.get(mapping.internal_user_id)
@@ -46,23 +63,51 @@ class ChannelIdentityMappingService:
             internal_user_id: str,
             channel_display_name: str | None = None,
             trusted: bool = True,
-            metadata: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> ChannelIdentityMapping:
         normalized_channel = ConversationChannelType(channel_type)
+        mapping_metadata = dict(metadata or {})
+        tenant_id = self._tenant_id(mapping_metadata)
+        if normalized_channel == ConversationChannelType.SLACK and not tenant_id:
+            raise ValueError("Slack identity mappings require metadata.team_id to bind the workspace tenant.")
+        scoped_channel_user_id = self._scoped_channel_user_id(
+            normalized_channel.value,
+            channel_user_id,
+            tenant_id,
+        )
         user = await self.context.user_repo.get(internal_user_id)
         if user is None:
             raise ValueError(f"Internal user '{internal_user_id}' was not found")
-        existing = await self.find_mapping(channel_type=normalized_channel.value, channel_user_id=channel_user_id)
+        existing = await self.find_mapping(
+            channel_type=normalized_channel.value,
+            channel_user_id=channel_user_id,
+            tenant_id=tenant_id,
+        )
         mapping = ChannelIdentityMapping(
             id=existing.id if existing is not None else f"channel-map-{uuid4()}",
             channel_type=normalized_channel,
-            channel_user_id=channel_user_id,
+            channel_user_id=scoped_channel_user_id,
             internal_user_id=internal_user_id,
             channel_display_name=channel_display_name,
             trusted=trusted,
-            metadata=metadata or {},
+            metadata={**mapping_metadata, **({"tenant_id": tenant_id} if tenant_id else {})},
         )
         return await self.context.channel_identity_mapping_repo.save(mapping)
+
+    @staticmethod
+    def _tenant_id(metadata: dict[str, Any]) -> str | None:
+        value = metadata.get("tenant_id") or metadata.get("team_id") or metadata.get("workspace_id")
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    @classmethod
+    def _scoped_channel_user_id(cls, channel_type: str, channel_user_id: str, tenant_id: str | None) -> str:
+        if channel_type == ConversationChannelType.SLACK.value:
+            if not tenant_id:
+                # Legacy unscoped Slack mappings are deliberately unreachable;
+                # Slack user IDs are only unique within a workspace boundary.
+                return "unscoped:" + channel_user_id
+            return f"{tenant_id}:{channel_user_id}"
+        return channel_user_id
 
     async def delete_mapping(self, mapping_id: str) -> bool:
         return await self.context.channel_identity_mapping_repo.soft_delete(mapping_id)

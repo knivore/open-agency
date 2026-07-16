@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from hashlib import sha256
 import logging
 import os
 import re
@@ -21,12 +22,14 @@ from app.domain import (
     ApprovalTargetType,
     ApprovalType,
     AgentDefinition,
+    ContextScope,
     Conversation,
     ConversationMessage,
     ConversationMessageType,
     ConversationRole,
     ExecutionEvent,
     ExecutionEventType,
+    ExecutionMode,
     GraphProjectionEvent,
     MainAgentProfile,
     ModelProfileDefinition,
@@ -35,6 +38,8 @@ from app.domain import (
     ScheduleType,
     PersonaStatus,
     PersonaVersionStatus,
+    RoutingDecision,
+    SpecialistAgentDescriptor,
     TaskDefinition,
     ToolDefinition,
     ToolType,
@@ -113,6 +118,17 @@ from app.services.workflows import WorkflowService
 from app.tools.names import make_tool_call_name, tool_call_name, tool_display_name, tool_matches_call_name
 from .audit import CONVERSATION_AUDIT_WORKFLOW_ID, ConversationAuditService
 from .policy import MainAgentPolicyService
+from .intent_routing import (
+    DeterministicFastPathClassifier,
+    LightweightIntentRouter,
+    ROUTER_PROMPT_VERSION,
+    ROUTING_PATTERN_CACHE,
+    RoutingPolicy,
+    RoutingPolicyOutcome,
+    message_needs_recent_routing_context,
+    redact_routing_text,
+    routing_cache_key,
+)
 
 if TYPE_CHECKING:
     from app.api.context import ApiContext
@@ -142,6 +158,7 @@ CONVERSATION_ACTIVITY_EVENT_TYPES = {
     "planner.started",
     "planner.step",
     "planner.completed",
+    "routing.completed",
     "tool_call.started",
     "tool_call.progress",
     "tool_call.completed",
@@ -530,7 +547,11 @@ class ConversationService:
             status="running",
             message_id=origin_message.id,
         )
-        assistant_payload = await self._generate_assistant_reply(profile=profile, conversation_id=conversation_id)
+        assistant_payload = await self._generate_assistant_reply(
+            profile=profile,
+            conversation_id=conversation_id,
+            origin_message=created,
+        )
         await self.publish_activity_event(
             conversation_id,
             "assistant.finalizing",
@@ -5043,7 +5064,333 @@ class ConversationService:
             await self.context.conversation_repo.update(conversation.id, {"main_agent_profile_id": profile.id})
         return profile
 
-    async def _generate_assistant_reply(self, *, profile: MainAgentProfile, conversation_id: str) -> dict[str, Any]:
+    async def _resolve_direct_reply_routing(
+            self,
+            *,
+            profile: MainAgentProfile,
+            model_profile: ModelProfileDefinition | None,
+            conversation: Conversation | None,
+            conversation_id: str,
+            user_message: str,
+            tools: list[ToolDefinition],
+            specialists: dict[
+                str,
+                tuple[AgentDefinition, list[ToolDefinition], SpecialistAgentDescriptor],
+            ] | None = None,
+    ) -> tuple[RoutingPolicyOutcome | None, list[ToolDefinition], dict[str, Any]]:
+        """Route a direct reply without allowing the router to expand the agent's tool allowlist."""
+        settings = get_settings()
+        baseline_schema_bytes, baseline_schema_tokens = self._measure_direct_reply_tool_schemas(tools)
+        metadata: dict[str, Any] = {
+            "available_tool_count": len(tools),
+            "estimated_baseline_tool_schema_bytes": baseline_schema_bytes,
+            "router_cache_hit": False,
+        }
+        if not settings.main_agent_router_enabled:
+            return None, tools, metadata
+
+        specialists = specialists or {}
+        all_routable_tools = [
+            *tools,
+            *(tool for _, specialist_tools, _ in specialists.values() for tool in specialist_tools),
+        ]
+        groups = self.context.tool_service.tool_registry.describe_tool_groups(all_routable_tools)
+        catalogue_version = self.context.tool_service.tool_registry.tool_catalogue_version(all_routable_tools)
+        specialist_descriptors = [item[2] for _, item in sorted(specialists.items())]
+        specialist_version = sha256(
+            _json_dump([item.model_dump(mode="json") for item in specialist_descriptors]).encode("utf-8")
+        ).hexdigest()
+        enabled_fast_path_rules = (
+            {
+                value.strip()
+                for value in settings.main_agent_router_fast_path_rules.split(",")
+                if value.strip()
+            }
+            if settings.main_agent_router_fast_path_enabled
+            else set()
+        )
+        fast_path = DeterministicFastPathClassifier(enabled_fast_path_rules).evaluate(user_message)
+        recent_router_context: list[dict[str, str]] = []
+        if not fast_path.matched and message_needs_recent_routing_context(user_message):
+            recent_messages = await self.context.conversation_message_repo.list_recent_by_conversation(
+                conversation_id,
+                limit=min(4, settings.main_agent_router_recent_message_limit),
+            )
+            for message in recent_messages:
+                if message.role not in {ConversationRole.USER, ConversationRole.ASSISTANT} or not message.plain_text:
+                    continue
+                if message.role == ConversationRole.USER and message.plain_text == user_message:
+                    continue
+                recent_router_context.append(
+                    {"role": message.role.value, "content": redact_routing_text(message.plain_text)[:500]}
+                )
+        context_version = (
+            sha256(_json_dump(recent_router_context).encode("utf-8")).hexdigest()
+            if recent_router_context
+            else "none"
+        )
+        metadata["router_context_turn_count"] = len(recent_router_context)
+        router_failure: str | None = None
+        if fast_path.matched:
+            raw_decision = fast_path.decision
+        else:
+            router_profile = model_profile
+            if settings.main_agent_router_model_profile_id:
+                router_profile = await self.context.model_profile_repo.get(settings.main_agent_router_model_profile_id)
+            if router_profile is None:
+                raw_decision = None
+                router_failure = "router_profile_unavailable"
+            else:
+                try:
+                    permission_payload = {
+                        "profile_id": profile.id,
+                        "agent_id": profile.agent_id,
+                        "user_id": conversation.created_by_user_id if conversation is not None else None,
+                        "tool_ids": [tool.id for tool in tools],
+                        "policy": {
+                            "min_confidence": settings.main_agent_router_min_confidence,
+                            "max_tool_groups": settings.main_agent_router_max_tool_groups,
+                            "direct_response_enabled": settings.main_agent_router_direct_response_enabled,
+                            "selective_write_enabled": settings.main_agent_router_selective_write_tools_enabled,
+                            "specialist_enabled": settings.main_agent_router_specialist_enabled,
+                            "safe_fallback_groups": settings.main_agent_router_safe_fallback_groups,
+                        },
+                    }
+                    permission_version = sha256(_json_dump(permission_payload).encode("utf-8")).hexdigest()
+                    cache_key = routing_cache_key(
+                        message=user_message,
+                        router_prompt_version=ROUTER_PROMPT_VERSION,
+                        router_provider=router_profile.provider,
+                        router_model=router_profile.model,
+                        catalogue_version=catalogue_version,
+                        specialist_version=specialist_version,
+                        permission_version=permission_version,
+                        context_version=context_version,
+                    )
+                    cached_decision = (
+                        ROUTING_PATTERN_CACHE.get(cache_key)
+                        if settings.main_agent_router_cache_enabled
+                        else None
+                    )
+                    metadata["router_cache_hit"] = cached_decision is not None
+                    if cached_decision is not None:
+                        raw_decision = cached_decision
+                        metadata.update(
+                            {
+                                "router_model": router_profile.model,
+                                "router_provider": router_profile.provider,
+                                "router_latency_ms": 0.0,
+                            }
+                        )
+                    else:
+                        client = self.context.llm_provider_registry.resolve(router_profile)
+                        attempt = await LightweightIntentRouter(settings).route(
+                            client=client,
+                            message=redact_routing_text(user_message),
+                            available_groups=groups,
+                            available_specialists=specialist_descriptors,
+                            recent_context=recent_router_context,
+                        )
+                        raw_decision = attempt.decision
+                        router_failure = attempt.failure_code
+                        usage = attempt.usage or {}
+                        metadata.update(
+                            {
+                                "router_repaired": attempt.repaired,
+                                "router_model": attempt.model or router_profile.model,
+                                "router_provider": attempt.provider or router_profile.provider,
+                                "router_input_tokens": _routing_usage_value(usage, "prompt_tokens", "input_tokens"),
+                                "router_output_tokens": _routing_usage_value(usage, "completion_tokens", "output_tokens"),
+                                "router_latency_ms": attempt.latency_ms,
+                            }
+                        )
+                        if settings.main_agent_router_cache_enabled and raw_decision is not None:
+                            metadata["router_cache_stored"] = ROUTING_PATTERN_CACHE.put(
+                                cache_key,
+                                raw_decision,
+                                available_groups=groups,
+                                ttl_seconds=settings.main_agent_router_cache_ttl_seconds,
+                                max_entries=settings.main_agent_router_cache_max_entries,
+                            )
+                except Exception:
+                    # Router availability must never prevent the legacy conversation path from serving a reply.
+                    raw_decision = None
+                    router_failure = "router_provider_unavailable"
+
+        policy = RoutingPolicy(settings)
+        outcome = policy.apply(
+            raw_decision,
+            groups,
+            specialist_descriptors,
+        ) if raw_decision is not None else policy.safe_fallback(
+            router_failure or "router_unavailable",
+            groups,
+        )
+        planned_tools = tools
+        rollout_selected = _router_rollout_selected(
+            settings=settings,
+            conversation_id=conversation_id,
+            user_id=conversation.created_by_user_id if conversation is not None else None,
+        )
+        authoritative = not settings.main_agent_router_shadow_mode and rollout_selected
+        # Selection is computed in shadow mode too, but only an authoritative rollout may
+        # alter executor inputs. This makes predicted-vs-actual measurements trustworthy.
+        if outcome.decision.execution_mode == ExecutionMode.DIRECT_RESPONSE:
+            planned_tools = []
+        elif outcome.decision.execution_mode == ExecutionMode.SELECTED_TOOLS:
+            planned_tools = self.context.tool_service.tool_registry.resolve_tool_groups(
+                tools,
+                outcome.decision.tool_groups,
+            )
+        elif outcome.decision.execution_mode == ExecutionMode.SPECIALIST_AGENT:
+            specialist_tools = specialists[outcome.decision.specialist_agent][1]
+            planned_tools = self.context.tool_service.tool_registry.resolve_tool_groups(
+                specialist_tools,
+                outcome.decision.tool_groups,
+            ) if outcome.decision.tool_groups else []
+        executor_tools = planned_tools if authoritative else tools
+        planned_schema_bytes, planned_schema_tokens = self._measure_direct_reply_tool_schemas(planned_tools)
+        executor_schema_bytes, _ = self._measure_direct_reply_tool_schemas(executor_tools)
+        metadata.update(
+            {
+                "routing_mode": outcome.decision.execution_mode.value,
+                "routing_confidence": outcome.decision.confidence,
+                "selected_tool_groups": outcome.decision.tool_groups,
+                "selected_tool_count": len(planned_tools),
+                "selected_tool_ids": [tool.id for tool in planned_tools],
+                "executor_tool_count": len(executor_tools),
+                "tool_schema_bytes": executor_schema_bytes,
+                "estimated_tool_schema_tokens": planned_schema_tokens,
+                "estimated_tokens_saved": max(0, baseline_schema_tokens - planned_schema_tokens),
+                "fallback_used": outcome.fallback_used,
+                "fast_path_rule": fast_path.rule_code,
+                "router_failure": router_failure,
+                "router_model": metadata.get("router_model"),
+                "specialist_agent": outcome.decision.specialist_agent,
+                "shadow_mode": not authoritative,
+                "configured_shadow_mode": settings.main_agent_router_shadow_mode,
+                "rollout_selected": rollout_selected,
+                "authoritative": authoritative,
+                "catalogue_version": catalogue_version,
+            }
+        )
+        await self._audit_conversation_event(
+            conversation_id=conversation_id,
+            event_type=ExecutionEventType.ROUTING_DECISION_RECORDED,
+            payload={
+                "routing_mode": outcome.decision.execution_mode.value,
+                "intent": outcome.decision.intent,
+                "complexity": outcome.decision.complexity.value,
+                "context_scope": outcome.decision.context_scope.value,
+                "selected_tool_groups": outcome.decision.tool_groups,
+                "specialist_agent": outcome.decision.specialist_agent,
+                "reason_code": outcome.decision.reason_code,
+                "fallback_used": outcome.fallback_used,
+                "fast_path_rule": fast_path.rule_code,
+                "router_failure": router_failure,
+                "router_cache_hit": metadata.get("router_cache_hit", False),
+                "router_cache_stored": metadata.get("router_cache_stored", False),
+                "catalogue_version": catalogue_version,
+                "rollout_selected": rollout_selected,
+            },
+            metrics={
+                "routing_confidence": outcome.decision.confidence,
+                "router_input_tokens": metadata.get("router_input_tokens", 0),
+                "router_output_tokens": metadata.get("router_output_tokens", 0),
+                "router_latency_ms": metadata.get("router_latency_ms", 0.0),
+                "selected_tool_count": len(planned_tools),
+                "available_tool_count": len(tools),
+                "executor_tool_count": len(executor_tools),
+                "tool_schema_bytes": executor_schema_bytes,
+                "estimated_baseline_tool_schema_bytes": baseline_schema_bytes,
+                "estimated_tool_schema_tokens": planned_schema_tokens,
+                "estimated_baseline_tool_schema_tokens": baseline_schema_tokens,
+                "estimated_tool_schema_bytes_saved": max(0, baseline_schema_bytes - planned_schema_bytes),
+                "estimated_tokens_saved": max(0, baseline_schema_tokens - planned_schema_tokens),
+            },
+            metadata={"profile_id": profile.id, "shadow_mode": not authoritative},
+            agent_id=profile.agent_id,
+        )
+        await self.publish_activity_event(
+            conversation_id,
+            "routing.completed",
+            "Selected response route",
+            detail=(
+                f"{outcome.decision.execution_mode.value}; "
+                f"{len(planned_tools)} of {len(tools)} tool(s) selected"
+            ),
+            status="completed",
+            metadata=metadata,
+        )
+        return outcome, executor_tools, metadata
+
+    async def _routing_specialists(
+            self,
+            agent: AgentDefinition | None,
+            *,
+            user_id: str | None,
+    ) -> dict[str, tuple[AgentDefinition, list[ToolDefinition], SpecialistAgentDescriptor]]:
+        """Resolve only explicitly allowlisted handoff agents and their visible tool groups."""
+        if agent is None:
+            return {}
+        specialists: dict[str, tuple[AgentDefinition, list[ToolDefinition], SpecialistAgentDescriptor]] = {}
+        for specialist_id in dict.fromkeys(agent.handoff_agent_ids):
+            if specialist_id == agent.id:
+                continue
+            specialist = await self.context.agent_repo.get(specialist_id)
+            if specialist is None:
+                continue
+            specialist_tools = [
+                tool
+                for tool in await AgentToolResolver(self.context).resolve_agent_tools(specialist)
+                if self._policy().tool_is_visible_to_user(tool, user_id)
+            ]
+            groups = self.context.tool_service.tool_registry.describe_tool_groups(specialist_tools)
+            descriptor = SpecialistAgentDescriptor(
+                id=specialist.id,
+                name=specialist.display_name or specialist.name,
+                description=specialist.description or specialist.role or "Specialist agent",
+                tool_groups=[group.id for group in groups],
+            )
+            specialists[specialist.id] = (specialist, specialist_tools, descriptor)
+        return specialists
+
+    @staticmethod
+    def _history_for_routing_scope(
+            history: list[ConversationMessage],
+            decision: RoutingDecision,
+            *,
+            token_budget: int,
+    ) -> list[ConversationMessage]:
+        if decision.context_scope == ContextScope.FULL_THREAD:
+            candidates = history
+        elif decision.context_scope == ContextScope.CURRENT_MESSAGE:
+            latest_user = next((item for item in reversed(history) if item.role == ConversationRole.USER), None)
+            candidates = [latest_user] if latest_user is not None else history[-1:]
+        elif decision.context_scope == ContextScope.RECENT_TURNS:
+            candidates = history
+        else:
+            # Retrieval and summaries retain a compact nearby anchor; older context comes from targeted retrieval.
+            candidates = history[-4:]
+
+        selected: list[ConversationMessage] = []
+        used_tokens = 0
+        for message in reversed(candidates):
+            content = message.plain_text if message.plain_text is not None else _json_dump(message.content)
+            message_tokens = max(1, len(content) // 4) + 4
+            if selected and used_tokens + message_tokens > token_budget:
+                break
+            selected.append(message)
+            used_tokens += message_tokens
+        return list(reversed(selected))
+
+    async def _generate_assistant_reply(
+            self,
+            *,
+            profile: MainAgentProfile,
+            conversation_id: str,
+            origin_message: ConversationMessage | None = None,
+    ) -> dict[str, Any]:
         agent = await self.context.agent_repo.get(profile.agent_id)
         model_profile_id = (
             agent.model_profile_id
@@ -5052,40 +5399,127 @@ class ConversationService:
         )
         model_profile = await self.context.model_profile_repo.get(
             model_profile_id) if model_profile_id else None
-        history = await self.context.conversation_message_repo.list_by_conversation(conversation_id)
         conversation = await self.context.conversation_repo.get(conversation_id)
-        tools = [
+        available_tools = [
             tool
             for tool in await AgentToolResolver(self.context).resolve_agent_tools(agent)
-            if self._policy().tool_is_visible(tool)
+            if self._policy().tool_is_visible_to_user(
+                tool,
+                conversation.created_by_user_id if conversation is not None else None,
+            )
         ]
+        specialists = await self._routing_specialists(
+            agent,
+            user_id=conversation.created_by_user_id if conversation is not None else None,
+        )
+        history: list[ConversationMessage] = []
+        latest_user_message = origin_message
+        if latest_user_message is None:
+            history = await self.context.conversation_message_repo.list_by_conversation(conversation_id)
+            latest_user_message = next((item for item in reversed(history) if item.role == ConversationRole.USER), None)
+        latest_user_text = latest_user_message.plain_text if latest_user_message is not None else ""
+        routing_outcome, tools, routing_metadata = await self._resolve_direct_reply_routing(
+            profile=profile,
+            model_profile=model_profile,
+            conversation=conversation,
+            conversation_id=conversation_id,
+            user_message=latest_user_text,
+            tools=available_tools,
+            specialists=specialists,
+        )
+        # Narrow the optional outcome once. Downstream context, model, and tool choices must
+        # all be based on the same policy-validated decision.
+        routing_decision = routing_outcome.decision if routing_outcome is not None else None
+        routing_authoritative = routing_decision is not None and routing_metadata.get("authoritative") is True
+        compatibility_full_agent = (
+            routing_authoritative and routing_decision.execution_mode == ExecutionMode.FULL_AGENT
+        )
+        if routing_authoritative and routing_decision.execution_mode == ExecutionMode.CLARIFICATION:
+            assistant = await self._append_assistant_text_message(
+                conversation_id=conversation_id,
+                text=routing_decision.clarification_question or "Could you clarify your request?",
+                metadata={"delivery": "direct", "routing": routing_metadata},
+            )
+            return {"assistant_message": assistant.model_dump(mode="json")}
+        execution_agent = agent
+        execution_model_profile = model_profile
+        if routing_authoritative and routing_decision.execution_mode == ExecutionMode.SPECIALIST_AGENT:
+            execution_agent = specialists[routing_decision.specialist_agent][0]
+            if execution_agent.model_profile_id:
+                specialist_profile = await self.context.model_profile_repo.get(execution_agent.model_profile_id)
+                if specialist_profile is not None:
+                    execution_model_profile = specialist_profile
+                    model_profile_id = specialist_profile.id
+        needs_history = (
+            not routing_authoritative
+            or routing_decision.context_scope != ContextScope.CURRENT_MESSAGE
+        )
+        if needs_history and not history:
+            if routing_authoritative and routing_decision.context_scope != ContextScope.FULL_THREAD:
+                history = await self.context.conversation_message_repo.list_recent_by_conversation(
+                    conversation_id,
+                    limit=get_settings().main_agent_router_recent_message_limit,
+                )
+            else:
+                history = await self.context.conversation_message_repo.list_by_conversation(conversation_id)
+        elif not history and origin_message is not None:
+            history = [origin_message]
+        if routing_authoritative and not compatibility_full_agent:
+            history = self._history_for_routing_scope(
+                history,
+                routing_decision,
+                token_budget=get_settings().main_agent_router_context_token_budget,
+            )
+        elif not history:
+            # Follow-up responses without an origin message retain the legacy full-history behavior.
+            history = await self.context.conversation_message_repo.list_by_conversation(conversation_id)
+        routing_metadata.update(
+            {
+                "context_scope": (
+                    routing_decision.context_scope.value if routing_decision is not None else "full_thread"
+                ),
+                "context_sources": [
+                    routing_decision.context_scope.value if routing_decision is not None else "full_thread"
+                ],
+                "history_message_count": len(history),
+                "history_estimated_tokens": self._estimate_history_tokens(history),
+            }
+        )
+        planned_memory_context = (
+            conversation is not None
+            and (
+                not routing_authoritative
+                or routing_decision.needs_memory
+                or routing_decision.context_scope in {
+                    ContextScope.CONVERSATION_SUMMARY,
+                    ContextScope.RELEVANT_RETRIEVAL,
+                }
+            )
+        )
+        if planned_memory_context:
+            routing_metadata["context_sources"].append("relevant_memory_retrieval")
         await self.publish_activity_event(
             conversation_id,
             "context.loaded",
             "Loaded conversation history",
             detail=f"{len(history)} message(s), {len(tools)} available tool(s).",
             status="completed",
-            metadata={"message_count": len(history), "tool_count": len(tools)},
+            metadata={"message_count": len(history), "tool_count": len(tools), **routing_metadata},
         )
-        instructions = await self._compose_main_agent_instructions(
-            agent=agent,
-            profile=profile,
-        )
+        if routing_authoritative and routing_decision.execution_mode == ExecutionMode.SPECIALIST_AGENT:
+            instructions = self._compose_specialist_instructions(execution_agent)
+        else:
+            instructions = await self._compose_main_agent_instructions(
+                agent=execution_agent,
+                profile=profile,
+            )
         if conversation is not None:
-            await self._ensure_context_pack_for_prompt(
-                conversation=conversation,
-                agent_id=profile.agent_id,
-                history=history,
-            )
-            latest_user_text = next(
-                (item.plain_text for item in reversed(history) if
-                 item.role == ConversationRole.USER and item.plain_text),
-                None,
-            )
-            latest_user_message = next(
-                (item for item in reversed(history) if item.role == ConversationRole.USER),
-                None,
-            )
+            if not routing_authoritative or routing_decision.context_scope != ContextScope.CURRENT_MESSAGE:
+                await self._ensure_context_pack_for_prompt(
+                    conversation=conversation,
+                    agent_id=execution_agent.id if execution_agent is not None else profile.agent_id,
+                    history=history,
+                )
             page_context_prompt = self._page_context_prompt(latest_user_message)
             if page_context_prompt:
                 instructions = f"{instructions or ''}\n\n{page_context_prompt}".strip()
@@ -5095,48 +5529,66 @@ class ConversationService:
             direct_document_prompt = await self._direct_document_context_prompt(latest_user_message)
             if direct_document_prompt:
                 instructions = f"{instructions or ''}\n\n{direct_document_prompt}".strip()
-            await self.publish_activity_event(
-                conversation_id,
-                "memory.searching",
-                "Searching memory",
-                detail="Looking for conversation context and durable memories related to the latest request.",
-                status="running",
-            )
-            memory_prompt = await self._build_memory_prompt(
-                conversation=conversation,
-                agent_id=profile.agent_id,
-                query=latest_user_text,
-            )
-            if memory_prompt:
+            load_memory = planned_memory_context
+            if load_memory:
                 await self.publish_activity_event(
                     conversation_id,
-                    "memory.found",
-                    "Loaded memory context",
-                    detail="Relevant memory context was added to the model prompt.",
-                    status="completed",
+                    "memory.searching",
+                    "Searching memory",
+                    detail="Looking for conversation context and durable memories related to the latest request.",
+                    status="running",
                 )
-                instructions = f"{instructions or ''}\n\n{memory_prompt}".strip()
-            else:
-                await self.publish_activity_event(
-                    conversation_id,
-                    "memory.found",
-                    "Memory search completed",
-                    detail="No additional memory context was added to the prompt.",
-                    status="completed",
+                memory_prompt = await self._build_memory_prompt(
+                    conversation=conversation,
+                    agent_id=execution_agent.id if execution_agent is not None else profile.agent_id,
+                    query=latest_user_text,
+                    include_context_pack=(
+                        routing_authoritative
+                        and routing_decision.context_scope == ContextScope.CONVERSATION_SUMMARY
+                    ),
                 )
-            history = await self._compact_history_for_prompt(
-                conversation=conversation,
-                agent_id=profile.agent_id,
-                history=history,
-            )
+                if memory_prompt:
+                    await self.publish_activity_event(
+                        conversation_id,
+                        "memory.found",
+                        "Loaded memory context",
+                        detail="Relevant memory context was added to the model prompt.",
+                        status="completed",
+                    )
+                    instructions = f"{instructions or ''}\n\n{memory_prompt}".strip()
+                else:
+                    await self.publish_activity_event(
+                        conversation_id,
+                        "memory.found",
+                        "Memory search completed",
+                        detail="No additional memory context was added to the prompt.",
+                        status="completed",
+                    )
+            if not routing_authoritative or routing_decision.context_scope == ContextScope.FULL_THREAD:
+                history = await self._compact_history_for_prompt(
+                    conversation=conversation,
+                    agent_id=execution_agent.id if execution_agent is not None else profile.agent_id,
+                    history=history,
+                )
 
         outcome = await self._call_direct_reply_model(
             profile=profile,
             instructions=instructions,
-            model_profile=model_profile,
+            model_profile=execution_model_profile,
             history=history,
             conversation_id=conversation_id,
             tools=tools,
+            routing_metadata=routing_metadata,
+            max_tool_iterations=(
+                routing_decision.max_tool_iterations
+                if routing_authoritative and not compatibility_full_agent
+                else None
+            ),
+            token_budget=(
+                routing_decision.token_budget
+                if routing_authoritative and not compatibility_full_agent
+                else None
+            ),
         )
         if outcome.get("assistant_message") is not None:
             return outcome
@@ -7083,7 +7535,57 @@ class ConversationService:
             history: list[ConversationMessage],
             conversation_id: str,
             tools: list[ToolDefinition],
+            routing_metadata: dict[str, Any] | None = None,
+            max_tool_iterations: int | None = None,
+            token_budget: int | None = None,
     ) -> dict[str, Any]:
+        actual_tool_ids: list[str] = []
+        conversation_record = await self.context.conversation_repo.get(conversation_id)
+        conversation_owner_user_id = (
+            conversation_record.created_by_user_id if conversation_record is not None else None
+        )
+
+        async def record_routing_evaluation() -> None:
+            if not routing_metadata or not routing_metadata.get("routing_mode"):
+                return
+            selected_ids = set(routing_metadata.get("selected_tool_ids") or [])
+            actual_ids = set(actual_tool_ids)
+            false_negative_ids = sorted(actual_ids - selected_ids)
+            unnecessary_ids = sorted(selected_ids - actual_ids)
+            routing_metadata.update(
+                {
+                    "tools_actually_called": sorted(actual_ids),
+                    "false_negative_tool_ids": false_negative_ids,
+                    "unnecessary_selected_tool_ids": unnecessary_ids,
+                }
+            )
+            await self._audit_conversation_event(
+                conversation_id=conversation_id,
+                event_type=ExecutionEventType.ROUTING_EVALUATION_RECORDED,
+                payload={
+                    "routing_mode": routing_metadata.get("routing_mode"),
+                    "selected_tool_groups": routing_metadata.get("selected_tool_groups") or [],
+                    "selected_tool_ids": sorted(selected_ids),
+                    "tools_actually_called": sorted(actual_ids),
+                    "false_negative_tool_ids": false_negative_ids,
+                    "unnecessary_selected_tool_ids": unnecessary_ids,
+                    "shadow_mode": routing_metadata.get("shadow_mode", False),
+                },
+                metrics={
+                    "selected_tool_count": len(selected_ids),
+                    "actual_tool_count": len(actual_ids),
+                    "false_negative_tool_count": len(false_negative_ids),
+                    "unnecessary_selected_tool_count": len(unnecessary_ids),
+                },
+                metadata={"profile_id": profile.id},
+                agent_id=profile.agent_id,
+            )
+
+        async def finish(result: dict[str, Any]) -> dict[str, Any]:
+            """Record one terminal routing comparison before returning any model outcome."""
+            await record_routing_evaluation()
+            return result
+
         if model_profile is not None:
             try:
                 client = self.context.llm_provider_registry.resolve(model_profile)
@@ -7092,19 +7594,22 @@ class ConversationService:
                     client=client,
                 )
                 if auth_failure is not None:
-                    return auth_failure
+                    return await finish(auth_failure)
                 messages = self._build_model_messages(instructions=instructions, history=history)
                 tool_payload = self._build_direct_reply_tool_payload(tools)
+                routing_metadata = routing_metadata or {}
+                completion_candidates = [value for value in (model_profile.max_tokens, token_budget) if value is not None]
+                completion_budget = min(completion_candidates) if completion_candidates else None
                 latest_user_message_id = next(
                     (item.id for item in reversed(history) if item.role == ConversationRole.USER),
                     None,
                 )
-                for _ in range(4):
+                for _ in range(max_tool_iterations or 4):
                     model_request_id = str(uuid4())
                     context_health = estimate_context_health(
                         messages,
                         model_profile=model_profile,
-                        reserved_completion_tokens=model_profile.max_tokens,
+                        reserved_completion_tokens=completion_budget,
                     )
                     context_event = await self._audit_conversation_event(
                         conversation_id=conversation_id,
@@ -7145,6 +7650,7 @@ class ConversationService:
                             "tool_count": len(tool_payload),
                             "call_kind": "direct_reply",
                             "context_health": context_health.model_dump(mode="json"),
+                            "routing": routing_metadata,
                         },
                         metrics={
                             "estimated_prompt_tokens": context_health.estimated_prompt_tokens,
@@ -7154,7 +7660,12 @@ class ConversationService:
                             "context_usage_ratio": context_health.usage_ratio or 0,
                             "context_status": context_health.status,
                         },
-                        metadata={"profile_id": profile.id, "call_kind": "direct_reply"},
+                        metadata={
+                            "profile_id": profile.id,
+                            "call_kind": "direct_reply",
+                            "routing_mode": routing_metadata.get("routing_mode"),
+                            "shadow_mode": routing_metadata.get("shadow_mode"),
+                        },
                         agent_id=profile.agent_id,
                         model_request_id=model_request_id,
                     )
@@ -7176,7 +7687,7 @@ class ConversationService:
                         response = await client.agenerate_text(
                             messages,
                             temperature=model_profile.temperature,
-                            max_tokens=model_profile.max_tokens,
+                            max_tokens=completion_budget,
                             tools=tool_payload or None,
                         )
                     else:
@@ -7184,7 +7695,7 @@ class ConversationService:
                             client.generate_text,
                             messages,
                             temperature=model_profile.temperature,
-                            max_tokens=model_profile.max_tokens,
+                            max_tokens=completion_budget,
                             tools=tool_payload or None,
                         )
                     usage = normalize_token_usage(
@@ -7325,14 +7836,16 @@ class ConversationService:
                                     )
                                 )
                                 continue
+                            if tool.id not in actual_tool_ids:
+                                actual_tool_ids.append(tool.id)
                             response_tool_call_name = tool_call_name(tool)
                             if tool.security.requires_approval:
                                 channel_decision = await self._policy().check_tool_execution_channel(conversation_id)
                                 if not channel_decision.allowed:
-                                    return {
+                                    return await finish({
                                         "text": channel_decision.reason
                                                 or "This channel is not allowed to run approval-gated tools without a trusted mapped identity."
-                                    }
+                                    })
                                 approval_payload = await self._create_tool_execution_approval(
                                     profile=profile,
                                     conversation_id=conversation_id,
@@ -7341,7 +7854,7 @@ class ConversationService:
                                     tool_call_id=call_id,
                                     origin_message_id=latest_user_message_id,
                                 )
-                                return approval_payload
+                                return await finish(approval_payload)
                             if is_system_memory_tool(tool):
                                 await self._append_tool_call_message(
                                     conversation_id=conversation_id,
@@ -7395,7 +7908,7 @@ class ConversationService:
                                         tool_call_id=call_id,
                                         approval_payload=internal_result["approval_payload"],
                                     )
-                                    return internal_result["approval_payload"]
+                                    return await finish(internal_result["approval_payload"])
                                 result = internal_result.get("result", internal_result)
                                 display_result = self._redact_tool_value(tool, result)
                                 await self._append_tool_result_message(
@@ -7436,7 +7949,7 @@ class ConversationService:
                                         tool_call_id=call_id,
                                         approval_payload=internal_result["approval_payload"],
                                     )
-                                    return internal_result["approval_payload"]
+                                    return await finish(internal_result["approval_payload"])
                                 result = internal_result.get("result", internal_result)
                                 display_result = self._redact_tool_value(tool, result)
                                 await self._append_tool_result_message(
@@ -7497,6 +8010,7 @@ class ConversationService:
                                 internal_result = await self._execute_conversation_execution_tool(
                                     tool=tool,
                                     arguments=tool_call.arguments,
+                                    owner_user_id=conversation_owner_user_id,
                                 )
                                 result = internal_result.get("result", internal_result)
                                 display_result = self._redact_tool_value(tool, result)
@@ -7538,7 +8052,7 @@ class ConversationService:
                                         tool_call_id=call_id,
                                         approval_payload=internal_result["approval_payload"],
                                     )
-                                    return internal_result["approval_payload"]
+                                    return await finish(internal_result["approval_payload"])
                                 result = internal_result.get("result", internal_result)
                                 display_result = self._redact_tool_value(tool, result)
                                 await self._append_tool_result_message(
@@ -7599,23 +8113,23 @@ class ConversationService:
                         messages.append(ModelMessage(role="assistant", content=response.content))
                     content = response.content
                     if isinstance(content, str) and content.strip():
-                        return {"text": content.strip()}
+                        return await finish({"text": content.strip()})
             except Exception as exc:
                 logger.exception(
                     "Direct main-agent reply model call failed for conversation %s with model profile %s",
                     conversation_id,
                     model_profile.id,
                 )
-                return {
+                return await finish({
                     "text": (
                         "I could not reach the configured LLM for this main agent. "
                         f"Model profile '{model_profile.id}' failed with: {exc}"
                     )
-                }
+                })
         latest_user = next(
             (item.plain_text for item in reversed(history) if item.role == ConversationRole.USER and item.plain_text),
             None)
-        return {"text": self._fallback_reply(latest_user or "How can I help?")}
+        return await finish({"text": self._fallback_reply(latest_user or "How can I help?")})
 
     async def _preflight_direct_reply_model_auth(
             self,
@@ -7693,12 +8207,13 @@ class ConversationService:
             conversation: Conversation,
             agent_id: str,
             query: str | None,
+            include_context_pack: bool = False,
     ) -> str:
         memory_service = self._memory()
         settings = get_settings()
         current_user = await self._resolve_memory_read_user_for_conversation(conversation)
         context_pack_prompt = ""
-        if settings.memory_context_pack_prompt_injection_enabled:
+        if settings.memory_context_pack_prompt_injection_enabled or include_context_pack:
             context_packs = await memory_service.list_context_packs_for_conversation(
                 conversation=conversation,
                 mode="handoff",
@@ -8377,9 +8892,12 @@ class ConversationService:
             *,
             tool: ToolDefinition,
             arguments: dict[str, Any],
+            owner_user_id: str | None,
     ) -> dict[str, Any]:
         service = ExecutionService(self.context)
         try:
+            if not owner_user_id:
+                return {"result": {"status": "error", "error": "Conversation owner identity is required."}}
             if tool.id == SYSTEM_EXECUTION_LIST_TOOL_ID:
                 statuses = arguments.get("status")
                 result = await service.list_executions(
@@ -8389,12 +8907,20 @@ class ConversationService:
                     active_only=bool(arguments.get("active_only")),
                     limit=self._bounded_int(arguments.get("limit"), default=20, minimum=1, maximum=200),
                 )
+                result["items"] = [
+                    item for item in result.get("items", [])
+                    if isinstance(item, dict) and item.get("created_by") == owner_user_id
+                ]
+                result["count"] = len(result["items"])
                 return {"result": {"status": "ok", **result}}
 
             execution_id = arguments.get("execution_id")
             if not isinstance(execution_id, str) or not execution_id.strip():
                 return {"result": {"status": "error", "error": "execution_id is required."}}
             execution_id = execution_id.strip()
+            owned_execution = await self.context.execution_store.get_execution(execution_id)
+            if owned_execution is None or owned_execution.created_by != owner_user_id:
+                return {"result": {"status": "error", "error": f"Execution '{execution_id}' was not found."}}
             if tool.id == SYSTEM_EXECUTION_GET_TOOL_ID:
                 return {"result": {"status": "ok", **await service.get_execution(execution_id)}}
             if tool.id == SYSTEM_EXECUTION_EVENTS_TOOL_ID:
@@ -8690,6 +9216,20 @@ class ConversationService:
             )
         return payload
 
+    def _measure_direct_reply_tool_schemas(self, tools: list[ToolDefinition]) -> tuple[int, int]:
+        """Return serialized bytes and a provider-neutral token estimate.
+
+        Runtime providers do not expose a shared schema tokenizer, so observability uses
+        the conventional four-bytes-per-token approximation. The deterministic benchmark
+        remains the source of exact tokenizer-specific comparisons. An empty tool list is
+        measured as zero because direct mode omits the provider's tools field altogether.
+        """
+        if not tools:
+            return 0, 0
+        payload = self._build_direct_reply_tool_payload(tools)
+        schema_bytes = len(_json_dump(payload).encode("utf-8"))
+        return schema_bytes, (schema_bytes + 3) // 4
+
     async def _append_tool_call_message(
             self,
             *,
@@ -8822,6 +9362,22 @@ class ConversationService:
             metrics={"tool_success": result_status != "error"},
         )
         return message
+
+    @staticmethod
+    def _compose_specialist_instructions(agent: AgentDefinition | None) -> str:
+        if agent is None:
+            return "Answer the delegated request within the tools and context provided."
+        parts = [
+            agent.system_prompt or "",
+            f"Role: {agent.role}" if agent.role else "",
+            agent.instructions or "",
+            f"Backstory: {agent.backstory}" if agent.backstory else "",
+            (
+                "You are handling a request delegated by Agency's main agent. Stay within this specialist scope, "
+                "use only the tools provided in this call, and do not claim access to unavailable capabilities."
+            ),
+        ]
+        return "\n".join(part for part in parts if part)
 
     async def _compose_main_agent_instructions(
             self,
@@ -9586,3 +10142,34 @@ def _json_dump(payload: Any) -> str:
     import json
 
     return json.dumps(payload, separators=(",", ":"), default=str)
+
+
+def _routing_usage_value(usage: dict[str, Any], *keys: str) -> int:
+    for key in keys:
+        value = usage.get(key)
+        if isinstance(value, (int, float)):
+            return max(0, int(value))
+    return 0
+
+
+def _router_rollout_selected(
+        *,
+        settings: Any,
+        conversation_id: str,
+        user_id: str | None,
+) -> bool:
+    allowlist = {
+        value.strip()
+        for value in settings.main_agent_router_user_allowlist.split(",")
+        if value.strip()
+    }
+    if user_id and user_id in allowlist:
+        return True
+    percentage = settings.main_agent_router_rollout_percent
+    if percentage <= 0:
+        return False
+    if percentage >= 100:
+        return True
+    subject = user_id or conversation_id
+    bucket = int(sha256(subject.encode("utf-8")).hexdigest()[:8], 16) % 100
+    return bucket < percentage

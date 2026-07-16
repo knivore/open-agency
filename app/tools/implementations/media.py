@@ -3,7 +3,7 @@ from __future__ import annotations
 from html import escape
 import mimetypes
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Awaitable, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, model_validator
@@ -163,7 +163,7 @@ def send_media(
         dry_run: bool = True,
         metadata: dict[str, Any] | None = None,
         tool_context=None,  # noqa: ANN001
-) -> dict[str, Any]:
+) -> dict[str, Any] | Awaitable[dict[str, Any]]:
     request = _request_from_kwargs(
         provider=provider,
         media_type=media_type,
@@ -183,6 +183,28 @@ def send_media(
     payload = build_media_delivery_payload(request)
     if request.dry_run:
         return {"status": "preview", **payload}
+    runtime_executor = getattr(tool_context, "api_tool_runtime_executor", None)
+    runtime_context = getattr(runtime_executor, "context", None)
+    if runtime_context is not None:
+        # Native Python tools receive the API runtime through ToolExecutionContext.
+        # Reuse it for real delivery instead of degrading to requires_context.
+        return send_media_with_context(
+            runtime_context,
+            provider=provider,
+            media_type=media_type,
+            media_url=media_url,
+            file_path=file_path,
+            text=text,
+            caption=caption,
+            filename=filename,
+            mime_type=mime_type,
+            destination_id=destination_id,
+            team_id=team_id,
+            credential_id=credential_id,
+            owner_user_id=owner_user_id,
+            dry_run=dry_run,
+            metadata=metadata,
+        )
     return {
         "status": "requires_context",
         **payload,

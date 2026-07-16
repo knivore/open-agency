@@ -4,6 +4,7 @@ import asyncio
 import unittest
 from dataclasses import dataclass
 from typing import Callable
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -107,10 +108,16 @@ class MultichannelSharedContractTests(unittest.TestCase):
             self.assertEqual(requested.status_code, 200, case.provider)
             approval_id = requested.json()["result"]["approval_request"]["id"]
 
-            callback = self.client.post(
-                f"/integrations/conversations/adapters/{case.provider}/webhook",
-                json=case.callback_payload(approval_id),
-            )
+            # Provider authentication has dedicated tests; this contract test
+            # isolates the shared callback parsing and approval state transition.
+            with patch(
+                "app.services.conversations.channel_webhooks.ChannelWebhookVerificationService.verify",
+                new=AsyncMock(return_value={"verified": True, "required": True, "provider": case.provider}),
+            ):
+                callback = self.client.post(
+                    f"/integrations/conversations/adapters/{case.provider}/webhook",
+                    json=case.callback_payload(approval_id),
+                )
             self.assertEqual(callback.status_code, 200, case.provider)
             body = callback.json()
             self.assertTrue(body["handled"], case.provider)

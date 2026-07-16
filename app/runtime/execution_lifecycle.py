@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from typing import Any
+
+from app.core.time import ensure_utc
 
 ONE_TIME_RUN_MODE = "one_time"
 SCHEDULED_RUN_MODE = "scheduled"
@@ -26,7 +29,30 @@ class ResolvedExecutionRuntimePolicy:
         return asdict(self)
 
 
+@dataclass(frozen=True, slots=True)
+class PersistentCyclePolicy:
+    """Bounded policy for re-running one durable execution as a monitor loop."""
+
+    enabled: bool = False
+    interval_seconds: float = 60.0
+    jitter_ratio: float = 0.0
+    failure_backoff_multiplier: float = 2.0
+    max_interval_seconds: float = 3600.0
+    max_consecutive_failures: int = 5
+    max_cycles: int | None = None
+    max_no_progress_cycles: int | None = None
+    deadline_at: datetime | None = None
+    history_limit: int = 20
+
+    def model_dump(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["deadline_at"] = self.deadline_at.isoformat() if self.deadline_at else None
+        return payload
+
+
 def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
     try:
         parsed = int(float(value))
     except (TypeError, ValueError):
@@ -40,6 +66,80 @@ def _positive_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def _jitter_ratio(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return parsed if 0.0 <= parsed <= 1.0 else 0.0
+
+
+def _enabled(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _optional_positive_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return _positive_int(value)
+
+
+def _datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return ensure_utc(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return ensure_utc(datetime.fromisoformat(value.strip().replace("Z", "+00:00")))
+    except ValueError:
+        return None
+
+
+def _persistent_cycle_values(lifecycle: dict[str, Any]) -> dict[str, Any]:
+    candidate = lifecycle.get("persistent_cycle")
+    return candidate if isinstance(candidate, dict) else {}
+
+
+def _normalized_persistent_cycle_policy(
+        values: dict[str, Any],
+        *,
+        enabled: bool,
+) -> PersistentCyclePolicy:
+    interval = max(1.0, _positive_float(values.get("interval_seconds")) or 60.0)
+    max_interval = _positive_float(values.get("max_interval_seconds")) or 3600.0
+    backoff = max(1.0, _positive_float(values.get("failure_backoff_multiplier")) or 2.0)
+    history_limit = min(100, _positive_int(values.get("history_limit")) or 20)
+    return PersistentCyclePolicy(
+        enabled=enabled,
+        interval_seconds=interval,
+        jitter_ratio=_jitter_ratio(values.get("jitter_ratio")),
+        failure_backoff_multiplier=backoff,
+        max_interval_seconds=max(interval, max_interval),
+        max_consecutive_failures=_positive_int(values.get("max_consecutive_failures")) or 5,
+        max_cycles=_optional_positive_int(values.get("max_cycles")),
+        max_no_progress_cycles=_optional_positive_int(values.get("max_no_progress_cycles")),
+        deadline_at=_datetime(values.get("deadline_at")),
+        history_limit=history_limit,
+    )
+
+
+def resolve_persistent_cycle_policy(execution: Any) -> PersistentCyclePolicy:
+    """Resolve the immutable cycle policy copied onto an execution at creation."""
+    metadata = getattr(execution, "metadata", {}) or {}
+    lifecycle = metadata.get("execution_lifecycle")
+    if not isinstance(lifecycle, dict):
+        return PersistentCyclePolicy()
+    values = _persistent_cycle_values(lifecycle)
+    return _normalized_persistent_cycle_policy(
+        values,
+        enabled=_enabled(values.get("enabled")) and lifecycle.get("run_mode") == ALWAYS_ON_RUN_MODE,
+    )
 
 
 def _metadata_policy(metadata: dict[str, Any] | None) -> dict[str, Any]:
@@ -247,19 +347,33 @@ def build_execution_lifecycle_metadata(
         if isinstance(candidate, dict):
             workflow_lifecycle = candidate
 
+    persistent_cycle = _persistent_cycle_values(workflow_lifecycle)
+    persistent_cycle_enabled = _enabled(persistent_cycle.get("enabled"))
     run_mode = workflow_lifecycle.get("run_mode") or infer_execution_run_mode(trigger)
+    if persistent_cycle_enabled:
+        # A cycle must use always-on lifecycle semantics so default finite-run
+        # timeouts and container cleanup do not terminate it between wakes.
+        run_mode = ALWAYS_ON_RUN_MODE
     if run_mode not in RUN_MODES:
         run_mode = infer_execution_run_mode(trigger)
 
     terminate_on_completion = workflow_lifecycle.get("terminate_container_on_completion")
     if terminate_on_completion is None:
-        terminate_on_completion = run_mode != ALWAYS_ON_RUN_MODE
+        # Persistent cycles use a fresh isolated worker after every durable
+        # sleep, so their exited containers should not be retained.
+        terminate_on_completion = persistent_cycle_enabled or run_mode != ALWAYS_ON_RUN_MODE
 
-    return {
+    lifecycle = {
         "run_mode": run_mode,
         "triggered_by_schedule": run_mode == SCHEDULED_RUN_MODE,
         "terminate_container_on_completion": bool(terminate_on_completion),
     }
+    if persistent_cycle_enabled:
+        lifecycle["persistent_cycle"] = _normalized_persistent_cycle_policy(
+            persistent_cycle,
+            enabled=True,
+        ).model_dump()
+    return lifecycle
 
 
 def should_terminate_container_on_completion(execution: Any) -> bool:

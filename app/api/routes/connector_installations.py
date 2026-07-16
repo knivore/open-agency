@@ -66,6 +66,21 @@ def create_connector_installations_router(context: Optional[ApiContext] = None) 
             raise _not_found()
         return item
 
+    @router.get(
+        "/installations/{installation_id}/setup-session",
+        response_model=ConnectorSetupSessionPayload,
+        summary="Resume Connector Setup Session",
+    )
+    async def resume_setup_session(installation_id: str, request: Request):
+        current_user = await resolve_current_user(request, context, required_scopes=["integrations:read"])
+        try:
+            item = await service.resume_setup_session_for_owner(installation_id, current_user.id)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        if item is None:
+            raise _not_found()
+        return item
+
     @router.post(
         "/installations/{installation_id}/complete",
         response_model=ConnectorInstallation,

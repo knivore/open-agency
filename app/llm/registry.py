@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
+from app.core.config import get_settings
+from app.core.outbound_http import validate_model_provider_url
 from app.domain import ModelProfileDefinition
 from app.llm.base import BaseModelClient
 from app.llm.fallback import FallbackModelClient, build_fallback_profiles
@@ -17,6 +19,10 @@ class LLMEnvironmentConfig:
     qwen_base_url: Optional[str] = None
     ollama_base_url: Optional[str] = None
     openai_api_key: Optional[str] = None
+    openrouter_base_url: Optional[str] = None
+    openrouter_api_key: Optional[str] = None
+    openrouter_site_url: Optional[str] = None
+    openrouter_app_name: Optional[str] = None
     anthropic_api_key: Optional[str] = None
     google_api_key: Optional[str] = None
     deepseek_api_key: Optional[str] = None
@@ -32,6 +38,10 @@ class LLMEnvironmentConfig:
             qwen_base_url=os.getenv("QWEN_BASE_URL") or os.getenv("DASHSCOPE_BASE_URL"),
             ollama_base_url=os.getenv("OLLAMA_BASE_URL"),
             openai_api_key=os.getenv("OPENAI_API_KEY"),
+            openrouter_base_url=os.getenv("OPENROUTER_BASE_URL"),
+            openrouter_api_key=os.getenv("OPENROUTER_API_KEY"),
+            openrouter_site_url=os.getenv("OPENROUTER_SITE_URL"),
+            openrouter_app_name=os.getenv("OPENROUTER_APP_NAME"),
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
             google_api_key=os.getenv("GOOGLE_API_KEY"),
             deepseek_api_key=os.getenv("DEEPSEEK_API_KEY"),
@@ -62,6 +72,16 @@ class ModelProviderRegistry:
     def resolve_provider_key(self, profile: ModelProfileDefinition) -> str:
         profile_provider = self._normalize_provider_key(profile.provider)
 
+        if (
+            profile.base_url
+            and self._env_config.local_openai_base_url
+            and profile.base_url.strip().rstrip("/") == self._env_config.local_openai_base_url.strip().rstrip("/")
+            and "openai_compatible" in self._providers
+        ):
+            # An exact operator-configured local endpoint is a compatible
+            # gateway, even when legacy profiles label it as OpenAI.
+            return "openai_compatible"
+
         if profile_provider in self._providers:
             return profile_provider
 
@@ -78,8 +98,24 @@ class ModelProviderRegistry:
 
     def _resolve_single(self, profile: ModelProfileDefinition) -> BaseModelClient:
         key = self.resolve_provider_key(profile)
+        self._validate_profile_endpoint(profile, key)
         factory = self.get_factory(key)
         return factory(profile, self._env_config)
+
+    def _validate_profile_endpoint(self, profile: ModelProfileDefinition, provider_key: str) -> None:
+        if not profile.base_url:
+            return
+        if (
+            provider_key == "openai_compatible"
+            and self._env_config.local_openai_base_url
+            and profile.base_url.strip().rstrip("/") == self._env_config.local_openai_base_url.strip().rstrip("/")
+        ):
+            return
+        validate_model_provider_url(
+            profile.base_url,
+            provider_key=provider_key,
+            allowed_custom_hosts=get_settings().parsed_model_provider_allowed_hosts,
+        )
 
     def resolve(self, profile: ModelProfileDefinition) -> BaseModelClient:
         client = self._resolve_single(profile)
@@ -102,10 +138,12 @@ class ModelProviderRegistry:
         from app.llm.ollama import OllamaModelClient
         from app.llm.openai_codex import OpenAICodexModelClient
         from app.llm.openai_compatible import OpenAICompatibleModelClient
+        from app.llm.openrouter import OpenRouterModelClient
 
         registry = cls(env_config=env_config)
         registry.register("openai_compatible", lambda profile, env: OpenAICompatibleModelClient(profile, env))
         registry.register("openai", lambda profile, env: OpenAICompatibleModelClient(profile, env))
+        registry.register("openrouter", lambda profile, env: OpenRouterModelClient(profile, env))
         registry.register("deepseek", lambda profile, env: OpenAICompatibleModelClient(profile, env))
         registry.register("qwen", lambda profile, env: OpenAICompatibleModelClient(profile, env))
         registry.register("openai_codex", lambda profile, env: OpenAICodexModelClient(profile, env))

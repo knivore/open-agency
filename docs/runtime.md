@@ -27,6 +27,8 @@ Relevant local mode settings:
 
 - `AGENCY_BACKEND_RUN_MODE=host` keeps the backend and main-agent process on the host while isolated workers stay in Docker
 - `EXECUTION_ISOLATION_ENABLED=true` enables Docker-backed isolated execution for workflow and tool runs
+- `EXECUTION_WAIT_POLL_INTERVAL_SECONDS=1` controls how frequently the reconciler checks durable waits for due wakes or
+  expired deadlines
 
 Runtime event and notification features:
 
@@ -176,6 +178,92 @@ Workflow, task, agent, trigger, or input metadata can override those defaults wi
 `timeout_policy` metadata is still accepted for compatibility. Isolated worker startup resolves the longest task or
 agent timeout in the workflow before creating the container, which lets long-running agents extend the actual worker
 lifetime before any task activity event has been emitted.
+
+### Durable Wait Lifecycle
+
+Native executions can persist one pending `execution_waits` record when they are suspended at a node checkpoint. Wait
+kinds map to distinct execution statuses:
+
+- `input` -> `waiting_for_input`
+- `approval` -> `waiting_for_approval`
+- `event` -> `waiting_for_event`
+- `sleep` -> `sleeping`
+
+The wait record owns its idempotency key, checkpoint, request payload, policy, correlation key, wake/deadline times, and
+resolution. The execution record keeps an `active_wait` summary for fast operator reads, and `execution.waiting` plus
+`execution.woken` events preserve the ordered audit trail. Only one pending wait is allowed per execution.
+
+Lifecycle endpoints:
+
+- `POST /executions/{execution_id}/waits`
+- `GET /executions/{execution_id}/waits`
+- `GET /executions/{execution_id}/waits/{wait_id}`
+- `POST /executions/{execution_id}/waits/{wait_id}/resolve`
+- `POST /execution-waits/events/{correlation_key}`
+
+Resolution is an atomic single claim. Repeating the same resolution key is an idempotent no-op; a competing key is a
+conflict. Generic execution start/resume commands reject unresolved waits so they cannot bypass the wake claim. Due
+sleep waits and expired deadlines are reconciled at backend startup and on the runtime reconciler cadence. Native input,
+event, and sleep waits resume the same execution from persisted node outputs, including after process-local engine state
+has been lost.
+
+Tool approval requests and their linked waits are also persisted. Before a gated tool asks for approval, the native
+agent executor checkpoints its message transcript, model iteration, remaining tool calls, and pending call index. The
+approval suspension then unwinds the worker or isolated container. Approve and reject decisions resolve the durable wait,
+emit `execution.woken`, and queue a fresh native worker; that worker consumes the persisted decision and resumes at the
+pending call without replaying prior tool calls from the same model response. Low-risk main-agent delegated approvals
+continue inline because they do not incur a human wait.
+
+### Persistent Monitor Cycles
+
+A persistent monitor is an opt-in native workflow that repeatedly runs its complete graph under one execution ID. It is
+different from a scheduled workflow, which creates finite execution attempts, and from an `always_on` workflow without
+a cycle policy, which only receives relaxed timeout semantics.
+
+Configure the workflow definition metadata as follows:
+
+```json
+{
+  "execution_lifecycle": {
+    "persistent_cycle": {
+      "enabled": true,
+      "interval_seconds": 60,
+      "jitter_ratio": 0.1,
+      "failure_backoff_multiplier": 2,
+      "max_interval_seconds": 3600,
+      "max_consecutive_failures": 5,
+      "max_cycles": null,
+      "max_no_progress_cycles": null,
+      "deadline_at": null,
+      "history_limit": 20
+    }
+  }
+}
+```
+
+Enabling `persistent_cycle` implies the `always_on` run mode. A successful cycle emits
+`execution.cycle.completed`, clears the completed-node checkpoint, preserves the prior result under
+`output_payload.last_cycle_output`, and creates a durable `sleep` wait for the next cycle. Timer reconciliation wakes
+that wait and queues the same execution ID. Cycle state, progress signatures, recent outcomes, retry count, and next
+wake time are stored under `execution.metadata.persistent_cycle`.
+
+Failed cycles emit `execution.cycle.failed` and retry after bounded exponential backoff. `jitter_ratio` applies stable
+per-execution jitter so multiple monitors do not wake together. `max_consecutive_failures` and the optional
+`max_no_progress_cycles` repeated-output guard pause the execution and emit `execution.cycle.guard_triggered` instead of
+spinning indefinitely. `max_cycles` and `deadline_at` are optional terminal policies; when both are omitted, the monitor
+continues until an operator pauses or cancels it.
+
+Pausing a sleeping monitor cancels its pending timer and leaves the execution paused; resuming runs the next cycle
+immediately. Cancelling closes any pending wait and terminally cancels the execution. In isolated mode, a worker parked
+on a durable wait exits with the suspended-worker code, and reconciliation removes that finished container without
+changing the execution's wait status. The next wake creates a fresh worker and resumes from durable state.
+
+In the frontend, edit a workflow and open **Configuration & governance** to choose **Persistent monitor** under
+**Execution mode**. The editor exposes the interval, failure backoff, maximum interval, consecutive-failure guard,
+optional repeated-result guard, and optional cycle limit. Run detail displays durable wait state, current and next cycle,
+next wake time, failure/no-progress signals, and the valid operator actions for the execution state. Approval waits show
+the saved checkpoint, worker-release state, and direct approve/reject-and-resume controls. A sleeping monitor can be
+paused or cancelled; a guard-paused monitor can be resumed or cancelled.
 
 Shared memory is retrieved before each native task when workflow metadata has `shared_memory.enabled=true` or the assigned
 agent has `memory.enabled=true` with a non-`execution` scope. Retrieval uses the canonical memory service and can draw

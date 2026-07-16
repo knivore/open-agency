@@ -9,13 +9,19 @@ from app.services.execution_activity import execution_last_activity_at
 STALE_EXECUTION_STATUSES = {
     ExecutionStatus.QUEUED,
     ExecutionStatus.RUNNING,
+    ExecutionStatus.WAITING_FOR_INPUT,
     ExecutionStatus.WAITING_FOR_APPROVAL,
+    ExecutionStatus.WAITING_FOR_EVENT,
+    ExecutionStatus.SLEEPING,
     ExecutionStatus.PAUSED,
     ExecutionStatus.CANCELLING,
 }
 
 INTENTIONAL_WAIT_STATUSES = {
+    ExecutionStatus.WAITING_FOR_INPUT: "waiting_for_input",
     ExecutionStatus.WAITING_FOR_APPROVAL: "waiting_for_approval",
+    ExecutionStatus.WAITING_FOR_EVENT: "waiting_for_event",
+    ExecutionStatus.SLEEPING: "sleeping",
     ExecutionStatus.PAUSED: "paused",
 }
 
@@ -49,7 +55,14 @@ def classify_execution_staleness(
     wait_state = intentional_execution_wait_state(execution)
     intentionally_waiting = wait_state is not None
     intentionally_long_running = intentional_long_running_execution(execution)
-    heartbeat_stale = eligible_status and not intentionally_waiting and age_seconds > stale_after_seconds
+    # A native approval wait owns a suspended continuation, so its worker must
+    # heartbeat. Other intentional pauses can remain durable without a worker.
+    approval_worker_wait = execution.status == ExecutionStatus.WAITING_FOR_APPROVAL
+    heartbeat_stale = (
+            eligible_status
+            and (not intentionally_waiting or approval_worker_wait)
+            and age_seconds > stale_after_seconds
+    )
     alive_but_idle = (
             eligible_status
             and not intentionally_waiting
@@ -110,7 +123,7 @@ def classify_execution_staleness(
 
 
 def intentional_execution_wait_state(execution: Execution) -> str | None:
-    """Return a supervisor-visible wait state that should not be repaired as a stale worker."""
+    """Return a wait state exempt from activity and total-run timeouts while its worker is alive."""
     if execution.status in INTENTIONAL_WAIT_STATUSES:
         return INTENTIONAL_WAIT_STATUSES[execution.status]
 

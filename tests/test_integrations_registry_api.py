@@ -60,7 +60,11 @@ class IntegrationsRegistryApiTests(unittest.TestCase):
         self.assertEqual(telegram["capabilitySurface"], "connector")
         self.assertEqual(telegram["moduleCapabilities"], [])
         self.assertEqual(telegram["dependsOnAgencyCapabilities"], [])
-        self.assertEqual(telegram["onecliTransportMode"], "direct")
+        self.assertEqual(telegram["onecliTransportMode"], "proxy")
+        self.assertFalse(telegram["runtimeSecretRequired"])
+        self.assertTrue(telegram["setupSupported"])
+        self.assertEqual(telegram["onecliSecretProfile"]["injectionTarget"], "url_path")
+        self.assertEqual(telegram["onecliSecretProfile"]["pathTemplate"], "/bot{value}")
         self.assertTrue(telegram["healthSupported"])
         self.assertEqual(telegram["supportedSecretRefSchemes"], ["onecli://", "env://", "env:"])
         self.assertIn("bot_user_id", [item["key"] for item in telegram["instanceIdentityMetadata"]])
@@ -78,7 +82,8 @@ class IntegrationsRegistryApiTests(unittest.TestCase):
         self.assertTrue(any("agency-generated id" in note.lower() for note in telegram["onecliSetupGuide"]["notes"]))
 
         discord = payload["connectors"]["discord-bot"]
-        self.assertEqual(discord["onecliTransportMode"], "direct")
+        self.assertEqual(discord["onecliTransportMode"], "proxy")
+        self.assertFalse(discord["runtimeSecretRequired"])
         self.assertTrue(
             any("interactions webhook endpoint" in note.lower() for note in discord["onecliSetupGuide"]["notes"])
         )
@@ -95,10 +100,21 @@ class IntegrationsRegistryApiTests(unittest.TestCase):
             whatsapp["onecliSetupGuide"]["completionSignal"],
         )
         github = payload["connectors"]["github"]
+        self.assertEqual(github["onecliAppId"], "github")
+        self.assertTrue(github["setupSupported"])
         self.assertEqual(github["requiredMetadata"], [])
         self.assertIn("owner", [item["key"] for item in github["instanceIdentityMetadata"]])
         self.assertIn("repo", [item["key"] for item in github["targetScopeMetadata"]])
         self.assertIn("owner", [item["key"] for item in github["onecliSetupGuide"]["fields"]])
+
+        teams = payload["connectors"]["microsoft-teams"]
+        self.assertFalse(teams["setupSupported"])
+        self.assertIn("OAuth-refresh", teams["setupBlockReason"])
+        linear = payload["connectors"]["linear"]
+        self.assertIsNone(linear["onecliAppId"])
+        self.assertEqual(linear["onecliSecretProfile"]["hostPattern"], "api.linear.app")
+        outlook = payload["connectors"]["outlook-email"]
+        self.assertFalse(outlook["setupSupported"])
 
         self.assertNotIn("home-assistant", payload["connectors"])
 

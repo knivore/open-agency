@@ -131,6 +131,7 @@ env.bak/
 venv.bak/
 crewaivenvfinal/
 .data/
+/data/input/voices/
 .agency/
 local_storage/
 certs/

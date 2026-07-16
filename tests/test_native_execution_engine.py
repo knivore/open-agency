@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
+import json
 import unittest
+from datetime import timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from app.domain import (
     AgentDefinition,
@@ -48,8 +51,17 @@ from app.runtime.native.state import (
     record_graph_context_working_set_entry,
 )
 from app.runtime.registry import RuntimeAdapterRegistry
-from app.services.agent_tools import graph_system_tool_definitions
+from app.services.agent_tools import graph_system_tool_definitions, memory_system_tool_definitions
 from app.tools.cli_discovery import resolve_tool
+
+
+def _native_test_python_security(callable_name="echo_tool", **settings):
+    """Keep local test callables explicit so production allowlist checks stay fail closed."""
+    return SecuritySettings(
+        module_allowlist=["tests.native_test_tools"],
+        function_allowlist=[callable_name],
+        **settings,
+    )
 
 
 class FakeModelClient:
@@ -228,6 +240,24 @@ class FakeModelClient:
         return {"ok": True}
 
 
+class ScriptedModelClient(FakeModelClient):
+    def __init__(self, profile, env, responses):
+        super().__init__(profile, env, scenario="scripted")
+        self.responses = list(responses)
+
+    def generate_text(self, messages, *, temperature=None, max_tokens=None, **kwargs):
+        FakeModelClient.last_messages = messages
+        FakeModelClient.last_tools = kwargs.get("tools")
+        self.calls += 1
+        content = self.responses.pop(0)
+        return ModelResponse(
+            content=content,
+            provider=self.profile.provider,
+            model=self.profile.model,
+            latency_ms=1,
+        )
+
+
 class PausingModelClient(FakeModelClient):
     def __init__(self, profile, env, engine):
         super().__init__(profile, env, scenario="pause")
@@ -348,6 +378,25 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
             default_runtime_adapter_id="native",
         )
 
+    async def _wake_persistent_cycle(self, execution_id: str) -> None:
+        pending = await self.execution_store.list_execution_waits(execution_id)
+        wait = next(item for item in pending if item.status.value == "pending")
+        await self.execution_store.resolve_execution_wait(
+            wait.id,
+            status=wait.status.__class__.RESOLVED,
+            resolution_key=f"test-wake:{wait.id}",
+            resolution_payload={"source": "test"},
+            resolved_by="test",
+        )
+        execution = await self.execution_store.get_execution(execution_id)
+        assert execution is not None
+        metadata = dict(execution.metadata)
+        metadata.pop("active_wait", None)
+        execution.metadata = metadata
+        execution.status = ExecutionStatus.PAUSED
+        await self.execution_store.update_execution(execution)
+        await self.engine.resume_execution(execution_id)
+
     async def test_successful_execution(self):
         tool = ToolDefinition(
             id="tool-echo",
@@ -356,7 +405,7 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
             input_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
             output_schema={"type": "object"},
             implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
-            security=SecuritySettings(),
+            security=_native_test_python_security(),
             mcp_exposure=MCPExposureSettings(),
         )
         workflow = self._workflow(tool=tool)
@@ -371,6 +420,481 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.output_payload["final_output"], "Final answer")
         self.assertEqual(events[0].event_type.value, "execution.created")
         self.assertEqual(events[-1].event_type.value, "execution.completed")
+
+    async def test_invalid_structured_output_gets_one_tool_free_repair_turn(self):
+        client = ScriptedModelClient(
+            self.profile,
+            None,
+            [
+                '{"status":"sent","what_happened":"Discord notice sent.","discord_delivery":{}}',
+                '{"status":"sent","notice_text":"Discord notice sent.","discord_delivery":{}}',
+            ],
+        )
+        self.model_registry.register("fake", lambda profile, env: client)
+        tool = ToolDefinition(
+            id="tool-echo",
+            name="Echo Tool",
+            description="Echoes text",
+            input_schema={"type": "object"},
+            output_schema={"type": "object"},
+            implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
+            security=_native_test_python_security(),
+            mcp_exposure=MCPExposureSettings(),
+        )
+        workflow = self._workflow(tool=tool, max_iterations=1)
+        workflow.task_definitions[0].output_schema = {
+            "type": "object",
+            "required": ["status", "notice_text", "discord_delivery"],
+            "properties": {
+                "status": {"type": "string", "enum": ["sent", "failed"]},
+                "notice_text": {"type": "string"},
+                "discord_delivery": {"type": "object"},
+            },
+        }
+        await self.runtime_registry.register_workflow(workflow)
+        execution = await self.runtime_registry.create_execution(workflow.id, {}, {"source": "test"})
+
+        result = await self.runtime_registry.start_execution(execution.id)
+
+        self.assertEqual(result.status, ExecutionStatus.COMPLETED)
+        self.assertEqual(result.output_payload["final_output"]["notice_text"], "Discord notice sent.")
+        self.assertEqual(client.calls, 2)
+        self.assertIsNone(FakeModelClient.last_tools)
+        system_prompt = next(message.content for message in FakeModelClient.last_messages if message.role == "system")
+        repair_prompt = next(
+            message.content
+            for message in FakeModelClient.last_messages
+            if message.role == "user" and "did not satisfy" in str(message.content)
+        )
+        self.assertIn('"notice_text"', system_prompt)
+        self.assertIn("do not call tools again", repair_prompt)
+
+    async def test_native_runtime_skips_failure_branch_after_success(self):
+        client = ScriptedModelClient(
+            self.profile,
+            None,
+            ['{"status":"success"}', '{"status":"success","message":"delivered"}'],
+        )
+        self.model_registry.register("fake", lambda profile, env: client)
+        agent = AgentDefinition(
+            id="agent-branch",
+            name="Branch Agent",
+            model_profile_id=self.profile.id,
+        )
+        tasks = [
+            TaskDefinition(
+                id=task_id,
+                name=task_id,
+                description=task_id,
+                agent_id=agent.id,
+                output_schema={"type": "object", "required": ["status"]},
+            )
+            for task_id in ("task-source", "task-success", "task-failure")
+        ]
+        nodes = [
+            WorkflowNodeDefinition(
+                id=task.id.replace("task-", "node-"),
+                name=task.name,
+                node_type="task",
+                task_id=task.id,
+                agent_id=agent.id,
+            )
+            for task in tasks
+        ]
+        workflow = WorkflowDefinition(
+            id="workflow-conditional-success",
+            name="Conditional success",
+            nodes=nodes,
+            edges=[
+                WorkflowEdgeDefinition(
+                    source_node_id="node-source",
+                    target_node_id="node-success",
+                    edge_type="success",
+                ),
+                WorkflowEdgeDefinition(
+                    source_node_id="node-source",
+                    target_node_id="node-failure",
+                    edge_type="failure",
+                    condition="blocked_or_error",
+                ),
+            ],
+            entrypoint="node-source",
+            task_definitions=tasks,
+            agent_definitions=[agent],
+        )
+        await self.runtime_registry.register_workflow(workflow)
+        execution = await self.runtime_registry.create_execution(workflow.id, {}, {"source": "test"})
+
+        result = await self.runtime_registry.start_execution(execution.id)
+
+        self.assertEqual(result.status, ExecutionStatus.COMPLETED)
+        self.assertEqual(set(result.output_payload["node_outputs"]), {"node-source", "node-success"})
+        self.assertEqual(result.output_payload["final_output"]["message"], "delivered")
+
+    async def test_native_runtime_runs_failure_branch_and_preserves_failed_status(self):
+        client = ScriptedModelClient(
+            self.profile,
+            None,
+            [
+                '{"status":"blocked","outcome":"voice media is missing"}',
+                '{"status":"sent","notice_text":"The run was blocked."}',
+            ],
+        )
+        self.model_registry.register("fake", lambda profile, env: client)
+        agent = AgentDefinition(
+            id="agent-failure-branch",
+            name="Failure Branch Agent",
+            model_profile_id=self.profile.id,
+        )
+        tasks = [
+            TaskDefinition(
+                id=task_id,
+                name=task_id,
+                description=task_id,
+                agent_id=agent.id,
+                output_schema={"type": "object", "required": ["status"]},
+            )
+            for task_id in ("task-source", "task-success", "task-failure")
+        ]
+        nodes = [
+            WorkflowNodeDefinition(
+                id=task.id.replace("task-", "node-"),
+                name=task.name,
+                node_type="task",
+                task_id=task.id,
+                agent_id=agent.id,
+            )
+            for task in tasks
+        ]
+        workflow = WorkflowDefinition(
+            id="workflow-conditional-failure",
+            name="Conditional failure",
+            nodes=nodes,
+            edges=[
+                WorkflowEdgeDefinition(
+                    source_node_id="node-source",
+                    target_node_id="node-success",
+                    edge_type="success",
+                ),
+                WorkflowEdgeDefinition(
+                    source_node_id="node-source",
+                    target_node_id="node-failure",
+                    edge_type="failure",
+                    condition="blocked_or_error",
+                ),
+            ],
+            entrypoint="node-source",
+            task_definitions=tasks,
+            agent_definitions=[agent],
+        )
+        await self.runtime_registry.register_workflow(workflow)
+        execution = await self.runtime_registry.create_execution(workflow.id, {}, {"source": "test"})
+
+        result = await self.runtime_registry.start_execution(execution.id)
+
+        self.assertEqual(result.status, ExecutionStatus.FAILED)
+        self.assertEqual(set(result.output_payload["node_outputs"]), {"node-source", "node-failure"})
+        self.assertEqual(result.output_payload["final_output"]["status"], "sent")
+        self.assertIn("voice media is missing", result.error)
+
+    async def test_required_delivery_tool_cannot_be_replaced_by_model_claim(self):
+        client = ScriptedModelClient(
+            self.profile,
+            None,
+            [
+                '{"status":"sent","notice":"Discord delivery succeeded."}',
+                '{"status":"success","notice":"Delivery failure was routed."}',
+            ],
+        )
+        self.model_registry.register("fake", lambda profile, env: client)
+        agent = AgentDefinition(
+            id="agent-required-tool",
+            name="Required Tool Agent",
+            model_profile_id=self.profile.id,
+        )
+        delivery_task = TaskDefinition(
+            id="task-delivery",
+            name="Deliver notice",
+            description="Deliver a Discord notice.",
+            agent_id=agent.id,
+            metadata={
+                "required_tool_ids": ["agency.media.send"],
+                "required_tool_success_statuses": {"agency.media.send": ["sent"]},
+            },
+            output_schema={"type": "object", "required": ["status"]},
+        )
+        failure_task = TaskDefinition(
+            id="task-delivery-failure",
+            name="Handle delivery failure",
+            description="Record the delivery failure.",
+            agent_id=agent.id,
+            output_schema={"type": "object", "required": ["status"]},
+        )
+        workflow = WorkflowDefinition(
+            id="workflow-required-delivery-tool",
+            name="Required delivery tool",
+            nodes=[
+                WorkflowNodeDefinition(
+                    id="node-delivery",
+                    name="Deliver notice",
+                    node_type="task",
+                    task_id=delivery_task.id,
+                    agent_id=agent.id,
+                ),
+                WorkflowNodeDefinition(
+                    id="node-delivery-failure",
+                    name="Handle delivery failure",
+                    node_type="task",
+                    task_id=failure_task.id,
+                    agent_id=agent.id,
+                ),
+            ],
+            edges=[
+                WorkflowEdgeDefinition(
+                    source_node_id="node-delivery",
+                    target_node_id="node-delivery-failure",
+                    edge_type="failure",
+                )
+            ],
+            entrypoint="node-delivery",
+            task_definitions=[delivery_task, failure_task],
+            agent_definitions=[agent],
+        )
+        await self.runtime_registry.register_workflow(workflow)
+        execution = await self.runtime_registry.create_execution(workflow.id, {}, {"source": "test"})
+
+        result = await self.runtime_registry.start_execution(execution.id)
+
+        self.assertEqual(result.status, ExecutionStatus.FAILED)
+        self.assertEqual(
+            result.output_payload["node_outputs"]["node-delivery"]["error_type"],
+            "RequiredToolResultError",
+        )
+        self.assertIn("agency.media.send", result.error)
+        self.assertEqual(result.output_payload["final_output"]["notice"], "Delivery failure was routed.")
+
+    async def test_task_prompt_includes_bounded_delivery_runtime_context(self):
+        self.model_registry.register("fake", lambda profile, env: FakeModelClient(profile, env, scenario="no_tool"))
+        tool = ToolDefinition(
+            id="tool-runtime-context",
+            name="Runtime Context Tool",
+            description="Unused",
+            input_schema={"type": "object"},
+            output_schema={"type": "object"},
+            implementation=ToolImplementationReference(
+                target="tests.native_test_tools",
+                callable_name="echo_tool",
+            ),
+            security=_native_test_python_security(),
+            mcp_exposure=MCPExposureSettings(),
+        )
+        workflow = self._workflow(tool=tool)
+        workflow.metadata["discord_delivery"] = {
+            "channel_id": "channel-123",
+            "credential_id": "credential-123",
+            "owner_user_id": "owner-123",
+        }
+        workflow.task_definitions[0].metadata["delivery_target"] = {"provider": "discord"}
+        await self.runtime_registry.register_workflow(workflow)
+        execution = await self.runtime_registry.create_execution(workflow.id, {}, {"source": "test"})
+
+        await self.runtime_registry.start_execution(execution.id)
+
+        user_message = next(message for message in FakeModelClient.last_messages if message.role == "user")
+        payload = json.loads(user_message.content)
+        runtime_context = payload["runtime_context"]
+        self.assertEqual(runtime_context["workflow_metadata"]["discord_delivery"]["channel_id"], "channel-123")
+        self.assertEqual(runtime_context["task_metadata"]["delivery_target"]["provider"], "discord")
+
+    async def test_rejected_approval_node_routes_to_failure_branch(self):
+        async def reject_task(**_kwargs):
+            return ApprovalDecision(granted=False, reason="Memory write was not approved.")
+
+        self.engine.approval_manager.delegate_decision_provider = reject_task
+        client = ScriptedModelClient(
+            self.profile,
+            None,
+            ['{"status":"sent","notice_text":"Approval was rejected."}'],
+        )
+        self.model_registry.register("fake", lambda profile, env: client)
+        agent = AgentDefinition(
+            id="agent-approval-branch",
+            name="Approval Branch Agent",
+            model_profile_id=self.profile.id,
+        )
+        approval_task = TaskDefinition(
+            id="task-approval",
+            name="Approve change",
+            description="Approve the change.",
+            agent_id=agent.id,
+            human_approval_required=True,
+        )
+        notice_task = TaskDefinition(
+            id="task-rejection-notice",
+            name="Send rejection notice",
+            description="Report the rejection.",
+            agent_id=agent.id,
+            output_schema={"type": "object", "required": ["status"]},
+        )
+        workflow = WorkflowDefinition(
+            id="workflow-approval-rejection-branch",
+            name="Approval rejection branch",
+            nodes=[
+                WorkflowNodeDefinition(
+                    id="node-approval",
+                    name="Approve change",
+                    node_type="approval",
+                    task_id=approval_task.id,
+                    agent_id=agent.id,
+                ),
+                WorkflowNodeDefinition(
+                    id="node-rejection-notice",
+                    name="Send rejection notice",
+                    node_type="task",
+                    task_id=notice_task.id,
+                    agent_id=agent.id,
+                ),
+            ],
+            edges=[
+                WorkflowEdgeDefinition(
+                    source_node_id="node-approval",
+                    target_node_id="node-rejection-notice",
+                    edge_type="failure",
+                    condition="approval_rejected",
+                )
+            ],
+            entrypoint="node-approval",
+            task_definitions=[approval_task, notice_task],
+            agent_definitions=[agent],
+        )
+        await self.runtime_registry.register_workflow(workflow)
+        execution = await self.runtime_registry.create_execution(workflow.id, {}, {"source": "test"})
+
+        result = await self.runtime_registry.start_execution(execution.id)
+
+        self.assertEqual(result.status, ExecutionStatus.FAILED)
+        self.assertEqual(set(result.output_payload["node_outputs"]), {"node-approval", "node-rejection-notice"})
+        self.assertEqual(result.output_payload["final_output"]["status"], "sent")
+
+    async def test_persistent_cycle_reuses_execution_id_until_max_cycles(self):
+        self.model_registry.register("fake", lambda profile, env: FakeModelClient(profile, env, scenario="no_tool"))
+        tool = ToolDefinition(
+            id="tool-cycle",
+            name="Cycle Tool",
+            description="Cycle test tool",
+            input_schema={"type": "object"},
+            output_schema={"type": "object"},
+            implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
+            security=_native_test_python_security(),
+            mcp_exposure=MCPExposureSettings(),
+        )
+        workflow = self._workflow(tool=tool)
+        workflow.metadata["execution_lifecycle"] = {
+            "persistent_cycle": {"enabled": True, "interval_seconds": 1, "max_cycles": 2}
+        }
+        await self.runtime_registry.register_workflow(workflow)
+        execution = await self.runtime_registry.create_execution(workflow.id, {}, {"source": "test"})
+
+        first = await self.runtime_registry.start_execution(execution.id)
+        self.assertEqual(first.status, ExecutionStatus.SLEEPING)
+        self.assertEqual(first.metadata["persistent_cycle"]["next_cycle_number"], 2)
+        self.assertEqual(first.output_payload["node_outputs"], {})
+        self.assertEqual(first.output_payload["last_cycle_output"]["final_output"], "Final answer")
+
+        await self._wake_persistent_cycle(execution.id)
+        second = await self.runtime_registry.start_execution(execution.id)
+        events = await self.execution_store.list_events(execution.id)
+
+        self.assertEqual(second.id, execution.id)
+        self.assertEqual(second.status, ExecutionStatus.COMPLETED)
+        self.assertEqual(second.metadata["persistent_cycle"]["terminal_reason"], "max_cycles_reached")
+        self.assertEqual(
+            [event.event_type for event in events].count(ExecutionEventType.EXECUTION_CYCLE_STARTED),
+            2,
+        )
+        self.assertEqual(
+            [event.event_type for event in events].count(ExecutionEventType.EXECUTION_CYCLE_COMPLETED),
+            2,
+        )
+
+    async def test_persistent_cycle_no_progress_guard_pauses_repeated_output(self):
+        self.model_registry.register("fake", lambda profile, env: FakeModelClient(profile, env, scenario="no_tool"))
+        tool = ToolDefinition(
+            id="tool-cycle-guard",
+            name="Cycle Guard Tool",
+            description="Cycle guard test tool",
+            input_schema={"type": "object"},
+            output_schema={"type": "object"},
+            implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
+            security=_native_test_python_security(),
+            mcp_exposure=MCPExposureSettings(),
+        )
+        workflow = self._workflow(tool=tool)
+        workflow.metadata["execution_lifecycle"] = {
+            "persistent_cycle": {
+                "enabled": True,
+                "interval_seconds": 1,
+                "max_no_progress_cycles": 1,
+            }
+        }
+        await self.runtime_registry.register_workflow(workflow)
+        execution = await self.runtime_registry.create_execution(workflow.id, {}, {"source": "test"})
+
+        await self.runtime_registry.start_execution(execution.id)
+        await self._wake_persistent_cycle(execution.id)
+        guarded = await self.runtime_registry.start_execution(execution.id)
+        events = await self.execution_store.list_events(execution.id)
+
+        self.assertEqual(guarded.status, ExecutionStatus.PAUSED)
+        self.assertEqual(guarded.metadata["persistent_cycle"]["guard_reason"], "no_progress_limit_reached")
+        self.assertIn(ExecutionEventType.EXECUTION_CYCLE_GUARD_TRIGGERED, [event.event_type for event in events])
+
+    async def test_persistent_cycle_failure_backoff_stops_after_limit(self):
+        tool = ToolDefinition(
+            id="tool-cycle-failure",
+            name="Cycle Failure Tool",
+            description="Cycle failure test tool",
+            input_schema={"type": "object"},
+            output_schema={"type": "object"},
+            implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
+            security=_native_test_python_security(),
+            mcp_exposure=MCPExposureSettings(),
+        )
+        workflow = self._workflow(tool=tool)
+        workflow.metadata["execution_lifecycle"] = {
+            "persistent_cycle": {
+                "enabled": True,
+                "interval_seconds": 2,
+                "failure_backoff_multiplier": 3,
+                "max_consecutive_failures": 2,
+            }
+        }
+        await self.runtime_registry.register_workflow(workflow)
+        execution = await self.runtime_registry.create_execution(workflow.id, {}, {"source": "test"})
+
+        async def fail_cycle(*args, **kwargs):
+            raise RuntimeError("monitor source unavailable")
+
+        self.engine._execute_task_with_runtime_overrides = fail_cycle
+        first = await self.runtime_registry.start_execution(execution.id)
+        pending = await self.execution_store.list_execution_waits(execution.id)
+        self.assertEqual(first.status, ExecutionStatus.SLEEPING)
+        self.assertEqual(first.metadata["persistent_cycle"]["last_delay_seconds"], 2)
+        self.assertEqual(len([item for item in pending if item.status.value == "pending"]), 1)
+
+        await self._wake_persistent_cycle(execution.id)
+        guarded = await self.runtime_registry.start_execution(execution.id)
+        events = await self.execution_store.list_events(execution.id)
+
+        self.assertEqual(guarded.status, ExecutionStatus.PAUSED)
+        self.assertEqual(
+            guarded.metadata["persistent_cycle"]["guard_reason"],
+            "max_consecutive_failures_reached",
+        )
+        self.assertEqual(
+            [event.event_type for event in events].count(ExecutionEventType.EXECUTION_CYCLE_FAILED),
+            2,
+        )
 
     async def test_builtin_tool_id_without_embedded_definition_is_exposed_to_model(self):
         self.model_registry.register("fake", lambda profile, env: FakeModelClient(profile, env, scenario="no_tool"))
@@ -467,6 +991,106 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved.id, "agency.voice.generate")
         self.assertEqual(resolved.implementation.callable_name, "generate_voice")
 
+    async def test_stale_embedded_builtin_cannot_shadow_canonical_security(self):
+        file_tool = resolve_tool("agency.file.write-text")
+        stale_file_tool = file_tool.model_copy(update={"security": SecuritySettings()})
+        workflow = self._workflow(tool=stale_file_tool)
+
+        resolved = self.engine.agent_executor.tool_executor.resolve_tool(
+            workflow,
+            file_tool.id,
+            tool_name="write_text_file",
+        )
+
+        self.assertEqual(
+            resolved.security.module_allowlist,
+            ["app.tools.implementations.custom.files"],
+        )
+        self.assertEqual(resolved.security.function_allowlist, ["write_text_file"])
+        self.assertTrue(resolved.security.allow_filesystem)
+        self.assertFalse(resolved.security.approval_required)
+
+    async def test_catalog_tool_allowed_by_validation_is_exposed_and_resolvable(self):
+        catalog_tool = ToolDefinition(
+            id="custom.catalog.echo",
+            name="Catalog Echo",
+            description="Catalog-backed echo tool",
+            input_schema={"type": "object"},
+            output_schema={"type": "object"},
+            implementation=ToolImplementationReference(
+                target="tests.native_test_tools",
+                callable_name="echo_tool",
+            ),
+            security=_native_test_python_security(),
+            mcp_exposure=MCPExposureSettings(),
+        )
+
+        async def load_catalog_tools(tool_ids):
+            return [catalog_tool] if catalog_tool.id in tool_ids else []
+
+        self.engine.agent_executor.tool_definition_loader = load_catalog_tools
+        self.model_registry.register("fake", lambda profile, env: FakeModelClient(profile, env, scenario="no_tool"))
+        agent = AgentDefinition(
+            id="agent-catalog-tool",
+            name="Catalog Tool Agent",
+            model_profile_id=self.profile.id,
+            tool_ids=[catalog_tool.id],
+        )
+        task = TaskDefinition(
+            id="task-catalog-tool",
+            name="Use catalog tool",
+            description="Use the catalog tool if needed.",
+            agent_id=agent.id,
+            tool_ids=[catalog_tool.id],
+        )
+        workflow = WorkflowDefinition(
+            id="workflow-catalog-tool",
+            name="Catalog tool workflow",
+            nodes=[
+                WorkflowNodeDefinition(
+                    id="node-catalog-tool",
+                    name="Use catalog tool",
+                    node_type="task",
+                    task_id=task.id,
+                    agent_id=agent.id,
+                )
+            ],
+            edges=[],
+            entrypoint="node-catalog-tool",
+            task_definitions=[task],
+            agent_definitions=[agent],
+            tool_definitions=[],
+        )
+        await self.runtime_registry.register_workflow(workflow)
+        execution = await self.runtime_registry.create_execution(workflow.id, {}, {"source": "test"})
+
+        result = await self.runtime_registry.start_execution(execution.id)
+        resolved = self.engine.agent_executor.tool_executor.resolve_tool(workflow, catalog_tool.id)
+
+        self.assertEqual(result.status, ExecutionStatus.COMPLETED)
+        self.assertEqual(resolved.id, catalog_tool.id)
+        self.assertIn(
+            "CatalogEcho",
+            {item["function"]["name"] for item in FakeModelClient.last_tools},
+        )
+
+    async def test_local_voice_provider_does_not_require_connector_binding(self):
+        voice_tool = resolve_tool("agency.voice.generate")
+        workflow = self._workflow(tool=voice_tool)
+
+        binding = self.engine.agent_executor.tool_executor._resolve_connector_binding(
+            workflow=workflow,
+            tool=voice_tool,
+            arguments={
+                "text": "A short local lesson.",
+                "provider": "system_tts",
+                "ai_disclosure": True,
+                "dry_run": True,
+            },
+        )
+
+        self.assertIsNone(binding)
+
     async def test_task_runtime_overrides_model_profile_and_max_tokens(self):
         self.model_registry.register("fake", lambda profile, env: FakeModelClient(profile, env, scenario="no_tool"))
         override_profile = ModelProfileDefinition(
@@ -485,7 +1109,7 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
             input_schema={"type": "object"},
             output_schema={"type": "object"},
             implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
-            security=SecuritySettings(),
+            security=_native_test_python_security(),
             mcp_exposure=MCPExposureSettings(),
         )
         workflow = self._workflow(tool=tool)
@@ -529,7 +1153,7 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
             input_schema={"type": "object"},
             output_schema={"type": "object"},
             implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
-            security=SecuritySettings(),
+            security=_native_test_python_security(),
             mcp_exposure=MCPExposureSettings(),
         )
         workflow = self._workflow(tool=tool)
@@ -557,7 +1181,7 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
             input_schema={"type": "object"},
             output_schema={"type": "object"},
             implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
-            security=SecuritySettings(),
+            security=_native_test_python_security(),
             mcp_exposure=MCPExposureSettings(),
         )
         workflow = self._workflow(tool=tool)
@@ -1028,7 +1652,7 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
             input_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
             output_schema={"type": "object"},
             implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
-            security=SecuritySettings(
+            security=_native_test_python_security(
                 connector_bindings=[
                     ConnectorBindingDefinition(
                         provider="discord",
@@ -1071,7 +1695,7 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
             input_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
             output_schema={"type": "object"},
             implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
-            security=SecuritySettings(),
+            security=_native_test_python_security(),
             tags=["connector"],
             mcp_exposure=MCPExposureSettings(),
         )
@@ -1097,7 +1721,7 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
                 callable_name="echo_tool",
                 config={"provider": "discord"},
             ),
-            security=SecuritySettings(),
+            security=_native_test_python_security(),
             tags=["connector"],
             mcp_exposure=MCPExposureSettings(),
         )
@@ -1134,7 +1758,7 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
             input_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
             output_schema={"type": "object"},
             implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
-            security=SecuritySettings(),
+            security=_native_test_python_security(),
             tags=["connector"],
             mcp_exposure=MCPExposureSettings(),
         )
@@ -1339,6 +1963,113 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["working_set"]["owner_agent_id"], agent.id)
         self.assertEqual(result["working_set"]["anchors"], [{"type": "task", "id": task.id}])
         self.assertIn(result["working_set"]["working_set_id"], state.graph_working_sets)
+
+    async def test_native_tool_executor_dispatches_graph_context_through_api_runtime(self):
+        context = create_test_api_context()
+        context_tool = next(
+            tool for tool in graph_system_tool_definitions() if tool.id == "agency.graph.context"
+        )
+        api_tool_runtime = (
+            context.execution_engine.agent_executor.tool_executor.tool_registry.api_tool_runtime_executor
+        )
+        self.assertIsNotNone(api_tool_runtime)
+        api_tool_runtime.run_async = AsyncMock(
+            return_value=SimpleNamespace(
+                result={
+                    "status": "ok",
+                    "summary": "Bounded graph context",
+                    "facts": [],
+                    "provenance": {},
+                    "omitted": {},
+                    "query_meta": {},
+                },
+                errors=[],
+            )
+        )
+
+        workflow = self._workflow(tool=context_tool)
+        execution = Execution(
+            id="execution-graph-context-tool",
+            workflow_id=workflow.id,
+            runtime_adapter="native",
+            input_json={"prompt": "inspect graph"},
+        )
+        await context.execution_store.save_execution(execution)
+        state = NativeExecutionState(execution_id=execution.id, workflow_id=workflow.id)
+        state.current_agent_id = workflow.agent_definitions[0].id
+        state.current_task_id = workflow.task_definitions[0].id
+
+        result = await context.execution_engine.agent_executor.tool_executor.execute(
+            workflow,
+            state,
+            context.execution_engine.emitter,
+            tool_id=context_tool.id,
+            arguments={"query": "current platform context", "intent": "learn"},
+        )
+
+        self.assertEqual(result["status"], "ok")
+        call = api_tool_runtime.run_async.await_args
+        self.assertEqual(call.args[0], context_tool.id)
+        self.assertEqual(call.kwargs["actor"], None)
+        self.assertEqual(
+            call.args[1]["scope"]["runtime_context"],
+            {
+                "execution_id": execution.id,
+                "workflow_id": workflow.id,
+                "task_id": state.current_task_id,
+                "agent_id": state.current_agent_id,
+                "tool_call_id": context_tool.id,
+            },
+        )
+        event_types = [event.event_type for event in await context.execution_store.list_events(execution.id)]
+        self.assertIn(ExecutionEventType.TOOL_CALL_COMPLETED, event_types)
+        self.assertNotIn(ExecutionEventType.TOOL_CALL_FAILED, event_types)
+
+    async def test_native_tool_executor_dispatches_memory_list_through_api_runtime(self):
+        context = create_test_api_context()
+        memory_tool = next(
+            tool for tool in memory_system_tool_definitions() if tool.id == "agency.memory.list"
+        )
+        api_tool_runtime = (
+            context.execution_engine.agent_executor.tool_executor.tool_registry.api_tool_runtime_executor
+        )
+        self.assertIsNotNone(api_tool_runtime)
+        api_tool_runtime.run_async = AsyncMock(
+            return_value=SimpleNamespace(
+                result={"status": "ok", "memories": [], "count": 0},
+                errors=[],
+            )
+        )
+
+        workflow = self._workflow(tool=memory_tool)
+        execution = Execution(
+            id="execution-memory-list-tool",
+            workflow_id=workflow.id,
+            runtime_adapter="native",
+            input_json={"prompt": "inspect memory"},
+        )
+        await context.execution_store.save_execution(execution)
+        state = NativeExecutionState(execution_id=execution.id, workflow_id=workflow.id)
+        state.current_agent_id = workflow.agent_definitions[0].id
+        state.current_task_id = workflow.task_definitions[0].id
+
+        result = await context.execution_engine.agent_executor.tool_executor.execute(
+            workflow,
+            state,
+            context.execution_engine.emitter,
+            tool_id=memory_tool.id,
+            arguments={"query": "Agency", "limit": 10},
+        )
+
+        self.assertEqual(result["status"], "ok")
+        api_tool_runtime.run_async.assert_awaited_once_with(
+            memory_tool.id,
+            {"query": "Agency", "limit": 10},
+            actor=None,
+        )
+        event_types = [event.event_type for event in await context.execution_store.list_events(execution.id)]
+        self.assertIn(ExecutionEventType.TOOL_CALL_COMPLETED, event_types)
+        self.assertNotIn(ExecutionEventType.TOOL_CALL_FAILED, event_types)
 
     async def test_native_runtime_injects_auto_graph_context_before_task_start(self):
         self.model_registry.register(
@@ -1746,7 +2477,7 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
             input_schema={"type": "object"},
             output_schema={"type": "object"},
             implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
-            security=SecuritySettings(),
+            security=_native_test_python_security(),
             mcp_exposure=MCPExposureSettings(),
         )
         workflow = self._workflow(tool=tool)
@@ -1804,7 +2535,7 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
             input_schema={"type": "object"},
             output_schema={"type": "object"},
             implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
-            security=SecuritySettings(),
+            security=_native_test_python_security(),
             mcp_exposure=MCPExposureSettings(),
         )
         workflow = self._workflow(tool=tool)
@@ -1851,7 +2582,7 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
             input_schema={"type": "object"},
             output_schema={"type": "object"},
             implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
-            security=SecuritySettings(),
+            security=_native_test_python_security(),
             mcp_exposure=MCPExposureSettings(),
         )
         workflow = self._workflow(tool=tool)
@@ -1898,7 +2629,7 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
             input_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
             output_schema={"type": "object"},
             implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
-            security=SecuritySettings(),
+            security=_native_test_python_security(),
             mcp_exposure=MCPExposureSettings(),
         )
         workflow = self._workflow(tool=tool, max_iterations=3)
@@ -1952,7 +2683,7 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
             input_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
             output_schema={"type": "object"},
             implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
-            security=SecuritySettings(),
+            security=_native_test_python_security(),
             mcp_exposure=MCPExposureSettings(),
         )
         workflow = self._workflow(tool=tool, max_iterations=3)
@@ -2008,7 +2739,7 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
             input_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
             output_schema={"type": "object"},
             implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
-            security=SecuritySettings(),
+            security=_native_test_python_security(),
             mcp_exposure=MCPExposureSettings(),
         )
         workflow = self._workflow(tool=tool, max_iterations=3)
@@ -2073,7 +2804,7 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
             input_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
             output_schema={"type": "object"},
             implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
-            security=SecuritySettings(),
+            security=_native_test_python_security(),
             mcp_exposure=MCPExposureSettings(),
         )
         guardrail = "CRITICAL GUARDRAIL: never bypass approval policy."
@@ -2155,7 +2886,7 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
             input_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
             output_schema={"type": "object"},
             implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
-            security=SecuritySettings(),
+            security=_native_test_python_security(),
             mcp_exposure=MCPExposureSettings(),
         )
         agent = AgentDefinition(
@@ -2341,7 +3072,7 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
             input_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
             output_schema={"type": "object"},
             implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="failing_tool"),
-            security=SecuritySettings(),
+            security=_native_test_python_security("failing_tool"),
             mcp_exposure=MCPExposureSettings(),
         )
         workflow = self._workflow(tool=tool)
@@ -2364,7 +3095,7 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
             input_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
             output_schema={"type": "object"},
             implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="failing_tool"),
-            security=SecuritySettings(),
+            security=_native_test_python_security("failing_tool"),
             mcp_exposure=MCPExposureSettings(),
         )
 
@@ -2438,7 +3169,7 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
             input_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
             output_schema={"type": "object"},
             implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
-            security=SecuritySettings(),
+            security=_native_test_python_security(),
             mcp_exposure=MCPExposureSettings(),
         )
         workflow = self._workflow(tool=tool)
@@ -2459,7 +3190,7 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
             input_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
             output_schema={"type": "object"},
             implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
-            security=SecuritySettings(),
+            security=_native_test_python_security(),
             mcp_exposure=MCPExposureSettings(),
         )
         workflow = self._workflow(tool=tool)
@@ -2480,7 +3211,7 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
             input_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
             output_schema={"type": "object"},
             implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
-            security=SecuritySettings(),
+            security=_native_test_python_security(),
             mcp_exposure=MCPExposureSettings(),
         )
         workflow = self._workflow(tool=tool)
@@ -2528,7 +3259,7 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
             input_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
             output_schema={"type": "object"},
             implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
-            security=SecuritySettings(),
+            security=_native_test_python_security(),
             mcp_exposure=MCPExposureSettings(),
         )
         workflow = self._workflow(tool=tool, max_iterations=2)
@@ -2550,7 +3281,7 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
             input_schema={"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
             output_schema={"type": "object"},
             implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="artifact_tool"),
-            security=SecuritySettings(),
+            security=_native_test_python_security("artifact_tool"),
             mcp_exposure=MCPExposureSettings(),
         )
         workflow = self._workflow(tool=tool)

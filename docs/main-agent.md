@@ -784,6 +784,89 @@ MAIN_AGENT_WORKFLOW_MONITOR_FINDING_RETENTION_DAYS=60
 AGENT_PERSISTENT_RUN_SUMMARY_ENABLED=false
 ```
 
+### Intent-aware routing and selective tools
+
+Conversation replies can use a lightweight, provider-agnostic intent router before the normal direct-reply model call.
+The router receives the user message and compact tool-group descriptors only; it never receives full function schemas,
+credentials, or durable-memory contents. A deterministic policy validates every decision against the agent's existing
+tool allowlist before the executor receives schemas.
+
+The explicit structured handlers keep their public behavior. General main-agent replies evaluate a
+deterministic fast path, then use compact structured routing, deterministic policy, user/agent allowlists, bounded
+context, and selected schemas before entering the same existing model/tool loop. Conversation SSE continues to stream
+the persisted activity, tool, approval, and assistant events from that loop.
+
+```mermaid
+flowchart LR
+    message["User message"] --> fast["Conservative fast path"]
+    fast --> router["Structured intent router"]
+    router --> policy["Policy + allowlist validation"]
+    policy --> context["Selective context and tool schemas"]
+    context --> executor["Existing model/tool loop"]
+    executor --> stream["Existing conversation events"]
+```
+
+The rollout is deliberately opt-in:
+
+1. Run `alembic upgrade head` so explicit `ToolDefinition.routing` metadata persists in `tools.routing_json`.
+2. Set `MAIN_AGENT_ROUTER_ENABLED=true` and leave `MAIN_AGENT_ROUTER_SHADOW_MODE=true`. Routing decisions and
+   predicted schema savings are audited, while the existing full-tool request is still sent to the main model.
+3. Review `routing.decision.recorded` and `routing.evaluation.recorded` events for confidence, selected groups, false
+   negatives, and the saved-schema
+   estimates. Routing failures and low-confidence decisions safely use `full_agent`, unless the optional
+   `MAIN_AGENT_ROUTER_SAFE_FALLBACK_GROUPS` contains only approved read groups.
+4. Set `MAIN_AGENT_ROUTER_SHADOW_MODE=false` to make read-only selected routing authoritative. Enable direct responses
+   separately with `MAIN_AGENT_ROUTER_DIRECT_RESPONSE_ENABLED=true`. Use a stable
+   `MAIN_AGENT_ROUTER_ROLLOUT_PERCENT` bucket or `MAIN_AGENT_ROUTER_USER_ALLOWLIST` for a smaller authoritative cohort.
+5. Keep `MAIN_AGENT_ROUTER_SELECTIVE_WRITE_TOOLS_ENABLED=false` until write-tool policy and approval behavior have
+   been evaluated. Existing approval checks always remain server-side.
+
+Relevant settings:
+
+```bash
+MAIN_AGENT_ROUTER_ENABLED=false
+MAIN_AGENT_ROUTER_SHADOW_MODE=true
+MAIN_AGENT_ROUTER_MODEL_PROFILE_ID=
+MAIN_AGENT_ROUTER_TIMEOUT_MS=3000
+MAIN_AGENT_ROUTER_MIN_CONFIDENCE=0.70
+MAIN_AGENT_ROUTER_MAX_TOOL_GROUPS=3
+MAIN_AGENT_ROUTER_MAX_TOOL_ITERATIONS=4
+MAIN_AGENT_ROUTER_MAX_TOKEN_BUDGET=8192
+MAIN_AGENT_ROUTER_DIRECT_RESPONSE_ENABLED=false
+MAIN_AGENT_ROUTER_SELECTIVE_WRITE_TOOLS_ENABLED=false
+MAIN_AGENT_ROUTER_SAFE_FALLBACK_GROUPS=
+MAIN_AGENT_ROUTER_CACHE_ENABLED=true
+MAIN_AGENT_ROUTER_CACHE_TTL_SECONDS=300
+MAIN_AGENT_ROUTER_CACHE_MAX_ENTRIES=1024
+MAIN_AGENT_ROUTER_ROLLOUT_PERCENT=100
+MAIN_AGENT_ROUTER_USER_ALLOWLIST=
+MAIN_AGENT_ROUTER_SPECIALIST_ENABLED=false
+MAIN_AGENT_ROUTER_RECENT_MESSAGE_LIMIT=12
+MAIN_AGENT_ROUTER_CONTEXT_TOKEN_BUDGET=4000
+MAIN_AGENT_ROUTER_FAST_PATH_ENABLED=true
+MAIN_AGENT_ROUTER_FAST_PATH_RULES=greeting,acknowledgement,previous_response_edit,continuation
+```
+
+Tools can declare explicit routing metadata through `ToolDefinition.routing` (`group`, compact description, intents,
+keywords, read/write risk, confirmation requirement, and enabled state). Existing Agency system tools have a
+backward-compatible group derived from their canonical ID and `SecuritySettings`; their provider schemas remain hidden
+from the router. Add a new group only when it contains enabled, real tools and include it in the agent's existing tool
+allowlist. Optional `allowed_user_ids` and `denied_user_ids` tool-policy metadata is applied after the agent allowlist and
+before compact groups are built.
+
+The routing cache stores validated routing patterns only. Its key contains a hash of normalized message text plus router
+prompt/model, compact catalogue, specialist descriptors, permissions, and policy versions. Raw messages, final answers,
+tool arguments, clarification questions, specialist decisions, and write-group decisions are not cached. TTL and maximum
+entry settings bound the in-process cache; each backend worker maintains its own cache.
+
+Specialists are limited to the main agent's persisted `handoff_agent_ids`. The router receives compact names,
+descriptions, and group IDs; policy revalidates the selected specialist and groups. Specialist routing remains disabled
+until `MAIN_AGENT_ROUTER_SPECIALIST_ENABLED=true`.
+
+Metrics record routing mode, confidence, fast-path rule, selected versus executor tool counts, actual tool calls, false
+negatives, unnecessary selections, schema bytes, estimated schema-token savings, cache state, fallback use, context
+sources, and catalogue version; they never include the user message.
+
 Set either mutation flag to `false` to globally block main-agent workflow or tool create/update proposals. Set the
 external-channel budget to `0` to block external-channel main-agent requests, or raise it for busier chat deployments.
 `MAIN_AGENT_WORKFLOW_MONITOR_ENABLED=true` starts the background monitor when the backend starts. Main-agent setup also

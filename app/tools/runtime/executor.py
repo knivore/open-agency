@@ -1440,7 +1440,11 @@ class ToolRuntimeExecutor:
                 actor=actor,
             )
         try:
-            raw_result = _execute_browser_tool(tool_name, payload)
+            raw_result = _execute_browser_tool(
+                tool_name,
+                payload,
+                allowed_hosts=self.policy_engine.allowed_http_hosts,
+            )
             error = _tool_result_error(raw_result)
             return build_tool_run_response(
                 verdict="warn" if error else policy_verdict.outcome,
@@ -3061,7 +3065,7 @@ class ToolRuntimeExecutor:
         if self.context is None:
             return self._context_required_response(SYSTEM_EXECUTION_GET_TOOL_ID, actor=actor)
         execution_id = str(payload.get("execution_id") or "")
-        execution = await self.context.execution_store.get_execution(execution_id)
+        execution = await self._execution_for_actor(execution_id, actor=actor)
         if execution is None:
             return build_tool_run_response(
                 verdict="warn",
@@ -3095,6 +3099,19 @@ class ToolRuntimeExecutor:
         if self.context is None:
             return self._context_required_response(SYSTEM_EXECUTION_LIST_TOOL_ID, actor=actor)
 
+        current_user = await self._current_user(actor)
+        if current_user is None:
+            error = "Authenticated execution access is required."
+            return build_tool_run_response(
+                verdict="warn",
+                policy_verdict=policy_verdict,
+                result={"status": "error", "error": error},
+                patch=None,
+                errors=[error],
+                dry_run=True,
+                actor=actor,
+            )
+
         workflow_id = _optional_string(payload.get("workflow_id"))
         agent_id = _optional_string(payload.get("agent_id"))
         active_only = bool(payload.get("active_only"))
@@ -3114,6 +3131,9 @@ class ToolRuntimeExecutor:
             executions = await self.context.execution_store.list_active_executions()
         else:
             executions = await self.context.execution_store.list_executions()
+
+        if "admin" not in getattr(current_user, "roles", []):
+            executions = [execution for execution in executions if execution.created_by == current_user.id]
 
         if normalized_statuses:
             allowed = set(normalized_statuses)
@@ -3157,7 +3177,7 @@ class ToolRuntimeExecutor:
         if self.context is None:
             return self._context_required_response(SYSTEM_EXECUTION_EVENTS_TOOL_ID, actor=actor)
         execution_id = str(payload.get("execution_id") or "")
-        execution = await self.context.execution_store.get_execution(execution_id)
+        execution = await self._execution_for_actor(execution_id, actor=actor)
         if execution is None:
             error = f"Execution '{execution_id}' was not found."
             return build_tool_run_response(
@@ -3204,7 +3224,7 @@ class ToolRuntimeExecutor:
         if self.context is None:
             return self._context_required_response(SYSTEM_EXECUTION_ARTIFACTS_TOOL_ID, actor=actor)
         execution_id = str(payload.get("execution_id") or "")
-        execution = await self.context.execution_store.get_execution(execution_id)
+        execution = await self._execution_for_actor(execution_id, actor=actor)
         if execution is None:
             error = f"Execution '{execution_id}' was not found."
             return build_tool_run_response(
@@ -3246,7 +3266,30 @@ class ToolRuntimeExecutor:
             return self._context_required_response("agency.workflow.run", actor=actor)
         workflow_id = str(payload.get("workflow_id") or "")
         workflow = await self.context.workflow_repo.get(workflow_id)
-        if workflow is None:
+        current_user = await self._current_user(actor)
+        owner_ids = workflow.metadata.get("owner_ids") if workflow is not None else None
+        normalized_owner_ids = {
+            item for item in owner_ids if isinstance(item, str) and item
+        } if isinstance(owner_ids, list) else set()
+        created_by = workflow.metadata.get("created_by") if workflow is not None else None
+        # The HTTP boundary always resolves a repository-backed user. Non-user
+        # actors are internal agent/runtime identities and retain the existing
+        # trusted orchestration path; anonymous calls still fail closed.
+        can_run = bool(
+            workflow is not None
+            and (
+                (current_user is None and bool(actor))
+                or (
+                    current_user is not None
+                    and (
+                        "admin" in getattr(current_user, "roles", [])
+                        or current_user.id in normalized_owner_ids
+                        or created_by == current_user.id
+                    )
+                )
+            )
+        )
+        if not can_run:
             error = f"Workflow '{workflow_id}' was not found."
             return build_tool_run_response(
                 verdict="warn",
@@ -3344,6 +3387,18 @@ class ToolRuntimeExecutor:
         if self.context is None:
             return self._context_required_response(tool_name, actor=actor)
         execution_id = str(payload.get("execution_id") or "")
+        execution = await self._execution_for_actor(execution_id, actor=actor)
+        if execution is None:
+            error = f"Execution '{execution_id}' was not found."
+            return build_tool_run_response(
+                verdict="warn",
+                policy_verdict=policy_verdict,
+                result={"status": "error", "error": error},
+                patch=None,
+                errors=[error],
+                dry_run=False,
+                actor=actor,
+            )
         service = ExecutionService(self.context)
         try:
             if action == "pause":
@@ -3378,6 +3433,18 @@ class ToolRuntimeExecutor:
         if self.context is None:
             return self._context_required_response(tool_name, actor=actor)
         execution_id = str(payload.get("execution_id") or "")
+        execution = await self._execution_for_actor(execution_id, actor=actor)
+        if execution is None:
+            error = f"Execution '{execution_id}' was not found."
+            return build_tool_run_response(
+                verdict="warn",
+                policy_verdict=policy_verdict,
+                result={"status": "error", "error": error},
+                patch=None,
+                errors=[error],
+                dry_run=True,
+                actor=actor,
+            )
         try:
             items = await ExecutionService(self.context).list_execution_approvals(execution_id)
         except ExecutionNotFoundError as exc:
@@ -3418,6 +3485,18 @@ class ToolRuntimeExecutor:
         if self.context is None:
             return self._context_required_response(tool_name, actor=actor)
         execution_id = str(payload.get("execution_id") or "")
+        execution = await self._execution_for_actor(execution_id, actor=actor)
+        if execution is None:
+            error = f"Execution '{execution_id}' was not found."
+            return build_tool_run_response(
+                verdict="warn",
+                policy_verdict=policy_verdict,
+                result={"status": "error", "error": error},
+                patch=None,
+                errors=[error],
+                dry_run=False,
+                actor=actor,
+            )
         tool_id = str(payload.get("tool_id") or "")
         reason = _optional_string(payload.get("reason"))
         service = ExecutionService(self.context)
@@ -5261,6 +5340,21 @@ class ToolRuntimeExecutor:
             return await self.context.user_repo.get(actor)
         return None
 
+    async def _execution_for_actor(self, execution_id: str, *, actor: str | None):
+        """Resolve an execution only when the authenticated actor owns it or is an admin."""
+        if self.context is None:
+            return None
+        current_user = await self._current_user(actor)
+        if current_user is None:
+            return None
+        execution = await self.context.execution_store.get_execution(execution_id)
+        if execution is None:
+            return None
+        if "admin" in getattr(current_user, "roles", []) or execution.created_by == current_user.id:
+            return execution
+        # Hide cross-owner identifiers so this helper cannot become an existence oracle.
+        return None
+
     async def _owned_uploaded_document(self, document_id: str, *, current_user):
         if self.context is None:
             return None
@@ -5584,7 +5678,12 @@ def _extract_storage_uri(message: str) -> str | None:
     return match.group(0).rstrip(".") if match else None
 
 
-def _execute_browser_tool(tool_name: str, payload: dict[str, Any]) -> Any:
+def _execute_browser_tool(
+        tool_name: str,
+        payload: dict[str, Any],
+        *,
+        allowed_hosts: list[str] | None = None,
+) -> Any:
     handlers = {
         "agency.browser.open": open_browser,
         "agency.browser.screenshot": screenshot,
@@ -5600,6 +5699,8 @@ def _execute_browser_tool(tool_name: str, payload: dict[str, Any]) -> Any:
     handler = handlers.get(tool_name)
     if handler is None:
         raise KeyError(f"Browser tool '{tool_name}' is not implemented")
+    if tool_name == "agency.browser.open":
+        return handler(**payload, _allowed_hosts=list(allowed_hosts or []))
     return handler(**payload)
 
 

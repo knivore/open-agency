@@ -49,7 +49,9 @@ Current contract-backed tools:
 - `agency.memory.list`, `agency.memory.remember`, `agency.memory.update`, and `agency.memory.delete` expose durable memory CRUD through signed contract responses and use `MemoryService` for ownership and sensitive-confirmation policy.
 - `agency.workflow.propose-create`, `agency.workflow.propose-update`, `agency.tool.propose-create`, and `agency.tool.propose-update` are contracted as approval-mediated proposal tools. Calls with `conversation_id` create approval requests; calls without conversation context return signed `requires_conversation_context` responses.
 - `agency.workflow.run` creates and queues unprotected workflow executions through `ExecutionService`, then returns execution id, workflow id, queued status, and the execution payload in `result`.
-- Browser tools execute through the existing browser session manager. `agency.browser.open` is URL/host policy checked; click/select/type actions are policy-mediated and warn when the actor is not explicitly approved.
+- Browser tools execute through the existing browser session manager. `agency.browser.open` checks the initial URL,
+  DNS answers, redirects, and subresources against the same host policy; click/select/type actions are policy-mediated
+  and warn when the actor is not explicitly approved.
 - `agency.human.ask` publishes a prompt to the existing human input channel and waits up to `timeout_seconds` for a reply.
 - Protected workflow runs and proposal tools create real conversation approval requests when `conversation_id` is supplied. Without conversation context, direct contract runs return signed `requires_approval_context` or `requires_conversation_context` responses instead of bypassing human approval.
 
@@ -66,4 +68,6 @@ To add a contract:
 Tool runs are persisted to `TOOL_RUN_STORE_PATH`, defaulting to `.data/executions/tool_runs.jsonl`.
 File-write and spreadsheet-writer contract runs are constrained by `TOOL_FILE_WRITE_ALLOWED_DIRS`, defaulting to the backend and frontend workspace roots.
 Sandbox edit contract runs are constrained by `SANDBOX_EDIT_ALLOWED_REPOS`, defaulting to the backend and frontend workspace roots.
-HTTP contract runs are constrained by `TOOL_HTTP_ALLOWED_HOSTS`, defaulting to `*`.
+HTTP contract runs are constrained by `TOOL_HTTP_ALLOWED_HOSTS`. The default is empty and therefore fail-closed;
+operators must explicitly list the destination host names that Agency tools may contact.
+In deployable modes Agency rejects allowlisted names that resolve to any non-public address.

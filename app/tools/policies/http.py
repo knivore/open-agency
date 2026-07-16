@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import urlparse
 
+from app.core.outbound_http import validate_outbound_http_url
 from app.core.onecli_http import ONECLI_BLOCKED_HEADER_NAMES, ONECLI_BLOCKED_QUERY_PARAM_NAMES
 from app.tools.contracts.models import PolicyRuleResult, PolicyVerdict
 
@@ -34,16 +35,19 @@ def evaluate_http_request_policy(
     host = (parsed_url.hostname or "").lower()
     if host in BLOCKED_HOSTS:
         rules.append(PolicyRuleResult(id="http-host-safety", outcome="deny", reason=f"blocked host: {host}"))
-    elif not _host_allowed(host, allowed_hosts):
-        rules.append(
-            PolicyRuleResult(
-                id="http-host-allowlist",
-                outcome="deny",
-                reason=f"host is not allowlisted: {host}",
-            )
-        )
     else:
-        rules.append(PolicyRuleResult(id="http-host-allowlist", outcome="ok", reason="host is allowlisted"))
+        try:
+            validate_outbound_http_url(str(payload.get("url") or ""), allowed_hosts=allowed_hosts)
+        except ValueError as exc:
+            rules.append(
+                PolicyRuleResult(
+                    id="http-host-allowlist",
+                    outcome="deny",
+                    reason=str(exc),
+                )
+            )
+        else:
+            rules.append(PolicyRuleResult(id="http-host-allowlist", outcome="ok", reason="host is allowlisted"))
 
     if method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}:
         rules.append(PolicyRuleResult(id="http-method", outcome="deny", reason=f"unsupported HTTP method: {method}"))
@@ -51,8 +55,10 @@ def evaluate_http_request_policy(
         rules.append(
             PolicyRuleResult(
                 id="http-mutation-approval-context",
-                outcome="warn",
-                reason="mutating HTTP request is policy-mediated but actor is not explicitly approved",
+                # A warning is non-blocking at the runtime boundary; mutations
+                # must fail closed until an invocation-bound approval is present.
+                outcome="deny",
+                reason="mutating HTTP request requires an explicitly approved actor context",
             )
         )
     else:
@@ -101,16 +107,3 @@ def evaluate_http_request_policy(
 
     score = sum(100 if rule.outcome == "deny" else 25 if rule.outcome == "warn" else 0 for rule in rules)
     return PolicyVerdict(score=score, rules=rules)
-
-
-def _host_allowed(host: str, allowed_hosts: list[str]) -> bool:
-    if not host:
-        return False
-    if "*" in allowed_hosts:
-        return True
-    for allowed in allowed_hosts:
-        if allowed.startswith("*.") and host.endswith(allowed[1:]):
-            return True
-        if host == allowed:
-            return True
-    return False

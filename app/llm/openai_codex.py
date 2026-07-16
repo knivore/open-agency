@@ -393,12 +393,10 @@ class OpenAICodexModelClient:
             timeout_seconds: int | None = None,
             output_schema: Dict[str, Any] | None = None,
     ) -> ModelResponse:
-        codex_binary = (
-                self.config.get("codex_binary")
-                or self.config.get("codexBinary")
-                or os.getenv("CODEX_CLI_BINARY")
-                or "codex"
-        )
+        # Executable, sandbox, and cwd are host-security controls. Model profiles
+        # are management data and must not be able to turn them into command or
+        # filesystem primitives; only operator-owned environment settings may.
+        codex_binary = os.getenv("CODEX_CLI_BINARY") or "codex"
         executable = shutil.which(codex_binary)
         if executable is None:
             raise RuntimeError(
@@ -410,12 +408,11 @@ class OpenAICodexModelClient:
         timeout = self._codex_cli_timeout_seconds(timeout_seconds)
         prompt = self._messages_to_prompt(messages)
         started_at = time.perf_counter()
-        sandbox_mode = (
-                self.config.get("codex_cli_sandbox")
-                or self.config.get("codexCliSandbox")
-                or os.getenv("CODEX_CLI_SANDBOX")
-                or "read-only"
-        )
+        operator_sandbox = os.getenv("CODEX_CLI_SANDBOX") or "read-only"
+        sandbox_mode = operator_sandbox if operator_sandbox in {"read-only", "workspace-write"} else "read-only"
+        requested_sandbox = self.config.get("codex_cli_sandbox") or self.config.get("codexCliSandbox")
+        if requested_sandbox:
+            sandbox_mode = "read-only"
 
         with tempfile.NamedTemporaryFile("w+", encoding="utf-8", suffix=".txt", delete=False) as output_file:
             output_path = output_file.name
@@ -443,7 +440,7 @@ class OpenAICodexModelClient:
         if schema_path:
             command.extend(["--output-schema", schema_path])
         command.append("-")
-        cwd = self.config.get("codex_cwd") or os.getenv("CODEX_CLI_CWD") or os.getcwd()
+        cwd = os.getenv("CODEX_CLI_CWD") or os.getcwd()
         try:
             completed = subprocess.run(
                 command,

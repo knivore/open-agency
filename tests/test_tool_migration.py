@@ -226,26 +226,44 @@ class ToolDefinitionMigrationTests(unittest.TestCase):
         file_write = specs["agency.file.write-text"].tool_definition
         browser_click = specs["agency.browser.click"].tool_definition
         http_request = specs["agency.http.request"].tool_definition
+        repo_inspect = specs["agency.repo.inspect"].tool_definition
 
-        self.assertTrue(file_write.security.requires_approval)
+        self.assertFalse(file_write.security.requires_approval)
         self.assertTrue(file_write.security.allow_filesystem)
         self.assertTrue(file_write.security.dangerous)
         self.assertTrue(browser_click.security.allow_browser)
         self.assertTrue(browser_click.security.requires_approval)
         self.assertTrue(http_request.security.allow_network)
         self.assertTrue(http_request.security.sandbox_required)
-        self.assertTrue(http_request.security.requires_approval)
+        self.assertFalse(http_request.security.requires_approval)
         self.assertTrue(http_request.security.dangerous)
+        self.assertTrue(repo_inspect.security.allow_filesystem)
+        self.assertTrue(repo_inspect.security.sandbox_required)
+        self.assertTrue(repo_inspect.security.read_only)
+        self.assertFalse(repo_inspect.security.requires_approval)
+        self.assertFalse(repo_inspect.security.dangerous)
 
-    def test_high_risk_mutation_surfaces_remain_approval_gated_or_proposal_only(self):
+    def test_all_privileged_builtin_tools_require_sandboxing(self):
+        privileged_tools = []
+        for tool in list_builtin_tool_definitions():
+            if not tool.security.has_privileged_capabilities:
+                continue
+            privileged_tools.append(tool.id)
+            with self.subTest(tool_id=tool.id):
+                self.assertTrue(
+                    tool.security.sandbox_required,
+                    f"{tool.id} enables privileged capabilities without sandboxing",
+                )
+
+        self.assertTrue(privileged_tools, "Expected the built-in registry to contain privileged tools")
+
+    def test_high_risk_mutation_surfaces_follow_explicit_approval_policy(self):
         catalog_tools = {spec.tool_definition.id: spec.tool_definition for spec in get_tool_catalog_specs().values()}
         system_tools = {tool.id: tool for tool in builtin_system_tool_definitions()}
         tools = {**catalog_tools, **system_tools}
 
         direct_side_effect_tools = {
             "agency.command.run": ("allow_shell",),
-            "agency.file.write-text": ("allow_filesystem",),
-            "agency.http.request": ("allow_network",),
             "agency.browser.click": ("allow_browser", "allow_network"),
             "agency.browser.type-text": ("allow_browser", "allow_network"),
             "agency.browser.select-option": ("allow_browser", "allow_network"),
@@ -254,6 +272,21 @@ class ToolDefinitionMigrationTests(unittest.TestCase):
             with self.subTest(tool_id=tool_id):
                 tool = tools[tool_id]
                 self.assertTrue(tool.security.requires_approval)
+                self.assertTrue(tool.security.sandbox_required)
+                self.assertTrue(tool.security.dangerous)
+                for capability in required_capabilities:
+                    self.assertTrue(getattr(tool.security, capability), capability)
+
+        autonomous_side_effect_tools = {
+            "agency.file.write-text": ("allow_filesystem",),
+            "agency.http.request": ("allow_network",),
+            "agency.media.send": ("allow_filesystem", "allow_network"),
+            "agency.voice.generate": ("allow_filesystem",),
+        }
+        for tool_id, required_capabilities in autonomous_side_effect_tools.items():
+            with self.subTest(tool_id=tool_id):
+                tool = tools[tool_id]
+                self.assertFalse(tool.security.requires_approval)
                 self.assertTrue(tool.security.sandbox_required)
                 self.assertTrue(tool.security.dangerous)
                 for capability in required_capabilities:

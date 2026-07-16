@@ -11,11 +11,13 @@ import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api.context import ApiContext, get_default_api_context
+from app.api.identity import resolve_current_user
 from app.api.routes import create_api_router
 from app.core.config import get_settings
 from app.core.time import utc_now
@@ -28,6 +30,7 @@ from app.services.conversation_daily_summary import (
 )
 from app.services.conversations.discord_gateway import DiscordGatewayListenerService
 from app.services.goals import GoalStartupReconciler
+from app.services.execution_waits import ExecutionWaitService
 from app.services.main_agent_setup.prompt_doc import extract_prompt_from_doc
 from app.services.main_agent_setup.service import (
     MainAgentModelProfileRequiredError,
@@ -38,6 +41,30 @@ from app.services.main_agent_setup.service import (
 from app.services.main_agent_workflow_monitor import MainAgentWorkflowMonitorService
 
 logger = logging.getLogger(__name__)
+
+PUBLIC_API_PATHS = {
+    "/auth/bootstrap",
+    "/auth/login",
+    "/setup/status",
+}
+DOCUMENTATION_PATHS = {"/docs", "/openapi.json", "/redoc"}
+
+
+def _is_public_http_request(request: Request) -> bool:
+    """Keep only bootstrap, diagnostics, docs, and signed webhooks outside the API auth boundary."""
+
+    path = request.url.path.rstrip("/") or "/"
+    if request.method.upper() == "OPTIONS" or path in PUBLIC_API_PATHS:
+        return True
+    if path in DOCUMENTATION_PATHS and get_settings().app_env != "production":
+        return True
+    if path == "/health" or path.startswith("/health/"):
+        return True
+    return (
+        request.method.upper() == "POST"
+        and path.startswith("/integrations/conversations/adapters/")
+        and path.endswith("/webhook")
+    )
 
 
 def create_app(context: ApiContext | None = None) -> FastAPI:
@@ -52,6 +79,7 @@ def create_app(context: ApiContext | None = None) -> FastAPI:
         logger.info("OneCLI credential gateway diagnostics: %s", settings.sanitized_onecli_diagnostics)
         runtime_context = context
         workflow_scheduler_task: asyncio.Task | None = None
+        execution_wait_task: asyncio.Task | None = None
         reconcile_task: asyncio.Task | None = None
         connector_retention_task: asyncio.Task | None = None
         daily_summary_task: asyncio.Task | None = None
@@ -94,6 +122,26 @@ def create_app(context: ApiContext | None = None) -> FastAPI:
                 await GoalStartupReconciler(runtime_context).reconcile_once()
             except Exception:
                 logger.exception("Startup goal reconciliation failed")
+        runtime_context = runtime_context or getattr(app.state, "api_context", None) or get_default_api_context()
+        app.state.api_context = runtime_context
+        try:
+            await ExecutionWaitService(runtime_context).wake_due_waits()
+        except Exception:
+            logger.exception("Startup execution wait reconciliation failed")
+
+        execution_wait_service = ExecutionWaitService(runtime_context)
+
+        async def execution_wait_loop() -> None:
+            # Durable continuations are required for local and isolated runs, so
+            # their wake cadence must not depend on the optional container reconciler.
+            while True:
+                try:
+                    await execution_wait_service.wake_due_waits()
+                except Exception:
+                    logger.exception("Execution wait loop failed")
+                await asyncio.sleep(settings.execution_wait_poll_interval_seconds)
+
+        execution_wait_task = asyncio.create_task(execution_wait_loop())
         if settings.workflow_scheduler_enabled:
             runtime_context = runtime_context or getattr(app.state, "api_context", None) or get_default_api_context()
             app.state.api_context = runtime_context
@@ -148,7 +196,7 @@ def create_app(context: ApiContext | None = None) -> FastAPI:
                     try:
                         await runtime_context.runtime_reconciler.reconcile_once()
                     except Exception:
-                        pass
+                        logger.exception("Runtime reconciliation loop failed")
                     await asyncio.sleep(settings.runtime_reconciler_interval_seconds)
 
             reconcile_task = asyncio.create_task(reconcile_loop())
@@ -212,6 +260,12 @@ def create_app(context: ApiContext | None = None) -> FastAPI:
                     await workflow_scheduler_task
                 except asyncio.CancelledError:
                     pass
+            if execution_wait_task is not None:
+                execution_wait_task.cancel()
+                try:
+                    await execution_wait_task
+                except asyncio.CancelledError:
+                    pass
             if reconcile_task is not None:
                 reconcile_task.cancel()
                 try:
@@ -247,9 +301,9 @@ def create_app(context: ApiContext | None = None) -> FastAPI:
         title="Agency API",
         description="Backend API for defining and running agents, tools, workflows, schedules, and executions.",
         version="0.1.0",
-        docs_url="/docs",
-        redoc_url="/redoc",
-        openapi_url="/openapi.json",
+        docs_url=None if settings.app_env == "production" else "/docs",
+        redoc_url=None if settings.app_env == "production" else "/redoc",
+        openapi_url=None if settings.app_env == "production" else "/openapi.json",
         swagger_ui_parameters={
             "displayRequestDuration": True,
             "persistAuthorization": True,
@@ -259,6 +313,9 @@ def create_app(context: ApiContext | None = None) -> FastAPI:
     if context is not None:
         app.state.api_context = context
 
+    if settings.app_env == "production":
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.parsed_agency_allowed_hosts)
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_allowed_origins,
@@ -267,9 +324,33 @@ def create_app(context: ApiContext | None = None) -> FastAPI:
         allow_headers=["*"],
     )
 
+    @app.middleware("http")
+    async def require_api_identity(request: Request, call_next):  # noqa: ANN001
+        # Tests exercise route behavior with lightweight in-memory contexts. Real
+        # development and production deployments fail closed at one shared edge.
+        if settings.app_env == "test" or _is_public_http_request(request):
+            return await call_next(request)
+
+        runtime_context = context or getattr(request.app.state, "api_context", None) or get_default_api_context()
+        try:
+            request.state.authenticated_user = await resolve_current_user(request, runtime_context)
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        return await call_next(request)
+
+    @app.middleware("http")
+    async def add_security_headers(request: Request, call_next):  # noqa: ANN001
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        return response
+
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request, exc):  # noqa: ANN001
-        return JSONResponse(status_code=500, content={"detail": str(exc)})
+        logger.exception("Unhandled API exception", exc_info=exc)
+        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
     app.include_router(create_api_router(context))
     return app

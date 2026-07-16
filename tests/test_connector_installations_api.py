@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-import unittest
 import asyncio
+import hashlib
+import unittest
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import patch
-from urllib.parse import parse_qs, urlparse
+from unittest.mock import AsyncMock, patch
+from urllib.parse import urlparse
 from fastapi.testclient import TestClient
 
 from app.api.context import create_test_api_context
@@ -42,6 +44,20 @@ class ConnectorInstallationsApiTests(unittest.TestCase):
             },
         )
 
+        async def verified_ref(_service, installation):
+            session_id = (installation.setup_session_id or installation.id).replace("-", "")[:12]
+            return f"onecli://users/{installation.owner_user_id}/secrets/verified-{session_id}"
+
+        self.verify_patcher = patch.object(
+            ConnectorInstallationService,
+            "_verified_onecli_ref",
+            new=verified_ref,
+        )
+        self.verify_patcher.start()
+
+    def tearDown(self) -> None:
+        self.verify_patcher.stop()
+
     def _create_setup_session(self, provider: str = "telegram", headers: dict[str, str] | None = None) -> dict:
         response = self.client.post(
             f"/integrations/connectors/{provider}/setup-sessions",
@@ -64,12 +80,12 @@ class ConnectorInstallationsApiTests(unittest.TestCase):
             f"onecli://users/user-installations/telegram-bot/{installation_id}",
         )
         self.assertEqual(installation["onecli_credential_ref"], body["onecli_credential_ref"])
-        self.assertIn("agency_installation_id=", body["setup_url"])
-        self.assertIn("device_code=", body["setup_url"])
-        self.assertIn("provider=telegram-bot", body["setup_url"])
-        setup_query = parse_qs(urlparse(body["setup_url"]).query)
-        self.assertEqual(setup_query["agency_user_id"], ["user-installations"])
-        self.assertEqual(setup_query["onecli_credential_ref"], [body["onecli_credential_ref"]])
+        self.assertEqual(urlparse(body["setup_url"]).query, "")
+        self.assertEqual(urlparse(body["setup_url"]).path, "/")
+        self.assertTrue(body["onecli_resource_name"].startswith("agency-telegram-bot-"))
+        self.assertIsNotNone(body["expires_at"])
+        self.assertIsNotNone(installation["setup_started_at"])
+        self.assertIsNotNone(installation["setup_expires_at"])
         self.assertNotIn("/setup/connectors/", body["setup_url"])
         self.assertNotIn("raw-secret", str(body))
 
@@ -87,8 +103,19 @@ class ConnectorInstallationsApiTests(unittest.TestCase):
             body["onecli_credential_ref"],
             f"onecli://users/user-installations/gmail/{body['installation']['id']}",
         )
-        self.assertIn("provider=gmail", body["setup_url"])
+        self.assertEqual(urlparse(body["setup_url"]).query, "")
+        self.assertEqual(urlparse(body["setup_url"]).path, "/")
         self.assertNotIn("/setup/connectors/", body["setup_url"])
+
+    def test_create_setup_session_rejects_unverifiable_multi_secret_shape(self) -> None:
+        response = self.client.post(
+            "/integrations/connectors/microsoft-teams/setup-sessions",
+            headers=self.owner_headers,
+            json={"name": "Teams"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("cannot yet be verified", response.json()["detail"])
 
     def test_create_setup_session_rejects_raw_secret_material(self) -> None:
         response = self.client.post(
@@ -99,6 +126,29 @@ class ConnectorInstallationsApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("OneCLI setup", response.json()["detail"])
+
+    def test_create_setup_session_rejects_browser_supplied_onecli_ref(self) -> None:
+        response = self.client.post(
+            "/integrations/connectors/telegram/setup-sessions",
+            headers=self.owner_headers,
+            json={
+                "name": "Telegram",
+                "onecli_credential_ref": "onecli://users/other-installations/secrets/forged",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("do not submit a credential ref", response.json()["detail"])
+
+    def test_create_setup_session_rejects_secret_values_nested_in_metadata(self) -> None:
+        response = self.client.post(
+            "/integrations/connectors/whatsapp/setup-sessions",
+            headers=self.owner_headers,
+            json={"name": "WhatsApp", "metadata": {"app_secret": "raw-provider-secret"}},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("metadata accepts only secret references", response.json()["detail"])
 
     def test_create_setup_session_creates_unique_installations_per_request(self) -> None:
         first = self._create_setup_session("telegram")
@@ -144,6 +194,24 @@ class ConnectorInstallationsApiTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in owner_list_response.json()["items"]], [installation_id])
         self.assertEqual(other_list_response.json()["items"], [])
 
+    def test_unexpired_setup_session_can_be_resumed_by_its_owner(self) -> None:
+        body = self._create_setup_session("discord")
+        installation_id = body["installation"]["id"]
+
+        response = self.client.get(
+            f"/integrations/connectors/installations/{installation_id}/setup-session",
+            headers=self.owner_headers,
+        )
+        other_response = self.client.get(
+            f"/integrations/connectors/installations/{installation_id}/setup-session",
+            headers=self.other_owner_headers,
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["onecli_resource_name"], body["onecli_resource_name"])
+        self.assertEqual(response.json()["expires_at"], body["expires_at"])
+        self.assertEqual(other_response.status_code, 404)
+
     def test_complete_setup_session_activates_installation_and_projects_credential_ref(self) -> None:
         body = self._create_setup_session("discord")
         installation_id = body["installation"]["id"]
@@ -160,17 +228,23 @@ class ConnectorInstallationsApiTests(unittest.TestCase):
         self.assertEqual(completed["metadata"]["workspace"], "ops")
         self.assertEqual(
             completed["onecli_credential_ref"],
-            f"onecli://users/user-installations/discord-bot/{installation_id}",
+            f"onecli://users/user-installations/secrets/verified-{installation_id.replace('-', '')[:12]}",
         )
 
         credential_response = self.client.get(f"/credentials/{installation_id}", headers=self.owner_headers)
         self.assertEqual(credential_response.status_code, 200, credential_response.text)
         credential = credential_response.json()
         self.assertEqual(credential["provider"], "discord-bot")
-        self.assertEqual(credential["secret_ref"], completed["onecli_credential_ref"])
+        self.assertNotIn("secret_ref", credential)
+        self.assertTrue(credential["secret_ref_configured"])
+        self.assertEqual(credential["secret_ref_scheme"], "onecli")
         self.assertEqual(credential["owner_user_id"], "user-installations")
+        stored = asyncio.run(self.context.credential_repo.get(installation_id))
+        self.assertIsNotNone(stored)
+        assert stored is not None
+        self.assertEqual(stored.secret_ref, completed["onecli_credential_ref"])
 
-    def test_complete_setup_session_rejects_cross_owner_onecli_ref(self) -> None:
+    def test_complete_setup_session_rejects_browser_supplied_onecli_ref(self) -> None:
         body = self._create_setup_session("discord")
         installation_id = body["installation"]["id"]
 
@@ -181,7 +255,7 @@ class ConnectorInstallationsApiTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn("onecli://users/user-installations/", response.json()["detail"])
+        self.assertIn("do not submit a credential ref", response.json()["detail"])
 
     def test_complete_setup_session_rejects_non_onecli_ref(self) -> None:
         body = self._create_setup_session("discord")
@@ -194,22 +268,48 @@ class ConnectorInstallationsApiTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn("onecli://users/user-installations/", response.json()["detail"])
+        self.assertIn("do not submit a credential ref", response.json()["detail"])
 
-    def test_complete_setup_session_requires_runtime_secret_for_direct_transport(self) -> None:
+    def test_complete_setup_session_rejects_runtime_secret_mirror(self) -> None:
         body = self._create_setup_session("telegram")
         installation_id = body["installation"]["id"]
 
         response = self.client.post(
             f"/integrations/connectors/installations/{installation_id}/complete",
             headers=self.owner_headers,
-            json={"metadata": {"bot_user_id": "telegram-bot", "bot_username": "agency_bot"}},
+            json={"runtime_secret_value": "telegram-token"},
         )
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn("runtime_secret_value", response.json()["detail"])
+        self.assertIn("do not submit a credential ref or secret", response.json()["detail"])
 
-    def test_complete_setup_session_projects_runtime_secret_for_direct_transport(self) -> None:
+    def test_complete_setup_session_rejects_expired_session(self) -> None:
+        body = self._create_setup_session("discord")
+        installation_id = body["installation"]["id"]
+        asyncio.run(
+            self.context.connector_installation_repo.update(
+                installation_id,
+                {"setup_expires_at": datetime.now(timezone.utc) - timedelta(seconds=1)},
+            )
+        )
+
+        # Use the real session guard while keeping the OneCLI transport mocked
+        # by the class-level verifier for every other API test.
+        async def verify_with_guard(service, installation):
+            service._require_live_setup_session(installation)
+            return "onecli://users/user-installations/secrets/never-used"
+
+        with patch.object(ConnectorInstallationService, "_verified_onecli_ref", new=verify_with_guard):
+            response = self.client.post(
+                f"/integrations/connectors/installations/{installation_id}/complete",
+                headers=self.owner_headers,
+                json={},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("expired", response.json()["detail"])
+
+    def test_complete_setup_session_projects_verified_onecli_ref_for_telegram(self) -> None:
         body = self._create_setup_session("telegram")
         installation_id = body["installation"]["id"]
 
@@ -218,7 +318,6 @@ class ConnectorInstallationsApiTests(unittest.TestCase):
             headers=self.owner_headers,
             json={
                 "metadata": {"bot_user_id": "telegram-bot", "bot_username": "agency_bot"},
-                "runtime_secret_value": "telegram-token",
             },
         )
 
@@ -232,9 +331,18 @@ class ConnectorInstallationsApiTests(unittest.TestCase):
         credential_response = self.client.get(f"/credentials/{installation_id}", headers=self.owner_headers)
         self.assertEqual(credential_response.status_code, 200, credential_response.text)
         credential = credential_response.json()
-        self.assertEqual(credential["secret_ref"], f"secret://agency/installations/{installation_id}")
+        self.assertNotIn("secret_ref", credential)
+        self.assertTrue(credential["secret_ref_configured"])
+        self.assertEqual(credential["secret_ref_scheme"], "onecli")
         self.assertEqual(credential["provider"], "telegram-bot")
         self.assertEqual(credential["owner_user_id"], "user-installations")
+        stored = asyncio.run(self.context.credential_repo.get(installation_id))
+        self.assertIsNotNone(stored)
+        assert stored is not None
+        self.assertEqual(
+            stored.secret_ref,
+            f"onecli://users/user-installations/secrets/verified-{installation_id.replace('-', '')[:12]}",
+        )
 
     def test_complete_setup_session_registers_telegram_webhook_automatically(self) -> None:
         body = self._create_setup_session("telegram")
@@ -265,27 +373,78 @@ class ConnectorInstallationsApiTests(unittest.TestCase):
         with patch(
             "app.services.connector_installations.get_settings",
             return_value=SimpleNamespace(agency_public_webhook_base_url="https://decline-busboy-flogging.ngrok-free.dev"),
+        ), patch(
+            "app.services.connector_installations.ConnectorService.onecli_proxy_kwargs_for_owner",
+            new=AsyncMock(return_value={"proxy": "http://onecli-gateway:8612"}),
         ), patch("app.services.connector_installations.httpx.AsyncClient", return_value=fake_client) as mock_client:
             complete_response = self.client.post(
                 f"/integrations/connectors/installations/{installation_id}/complete",
                 headers=self.owner_headers,
                 json={
                     "metadata": {"bot_user_id": "telegram-bot", "bot_username": "agency_bot"},
-                    "runtime_secret_value": "telegram-token",
                 },
             )
 
         self.assertEqual(complete_response.status_code, 200, complete_response.text)
         completed = complete_response.json()
-        mock_client.assert_called_once_with(timeout=10.0, trust_env=False)
+        mock_client.assert_called_once_with(timeout=10.0, proxy="http://onecli-gateway:8612")
         self.assertEqual(len(fake_client.calls), 1)
         url, data = fake_client.calls[0]
-        self.assertEqual(url, "https://api.telegram.org/bottelegram-token/setWebhook")
+        self.assertEqual(url, "https://api.telegram.org/botonecli-managed/setWebhook")
         self.assertEqual(
             data["url"],
             f"https://decline-busboy-flogging.ngrok-free.dev/integrations/conversations/adapters/telegram/webhook?credential_id={installation_id}",
         )
-        self.assertIn("webhook_secret_token", completed["metadata"])
+        self.assertIn("webhook_secret_token_sha256", completed["metadata"])
+        self.assertNotIn("webhook_secret_token", completed["metadata"])
+        self.assertIn("secret_token", data)
+        self.assertEqual(
+            hashlib.sha256(str(data["secret_token"]).encode("utf-8")).hexdigest(),
+            completed["metadata"]["webhook_secret_token_sha256"],
+        )
+
+    def test_failed_telegram_webhook_registration_does_not_activate_installation(self) -> None:
+        body = self._create_setup_session("telegram")
+        installation_id = body["installation"]["id"]
+
+        class FailedTelegramResponse:
+            status_code = 401
+            text = '{"ok": false}'
+
+            def json(self) -> dict[str, object]:
+                return {"ok": False, "description": "Unauthorized"}
+
+        class FailedTelegramClient:
+            async def __aenter__(self) -> "FailedTelegramClient":
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> bool:
+                return False
+
+            async def post(self, url: str, data: dict[str, object] | None = None):
+                return FailedTelegramResponse()
+
+        with patch(
+            "app.services.connector_installations.get_settings",
+            return_value=SimpleNamespace(agency_public_webhook_base_url="https://agency.example"),
+        ), patch(
+            "app.services.connector_installations.ConnectorService.onecli_proxy_kwargs_for_owner",
+            new=AsyncMock(return_value={"proxy": "http://onecli-gateway:8612"}),
+        ), patch(
+            "app.services.connector_installations.httpx.AsyncClient",
+            return_value=FailedTelegramClient(),
+        ):
+            response = self.client.post(
+                f"/integrations/connectors/installations/{installation_id}/complete",
+                headers=self.owner_headers,
+                json={"metadata": {"bot_user_id": "telegram-bot"}},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Unauthorized", response.json()["detail"])
+        stored = asyncio.run(self.context.connector_installation_repo.get(installation_id))
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.status, "setup_pending")
 
     def test_complete_setup_session_enforces_required_connector_metadata(self) -> None:
         body = self._create_setup_session("whatsapp")
@@ -296,7 +455,7 @@ class ConnectorInstallationsApiTests(unittest.TestCase):
             headers=self.owner_headers,
             json={},
         )
-        self.assertEqual(missing_metadata_response.status_code, 422)
+        self.assertEqual(missing_metadata_response.status_code, 400)
         self.assertIn("phone_number_id", str(missing_metadata_response.json()["detail"]))
 
         complete_response = self.client.post(
@@ -346,13 +505,15 @@ class ConnectorInstallationsApiTests(unittest.TestCase):
         with patch(
             "app.services.connector_installations.get_settings",
             return_value=SimpleNamespace(agency_public_webhook_base_url=""),
+        ), patch(
+            "app.services.connector_installations.ConnectorService.onecli_proxy_kwargs_for_owner",
+            new=AsyncMock(return_value={"proxy": "http://onecli-gateway:8612"}),
         ), patch("app.services.connector_installations.httpx.AsyncClient", return_value=fake_client):
             response = self.client.post(
                 f"/integrations/connectors/installations/{installation_id}/complete",
                 headers=self.owner_headers,
                 json={
                     "metadata": {"bot_user_id": "telegram-bot", "bot_username": "agency_bot"},
-                    "runtime_secret_value": "telegram-token",
                 },
             )
 
@@ -372,7 +533,6 @@ class ConnectorInstallationsApiTests(unittest.TestCase):
             headers=self.owner_headers,
             json={
                 "metadata": {"bot_user_id": "telegram-bot", "bot_username": "agency_bot"},
-                "runtime_secret_value": "telegram-token",
             },
         )
         self.assertEqual(complete_response.status_code, 200, complete_response.text)
@@ -412,6 +572,9 @@ class ConnectorInstallationsApiTests(unittest.TestCase):
         with patch(
             "app.services.connector_installations.get_settings",
             return_value=SimpleNamespace(agency_public_webhook_base_url=""),
+        ), patch(
+            "app.services.connector_installations.ConnectorService.onecli_proxy_kwargs_for_owner",
+            new=AsyncMock(return_value={"proxy": "http://onecli-gateway:8612"}),
         ), patch("app.services.connector_installations.httpx.AsyncClient", return_value=fake_client):
             result = asyncio.run(ConnectorInstallationService(self.context).reconcile_startup_integrations())
 
@@ -425,8 +588,16 @@ class ConnectorInstallationsApiTests(unittest.TestCase):
         )
 
     def test_revoke_marks_installation_revoked(self) -> None:
-        body = self._create_setup_session()
+        body = self._create_setup_session("discord")
         installation_id = body["installation"]["id"]
+        completed = self.client.post(
+            f"/integrations/connectors/installations/{installation_id}/complete",
+            headers=self.owner_headers,
+            json={},
+        )
+        self.assertEqual(completed.status_code, 200, completed.text)
+        active_credential = asyncio.run(self.context.credential_repo.get(installation_id))
+        self.assertEqual(active_credential.status.value, "active")
 
         response = self.client.delete(
             f"/integrations/connectors/installations/{installation_id}",
@@ -436,6 +607,9 @@ class ConnectorInstallationsApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "revoked")
         self.assertIsNotNone(response.json()["revoked_at"])
+        revoked_credential = asyncio.run(self.context.credential_repo.get(installation_id))
+        self.assertEqual(revoked_credential.status.value, "revoked")
+        self.assertIsNotNone(revoked_credential.revoked_at)
 
     def test_rotate_creates_rotation_setup_session_and_complete_marks_rotated(self) -> None:
         body = self._create_setup_session("discord")
@@ -456,7 +630,8 @@ class ConnectorInstallationsApiTests(unittest.TestCase):
         rotation = rotate_response.json()
         self.assertEqual(rotation["installation"]["id"], installation_id)
         self.assertEqual(rotation["installation"]["status"], "rotation_required")
-        self.assertIn("device_code=", rotation["setup_url"])
+        self.assertNotEqual(rotation["onecli_resource_name"], body["onecli_resource_name"])
+        self.assertIsNotNone(rotation["expires_at"])
 
         rotated_response = self.client.post(
             f"/integrations/connectors/installations/{installation_id}/complete",

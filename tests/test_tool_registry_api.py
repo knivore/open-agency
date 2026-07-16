@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import asyncio
+import tempfile
 import unittest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pathlib import Path
+from unittest.mock import Mock, patch
 
 from app.api.context import create_test_api_context
 from app.api.routes.tools import create_tools_router
-from app.domain import UserDefinition
+from app.domain import ToolDefinition, UserDefinition
+from app.runtime.native.errors import ToolExecutionError
+from app.tools.executors.base import ToolExecutionContext
+from app.tools.executors.python_function import PythonFunctionToolExecutor
+from app.tools.executors.shell_command import ShellCommandToolExecutor
 
 
 class ToolRegistryApiTests(unittest.TestCase):
@@ -21,8 +29,6 @@ class ToolRegistryApiTests(unittest.TestCase):
                 "x-agency-user-email": "tools@example.com",
             }
         )
-        import asyncio
-
         asyncio.run(
             self.context.user_repo.create(
                 UserDefinition(id="user-tools", email="tools@example.com", display_name="Tools User")
@@ -126,6 +132,57 @@ class ToolRegistryApiTests(unittest.TestCase):
         event_types = [item["event_type"] for item in body["events"]]
         self.assertIn("tool.call.started", event_types)
         self.assertIn("tool.call.completed", event_types)
+
+    def test_python_executor_rejects_omitted_function_allowlist_before_import(self):
+        payload = self._python_tool_payload(tool_id="tool-missing-function-allowlist")
+        payload["implementation"]["callable_name"] = "benign_name"
+        payload["security"]["function_allowlist"] = []
+        tool = ToolDefinition.model_validate(payload)
+        executor = PythonFunctionToolExecutor()
+        context = ToolExecutionContext(execution_id="execution-function-allowlist")
+        blocked_callable = Mock(return_value={"unexpected": True})
+
+        with patch("app.tools.executors.python_function.importlib.import_module") as import_module:
+            import_module.return_value = type("SyntheticModule", (), {"benign_name": blocked_callable})()
+            with self.assertRaisesRegex(ToolExecutionError, "missing a function allowlist"):
+                asyncio.run(executor.aexecute(tool, {}, context))
+
+        import_module.assert_not_called()
+        blocked_callable.assert_not_called()
+
+    def test_shell_executor_rejects_sensitive_cwd_before_subprocess(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sensitive_cwd = Path(tmp) / ".ssh"
+            sensitive_cwd.mkdir()
+            payload = self._python_tool_payload(tool_id="tool-sensitive-cwd")
+            payload["tool_type"] = "shell_command"
+            payload["implementation"] = {
+                "implementation_type": "shell_command",
+                "target": "cat id_rsa",
+                "config": {},
+            }
+            payload["security"].update(
+                {
+                    "requires_approval": True,
+                    "sandbox_required": True,
+                    "allow_shell": True,
+                    "allowed_paths": [tmp],
+                    "module_allowlist": [],
+                    "function_allowlist": [],
+                }
+            )
+            tool = ToolDefinition.model_validate(payload)
+            context = ToolExecutionContext(execution_id="execution-sensitive-cwd")
+
+            with patch("app.tools.executors.shell_command.subprocess.run") as run:
+                with self.assertRaisesRegex(ToolExecutionError, "reading SSH credentials is blocked"):
+                    ShellCommandToolExecutor().execute(
+                        tool,
+                        {"command": "cat id_rsa", "cwd": str(sensitive_cwd)},
+                        context,
+                    )
+
+            run.assert_not_called()
 
 
 if __name__ == "__main__":

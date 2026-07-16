@@ -60,6 +60,15 @@ class InMemoryConversationMessageRepository(InMemoryCatalogRepository[Conversati
         items = await self.list()
         return [item for item in items if item.conversation_id == conversation_id]
 
+    async def list_recent_by_conversation(
+            self,
+            conversation_id: str,
+            *,
+            limit: int,
+    ) -> list[ConversationMessage]:
+        items = await self.list_by_conversation(conversation_id)
+        return items[-limit:]
+
     async def find_by_external_message_id(
             self,
             conversation_id: str,

@@ -8,6 +8,8 @@ __pycache__/
 *.db
 .DS_Store
 .env
+.data/
+data/input/voices/
 alembic/versions/__pycache__/
 app/__pycache__/
 docs/archive/

@@ -69,6 +69,14 @@ def create_api_tokens_router(context: Optional[ApiContext] = None) -> APIRouter:
         raw_token = generate_token()
         token_hash = hash_token(raw_token)
         scopes = normalize_requested_scopes(payload)
+        caller_token = getattr(request.state, "authenticated_api_token", None)
+        if caller_token is not None and not set(scopes).issubset(set(caller_token.scopes)):
+            # Delegated tokens must never amplify their own authority by minting
+            # a replacement with broader scopes.
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="API tokens may only delegate scopes they already hold",
+            )
         try:
             definition = ApiTokenDefinition.model_validate(
                 {

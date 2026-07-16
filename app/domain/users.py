@@ -10,6 +10,9 @@ from uuid import uuid4
 from .credentials import DomainModel
 
 
+PROFILE_PREFERENCES_METADATA_KEY = "profile_preferences"
+
+
 class UserStatus(str, Enum):
     ACTIVE = "active"
     DISABLED = "disabled"
@@ -27,3 +30,25 @@ class UserDefinition(DomainModel):
     provider_subject: str | None = None
     provider_account_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+def apply_profile_preference_overrides(
+    existing: UserDefinition,
+    incoming: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep owner-managed profile and local sign-in fields authoritative during identity re-syncs."""
+    preferences = existing.metadata.get(PROFILE_PREFERENCES_METADATA_KEY)
+    if isinstance(preferences, dict):
+        preferred_name = preferences.get("display_name")
+        if isinstance(preferred_name, str) and preferred_name.strip():
+            incoming["display_name"] = preferred_name.strip()
+
+    local_auth = existing.metadata.get("local_auth")
+    if isinstance(local_auth, dict):
+        owner_email = local_auth.get("email")
+        if isinstance(owner_email, str) and owner_email.strip():
+            # A browser may synchronize stale identity claims immediately before
+            # credential-change sign-out; the locally verified email must win.
+            incoming["email"] = owner_email.strip().lower()
+            incoming["provider_account_id"] = owner_email.strip().lower()
+    return incoming

@@ -711,7 +711,6 @@ def _connector_payload(
         name: str | None = None,
         workflow_id: str | None = None,
         metadata_json: str | None = None,
-        runtime_secret_value: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     if name:
@@ -720,8 +719,6 @@ def _connector_payload(
         payload["workflow_id"] = workflow_id
     if metadata_json:
         payload["metadata"] = _parse_object_json(metadata_json, label="Connector metadata")
-    if runtime_secret_value:
-        payload["runtime_secret_value"] = runtime_secret_value
     return payload
 
 
@@ -797,7 +794,6 @@ async def _connector_complete(args) -> int:
             owner_user_id=args.owner_user_id,
             payload=_connector_payload(
                 metadata_json=args.metadata_json,
-                runtime_secret_value=args.runtime_secret_value,
             ),
         )
     except (ValidationError, ValueError) as exc:
@@ -824,7 +820,6 @@ async def _connector_rotate(args) -> int:
             owner_user_id=args.owner_user_id,
             payload=_connector_payload(
                 metadata_json=args.metadata_json,
-                runtime_secret_value=args.runtime_secret_value,
             ),
         )
     except (ValidationError, ValueError) as exc:
@@ -1409,15 +1404,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     connector_complete_parser = connector_subparsers.add_parser(
         "complete",
-        help="Mark a setup or rotation session complete after OneCLI returns a token-safe ref.",
+        help="Verify the session-specific OneCLI resource and activate the installation.",
     )
     connector_complete_parser.add_argument("installation_id", help="Connector installation id.")
     connector_complete_parser.add_argument("--owner-user-id", required=True, help="Agency owner user id.")
     connector_complete_parser.add_argument("--metadata-json", help="JSON object with non-secret connector metadata.")
-    connector_complete_parser.add_argument(
-        "--runtime-secret-value",
-        help="Raw runtime secret for direct transport connectors such as Telegram and direct Discord.",
-    )
     connector_complete_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
 
     connector_rotate_parser = connector_subparsers.add_parser(
@@ -1427,10 +1418,6 @@ def build_parser() -> argparse.ArgumentParser:
     connector_rotate_parser.add_argument("installation_id", help="Connector installation id.")
     connector_rotate_parser.add_argument("--owner-user-id", required=True, help="Agency owner user id.")
     connector_rotate_parser.add_argument("--metadata-json", help="JSON object with non-secret connector metadata.")
-    connector_rotate_parser.add_argument(
-        "--runtime-secret-value",
-        help="Raw runtime secret for direct transport connectors such as Telegram and direct Discord.",
-    )
     connector_rotate_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
 
     connector_revoke_parser = connector_subparsers.add_parser(

@@ -709,7 +709,10 @@ class Neo4jGraphReader:
             session_kwargs["database"] = self.config.database
         try:
             async with self.driver.session(**session_kwargs) as session:
-                result = await session.run(cypher, **params)
+                # Pass Cypher values through Neo4j's dedicated parameters map.
+                # Expanding them as kwargs collides when a query uses `$query`,
+                # because AsyncSession.run already names its first argument query.
+                result = await session.run(cypher, parameters=params)
                 return await _collect_records(result)
         except Exception as exc:
             raise Neo4jGraphReadError(str(exc)) from exc

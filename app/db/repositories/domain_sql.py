@@ -68,6 +68,7 @@ from app.domain import (
     UserDefinition,
     WorkflowDefinition,
 )
+from app.domain.users import apply_profile_preference_overrides
 
 T = TypeVar("T")
 logger = logging.getLogger(__name__)
@@ -335,6 +336,7 @@ class SQLToolRepository(SQLDomainRepositoryBase):
                 "implementation": orm.implementation_json,
                 "security": orm.security_json,
                 "mcp_exposure": orm.mcp_json,
+                "routing": orm.routing_json,
                 "framework_hints": {},
             }
         )
@@ -350,6 +352,7 @@ class SQLToolRepository(SQLDomainRepositoryBase):
             implementation_json=item.implementation.model_dump(mode="json"),
             security_json=item.security.model_dump(mode="json"),
             mcp_json=item.mcp_exposure.model_dump(mode="json"),
+            routing_json=item.routing.model_dump(mode="json") if item.routing is not None else None,
             enabled=True,
         )
 
@@ -378,6 +381,7 @@ class SQLToolRepository(SQLDomainRepositoryBase):
                         "implementation_json",
                         "security_json",
                         "mcp_json",
+                        "routing_json",
                 ):
                     setattr(entity, field, getattr(source, field))
             entity = await self._commit_and_refresh(session, entity)
@@ -694,6 +698,21 @@ class SQLConversationMessageRepository(SQLDomainRepositoryBase):
                 .order_by(ConversationMessageORM.created_at.asc(), ConversationMessageORM.id.asc())
             )
             return [self._to_domain(item) for item in result.scalars().all()]
+
+    async def list_recent_by_conversation(
+            self,
+            conversation_id: str,
+            *,
+            limit: int,
+    ) -> list[ConversationMessage]:
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(ConversationMessageORM)
+                .where(ConversationMessageORM.conversation_id == conversation_id)
+                .order_by(ConversationMessageORM.created_at.desc(), ConversationMessageORM.id.desc())
+                .limit(limit)
+            )
+            return [self._to_domain(item) for item in reversed(result.scalars().all())]
 
     async def find_by_external_message_id(
             self,
@@ -1613,6 +1632,8 @@ class SQLConnectorInstallationRepository(SQLDomainRepositoryBase):
                 "runtime_secret_encrypted": orm.runtime_secret_encrypted,
                 "status": orm.status,
                 "setup_session_id": orm.setup_session_id,
+                "setup_started_at": orm.setup_started_at,
+                "setup_expires_at": orm.setup_expires_at,
                 "last_rotated_at": orm.last_rotated_at,
                 "revoked_at": orm.revoked_at,
                 "metadata": orm.metadata_json or {},
@@ -1630,6 +1651,8 @@ class SQLConnectorInstallationRepository(SQLDomainRepositoryBase):
             runtime_secret_encrypted=item.runtime_secret_encrypted,
             status=item.status,
             setup_session_id=item.setup_session_id,
+            setup_started_at=item.setup_started_at,
+            setup_expires_at=item.setup_expires_at,
             last_rotated_at=item.last_rotated_at,
             revoked_at=item.revoked_at,
             metadata_json=item.metadata,
@@ -1660,6 +1683,8 @@ class SQLConnectorInstallationRepository(SQLDomainRepositoryBase):
                         "runtime_secret_encrypted",
                         "status",
                         "setup_session_id",
+                        "setup_started_at",
+                        "setup_expires_at",
                         "last_rotated_at",
                         "revoked_at",
                         "metadata_json",
@@ -2026,6 +2051,9 @@ class SQLUserRepository(SQLDomainRepositoryBase):
             return await self.create(item)
         merged = existing.model_dump(mode="json")
         incoming = item.model_dump(mode="json", exclude_none=True)
+        # Match the in-memory identity merge: account-scoped Profile choices
+        # must survive routine NextAuth identity synchronization.
+        incoming = apply_profile_preference_overrides(existing, incoming)
         if "roles" not in item.model_fields_set:
             incoming.pop("roles", None)
         if "metadata" in item.model_fields_set:

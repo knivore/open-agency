@@ -14,6 +14,10 @@ class ExecutionPausedError(NativeRuntimeError):
     """Raised when execution is paused."""
 
 
+class ExecutionApprovalSuspendedError(ExecutionPausedError):
+    """Raised after an approval checkpoint is durable so the worker can exit."""
+
+
 class ExecutionCancelledError(NativeRuntimeError):
     """Raised when execution is cancelled."""
 

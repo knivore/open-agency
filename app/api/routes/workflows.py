@@ -243,6 +243,10 @@ async def _ensure_owner_or_admin(
         return workflow
     if _has_explicit_owner(workflow):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Workflow owner access is required")
+    if get_settings().app_env != "test":
+        # Legacy ownerless rows must be assigned by an administrator or migration;
+        # the first ordinary reader must never acquire control implicitly.
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Workflow owner access is required")
     updated = await context.workflow_repo.update(workflow_id, {"metadata": _claimed_workflow_metadata(workflow, user)})
     if updated is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Workflow '{workflow_id}' not found")
@@ -504,6 +508,25 @@ def create_workflows_router(context: Optional[ApiContext] = None) -> APIRouter:
     router = APIRouter(prefix="/workflows", tags=["Workflows"])
     service = WorkflowService(context)
 
+    async def require_workflow_user(request: Request, *, scopes: list[str]) -> UserDefinition | None:
+        if get_settings().app_env == "test":
+            return await resolve_current_user_if_present(request, context, required_scopes=scopes)
+        return await resolve_current_user(request, context, required_scopes=scopes)
+
+    async def load_visible_workflow(
+            workflow_id: str,
+            request: Request,
+            *,
+            scopes: list[str],
+    ) -> tuple[WorkflowDefinition, UserDefinition | None]:
+        current_user = await require_workflow_user(request, scopes=scopes)
+        workflow = await context.workflow_repo.get(workflow_id)
+        if workflow is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Workflow '{workflow_id}' not found")
+        if current_user is not None:
+            _require_owner_or_admin(workflow, current_user)
+        return workflow, current_user
+
     @router.post("", summary="Create Workflow")
     async def create_workflow(payload: WorkflowDefinition, request: Request):
         current_user = await resolve_current_user(request, context, required_scopes=["workflows:write"])
@@ -513,8 +536,10 @@ def create_workflows_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @router.get("", summary="List Workflows")
     async def list_workflows(request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["workflows:read"])
+        current_user = await require_workflow_user(request, scopes=["workflows:read"])
         items = await context.workflow_repo.list()
+        if current_user is not None and "admin" not in current_user.roles:
+            items = [item for item in items if _is_owner_or_admin(item, current_user)]
         default_workflow_id = await service.main_agent_default_workflow_id()
         return {
             "items": [
@@ -716,10 +741,7 @@ def create_workflows_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @router.get("/{workflow_id}", summary="Get Workflow By Id")
     async def get_workflow(workflow_id: str, request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["workflows:read"])
-        item = await context.workflow_repo.get(workflow_id)
-        if item is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Workflow '{workflow_id}' not found")
+        item, _ = await load_visible_workflow(workflow_id, request, scopes=["workflows:read"])
         return _workflow_response_payload(
             item,
             context,
@@ -728,7 +750,7 @@ def create_workflows_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @router.get("/{workflow_id}/persona-version-notices", summary="List Workflow Persona Version Notices")
     async def list_workflow_persona_version_notices(workflow_id: str, request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["workflows:read", "personas:read"])
+        await load_visible_workflow(workflow_id, request, scopes=["workflows:read", "personas:read"])
         try:
             return await service.workflow_persona_version_notices(workflow_id)
         except WorkflowNotFoundError as exc:
@@ -802,7 +824,7 @@ def create_workflows_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @router.get("/{workflow_id}/versions", summary="List Workflow Versions")
     async def list_workflow_versions(workflow_id: str, request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["workflows:read"])
+        await load_visible_workflow(workflow_id, request, scopes=["workflows:read"])
         try:
             return await service.list_workflow_versions(workflow_id)
         except WorkflowNotFoundError as exc:
@@ -810,7 +832,7 @@ def create_workflows_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @router.get("/{workflow_id}/versions/{revision}", summary="Get Workflow Version")
     async def get_workflow_version(workflow_id: str, revision: int, request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["workflows:read"])
+        await load_visible_workflow(workflow_id, request, scopes=["workflows:read"])
         try:
             return await service.get_workflow_version(workflow_id, revision)
         except WorkflowNotFoundError as exc:
@@ -929,21 +951,18 @@ def create_workflows_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @router.post("/validate", summary="Validate Workflow")
     async def validate_workflow(payload: dict[str, Any] = Body(...), request: Request = None):
-        await resolve_current_user_if_present(request, context, required_scopes=["workflows:write"])
+        await require_workflow_user(request, scopes=["workflows:write"])
         workflow = _workflow_validate_payload(payload)
         return await service.validate_workflow(workflow)
 
     @router.get("/{workflow_id}/executions", summary="List Executions For Workflow")
     async def list_workflow_executions(workflow_id: str, request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["executions:read"])
+        await load_visible_workflow(workflow_id, request, scopes=["executions:read"])
         return await service.list_workflow_executions(workflow_id)
 
     @router.get("/{workflow_id}/monitoring", summary="Get Workflow Monitoring Operator Controls")
     async def get_workflow_monitoring(workflow_id: str, request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["workflows:read"])
-        workflow = await context.workflow_repo.get(workflow_id)
-        if workflow is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Workflow '{workflow_id}' not found")
+        workflow, _ = await load_visible_workflow(workflow_id, request, scopes=["workflows:read"])
         return service.monitoring_operator_payload(
             workflow,
             main_agent_default_workflow_id=await service.main_agent_default_workflow_id(),
@@ -963,10 +982,7 @@ def create_workflows_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @router.get("/{workflow_id}/runtime-governance", summary="Get Workflow Runtime Governance Controls")
     async def get_workflow_runtime_governance(workflow_id: str, request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["workflows:read"])
-        workflow = await context.workflow_repo.get(workflow_id)
-        if workflow is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Workflow '{workflow_id}' not found")
+        workflow, _ = await load_visible_workflow(workflow_id, request, scopes=["workflows:read"])
         return service.runtime_governance_operator_payload(workflow)
 
     @router.patch("/{workflow_id}/runtime-governance", summary="Update Workflow Runtime Governance Controls")
@@ -990,7 +1006,7 @@ def create_workflows_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @router.get("/{workflow_id}/monitoring/events", summary="List Workflow Monitor Findings And Proposals")
     async def list_workflow_monitoring_events(workflow_id: str, request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["executions:read"])
+        await load_visible_workflow(workflow_id, request, scopes=["executions:read"])
         try:
             return await service.workflow_monitoring_events(workflow_id)
         except WorkflowNotFoundError as exc:
@@ -1063,7 +1079,7 @@ def create_workflows_router(context: Optional[ApiContext] = None) -> APIRouter:
             request: Request,
             limit: int | None = Query(default=None, ge=1, le=100),
     ):
-        await resolve_current_user_if_present(request, context, required_scopes=["workflows:read"])
+        await load_visible_workflow(workflow_id, request, scopes=["workflows:read"])
         try:
             return await service.workflow_governance_review_queue(workflow_id, limit=limit)
         except WorkflowNotFoundError as exc:
@@ -1078,6 +1094,10 @@ def create_workflows_router(context: Optional[ApiContext] = None) -> APIRouter:
             limit: int | None = Query(default=None, ge=1, le=20),
     ):
         current_user = await resolve_current_user(request, context, required_scopes=["workflows:read"])
+        workflow = await context.workflow_repo.get(workflow_id)
+        if workflow is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Workflow '{workflow_id}' not found")
+        _require_owner_or_admin(workflow, current_user)
         try:
             return await service.suggest_workflow_governance_documents(
                 workflow_id,
@@ -1262,7 +1282,7 @@ def create_workflows_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @router.post("/{workflow_id}/stale-executions/repair", summary="Repair Stale Executions For Workflow")
     async def repair_stale_workflow_executions(workflow_id: str, request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["executions:write"])
+        await load_visible_workflow(workflow_id, request, scopes=["executions:write"])
         try:
             return await service.repair_stale_workflow_executions(workflow_id)
         except WorkflowNotFoundError as exc:

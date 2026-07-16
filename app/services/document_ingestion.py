@@ -38,6 +38,8 @@ from app.services.memory import MemoryService
 from app.services.persona_factory import DEFAULT_GOVERNANCE_LABELS, GOVERNANCE_ALLOWED_VALUES
 from app.services.source_intelligence import SOURCE_INTELLIGENCE_DOCUMENT_KINDS
 
+MAX_DOCUMENT_UPLOAD_BYTES = 10 * 1024 * 1024
+
 SUPPORTED_TEXT_EXTENSIONS = {".txt", ".md", ".markdown", ".csv", ".json", ".log", ".html", ".htm"}
 SUPPORTED_DOCUMENT_EXTENSIONS = {*SUPPORTED_TEXT_EXTENSIONS, ".pdf", ".docx"}
 DIRECT_CONTEXT_MAX_TOKENS = 24_000
@@ -476,7 +478,9 @@ class DocumentIngestionService:
             conversation_id=conversation_id,
             workflow_id=workflow_id,
         )
-        raw = await upload.read()
+        raw = await upload.read(MAX_DOCUMENT_UPLOAD_BYTES + 1)
+        if len(raw) > MAX_DOCUMENT_UPLOAD_BYTES:
+            raise DocumentIngestionError("Uploaded document exceeds the 10 MiB size limit.")
         if not raw:
             raise DocumentIngestionError("Uploaded document is empty.")
 

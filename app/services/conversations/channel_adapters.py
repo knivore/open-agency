@@ -49,6 +49,7 @@ class ChatChannelAdapter(ChatChannelTransportContract):
                 channel_user_id=approval.channel_user_id,
                 internal_user_id=None,
                 reason=approval.reason,
+                metadata=approval.metadata,
             )
             result["provider_outbound_messages"] = self.format_outbound_messages(
                 result.get("outbound_messages", []),
@@ -735,6 +736,9 @@ class SlackChannelAdapter(ChatChannelAdapter):
             channel_user_id=str(user.get("id") or ""),
             data=data if isinstance(data, str) else None,
             metadata={
+                "team_id": payload.get("team_id") or (
+                    payload.get("team", {}).get("id") if isinstance(payload.get("team"), dict) else None
+                ),
                 "channel_id": channel_id,
                 "thread_ts": container.get("message_ts") or payload.get("message_ts"),
             },

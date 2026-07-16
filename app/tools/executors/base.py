@@ -19,6 +19,9 @@ class ToolExecutionContext:
     approval_manager: ApprovalManager | None = None
     mcp_registry: MCPClientRegistry | None = None
     execution_store: Any | None = None
+    # System workflow tools such as Agency Graph need the application composition
+    # root; their target is a routing namespace, not a persisted workflow id.
+    api_tool_runtime_executor: Any | None = None
     # Connector-backed adapters use this binding to avoid ambiguous credential
     # selection when several instances of the same provider are configured.
     connector_binding: dict[str, Any] | None = None

@@ -29,7 +29,9 @@ class PythonFunctionToolExecutor:
         if module_name not in module_allowlist and not any(
                 module_name.startswith(f"{prefix}.") for prefix in module_allowlist):
             raise ToolExecutionError(f"Module '{module_name}' is not allowlisted for tool '{tool.id}'")
-        if function_allowlist and callable_name not in function_allowlist:
+        if not function_allowlist:
+            raise ToolExecutionError(f"Python tool '{tool.id}' is missing a function allowlist")
+        if callable_name not in function_allowlist:
             raise ToolExecutionError(f"Function '{callable_name}' is not allowlisted for tool '{tool.id}'")
 
         module = importlib.import_module(module_name)

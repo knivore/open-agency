@@ -80,6 +80,7 @@ class ExecutionORM(TimestampMixin, Base):
     events = relationship("ExecutionEventORM", back_populates="execution", cascade="all, delete-orphan")
     artifacts = relationship("ExecutionArtifactORM", back_populates="execution", cascade="all, delete-orphan")
     approval_requests = relationship("ApprovalRequestORM", back_populates="execution", cascade="all, delete-orphan")
+    waits = relationship("ExecutionWaitORM", back_populates="execution", cascade="all, delete-orphan")
     tool_invocations = relationship("ToolInvocationORM", back_populates="execution", cascade="all, delete-orphan")
 
 
@@ -147,6 +148,37 @@ class ApprovalRequestORM(Base):
 
     execution = relationship("ExecutionORM", back_populates="approval_requests")
     event = relationship("ExecutionEventORM", back_populates="approval_requests")
+
+
+class ExecutionWaitORM(TimestampMixin, Base):
+    __tablename__ = "execution_waits"
+    __table_args__ = (
+        UniqueConstraint("execution_id", "idempotency_key", name="uq_execution_waits_execution_id_idempotency_key"),
+        UniqueConstraint("execution_id", "active_slot", name="uq_execution_waits_execution_id_active_slot"),
+        Index("ix_execution_waits_execution_id_status", "execution_id", "status"),
+        Index("ix_execution_waits_status_wake_at", "status", "wake_at"),
+        Index("ix_execution_waits_correlation_key", "correlation_key"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    execution_id: Mapped[str] = mapped_column(ForeignKey("executions.id", ondelete="CASCADE"), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    active_slot: Mapped[str | None] = mapped_column(String(16), nullable=True, default="active")
+    correlation_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    checkpoint_json: Mapped[dict] = mapped_column(JSON_VARIANT, default=dict)
+    request_payload_json: Mapped[dict] = mapped_column(JSON_VARIANT, default=dict)
+    policy_json: Mapped[dict] = mapped_column(JSON_VARIANT, default=dict)
+    resolution_payload_json: Mapped[dict | None] = mapped_column(JSON_VARIANT, nullable=True)
+    resolution_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    wake_at: Mapped[object | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deadline_at: Mapped[object | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_at: Mapped[object | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON_VARIANT, default=dict)
+
+    execution = relationship("ExecutionORM", back_populates="waits")
 
 
 class ToolInvocationORM(Base):

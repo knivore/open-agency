@@ -112,6 +112,7 @@ Current platform tables:
 - `goals`
 - `runtime_revisions`
 - `executions`
+- `execution_waits`
 - `execution_events`
 - `execution_artifacts`
 - `schedules`
@@ -139,6 +140,7 @@ Key relational links:
 - `executions.goal_id -> goals.id`
 - `executions.workflow_version_id -> workflow_versions.id`
 - `executions.runtime_revision_id -> runtime_revisions.id`
+- `execution_waits.execution_id -> executions.id`
 - `execution_events.execution_id -> executions.id`
 - `execution_artifacts.execution_id -> executions.id`
 - `execution_artifacts.event_id -> execution_events.id`
@@ -154,9 +156,20 @@ Important integrity rules include:
 
 - indexed goal status, owner, parent, and updated-at lookups for supervisor scans
 - indexed execution status, workflow, and created-at lookups
+- indexed execution-wait status/wake-time and event-correlation lookups
 - indexed schedule enablement and next-fire timestamps
 - indexed tool and workflow enablement
 - unique `(execution_id, sequence)` on execution events
+- unique `(execution_id, idempotency_key)` on execution waits
+- at most one pending wait per execution, enforced by unique `(execution_id, active_slot)` where pending rows use the
+  `active` slot and terminal rows clear it
+
+`execution_waits` is the durable lifecycle ledger for workflow suspension. It records input, approval, event, and sleep
+waits independently from process-local workers, including their checkpoint, request data, wake/deadline timestamps,
+correlation key, resolution payload, and resolving actor. Execution status remains the efficient current-state view;
+the wait ledger and ordered execution events preserve the auditable transition history. Persistent monitor workflows
+reuse sleep rows for cycle timers; cycle counters and bounded outcome history remain in `executions.metadata_json` rather
+than introducing a separate cycle table.
 
 ## Memory Storage
 

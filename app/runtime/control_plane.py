@@ -14,8 +14,8 @@ from typing import Any, Optional
 from uuid import uuid4
 
 from app.core.config import get_settings
-from app.core.time import ensure_utc, utc_now
-from app.domain import ExecutionEventType
+from app.core.time import utc_now
+from app.domain import ExecutionEventType, ExecutionStatus, ExecutionWaitKind, ExecutionWaitStatus
 from app.runtime.containers import ContainerRuntimeError, RuntimeContainerSpec
 from app.runtime.execution_lifecycle import resolve_execution_runtime_policy
 from app.runtime.lifecycle import RuntimeLifecycleEventEmitter, RuntimeContainerState
@@ -24,9 +24,28 @@ from app.runtime.native.errors import ExecutionNotFoundError
 from app.runtime.native.events import ExecutionEventEmitter
 from app.runtime.native.state import NativeExecutionState
 from app.runtime.registry import EXECUTION_HOST_DOCKER, EXECUTION_HOST_LOCAL, RuntimeAdapterRegistry
+from app.services.execution_classification import classify_execution_staleness
 
-ACTIVE_REPLACEMENT_STATUSES = {"queued", "running", "waiting_for_approval", "paused", "cancelling"}
-STALE_REPAIR_STATUSES = {"queued", "running", "paused", "cancelling"}
+ACTIVE_REPLACEMENT_STATUSES = {
+    "queued",
+    "running",
+    "waiting_for_input",
+    "waiting_for_approval",
+    "waiting_for_event",
+    "sleeping",
+    "paused",
+    "cancelling",
+}
+STALE_REPAIR_STATUSES = {
+    "queued",
+    "running",
+    "waiting_for_input",
+    "waiting_for_approval",
+    "waiting_for_event",
+    "sleeping",
+    "paused",
+    "cancelling",
+}
 LIVE_CONTAINER_STATUSES = {"created", "running", "restarting", "paused"}
 EXITED_CONTAINER_STATUSES = {"exited", "dead"}
 TERMINAL_EXECUTION_STATUSES = {"completed", "failed", "cancelled"}
@@ -42,6 +61,15 @@ DIRECT_EXTERNAL_CREDENTIAL_ENV_NAMES = frozenset(
         "LOCAL_OPENAI_API_KEY",
     }
 )
+
+
+def _reject_terminal_execution_replay(execution) -> None:
+    if execution.status.value in TERMINAL_EXECUTION_STATUSES:
+        # Retrying under a new identity preserves the terminal audit record and
+        # prevents non-idempotent workflow effects from replaying in place.
+        raise ValueError(
+            f"Execution '{execution.id}' is terminal and must be retried through a replacement execution."
+        )
 
 
 def onecli_worker_environment(settings) -> dict[str, str]:
@@ -213,6 +241,8 @@ class ExecutionControlPlane:
         execution = await self.execution_store.get_execution(execution_id)
         if execution is None:
             raise ExecutionNotFoundError(f"Execution '{execution_id}' was not found")
+        _reject_terminal_execution_replay(execution)
+        await self._reject_unresolved_wait(execution_id)
         execution.status = execution.status.__class__.QUEUED
         await self.execution_store.update_execution(execution)
         if execution_id not in self._tasks or self._tasks[execution_id].done():
@@ -281,22 +311,59 @@ class ExecutionControlPlane:
             await self.execution_store.heartbeat(execution_id, worker_id)
 
     def _execution_host_for(self, execution) -> str:
+        if self.execution_isolation_enabled:
+            # Isolation is an operator security boundary, not a per-execution
+            # preference. Request/workflow metadata may request Docker when the
+            # default is local, but can never downgrade an enabled boundary.
+            return EXECUTION_HOST_DOCKER
         metadata = execution.metadata if isinstance(execution.metadata, dict) else {}
         requested_host = metadata.get("execution_host")
         if isinstance(requested_host, str):
             normalized_host = requested_host.strip().lower()
             if normalized_host in {EXECUTION_HOST_LOCAL, EXECUTION_HOST_DOCKER}:
                 return normalized_host
-        return EXECUTION_HOST_DOCKER if self.execution_isolation_enabled else EXECUTION_HOST_LOCAL
+        return EXECUTION_HOST_LOCAL
 
     async def pause(self, execution_id: str):
+        execution = await self.execution_store.get_execution(execution_id)
+        if execution is None:
+            raise ExecutionNotFoundError(f"Execution '{execution_id}' was not found")
+        if execution.status == ExecutionStatus.SLEEPING:
+            await self._close_pending_waits(
+                execution,
+                reason="operator_pause",
+                kinds={ExecutionWaitKind.SLEEP},
+                set_paused=True,
+            )
         return await self.runtime_registry.pause_execution(execution_id)
 
     async def resume(self, execution_id: str):
+        execution = await self.execution_store.get_execution(execution_id)
+        if execution is None:
+            raise ExecutionNotFoundError(f"Execution '{execution_id}' was not found")
+        _reject_terminal_execution_replay(execution)
+        await self._reject_unresolved_wait(execution_id)
         execution = await self.runtime_registry.resume_execution(execution_id)
         if execution.status.value in {"running", "queued"}:
             await self.queue_start(execution_id)
         return execution
+
+    async def _reject_unresolved_wait(self, execution_id: str) -> None:
+        if not hasattr(self.execution_store, "list_execution_waits"):
+            return
+        pending = await self.execution_store.list_execution_waits(
+            execution_id,
+            status=ExecutionWaitStatus.PENDING,
+        )
+        if pending:
+            wait = pending[0]
+            # Wake resolution atomically claims the continuation before it
+            # reaches this control-plane boundary. Generic lifecycle commands
+            # must not create a second path around that claim.
+            raise ValueError(
+                f"Execution '{execution_id}' has unresolved {wait.kind.value} wait '{wait.id}'. "
+                "Resolve the wait before starting or resuming the execution."
+            )
 
     async def cancel(self, execution_id: str):
         execution = await self.execution_store.get_execution(execution_id)
@@ -304,6 +371,8 @@ class ExecutionControlPlane:
             raise ExecutionNotFoundError(f"Execution '{execution_id}' was not found")
         if execution.status.value in TERMINAL_EXECUTION_STATUSES or execution.status.value == "cancelling":
             return execution
+        await self._close_pending_waits(execution, reason="operator_cancel")
+        execution = await self.execution_store.get_execution(execution_id) or execution
         preservation = await self._partial_result_preservation_snapshot(execution, reason="cancel_requested")
         if preservation:
             metadata = dict(execution.metadata or {})
@@ -319,11 +388,154 @@ class ExecutionControlPlane:
             cancelled = await self.execution_store.update_execution(cancelled)
         return cancelled
 
+    async def _close_pending_waits(
+            self,
+            execution,
+            *,
+            reason: str,
+            kinds: set[ExecutionWaitKind] | None = None,
+            set_paused: bool = False,
+    ) -> None:
+        if not hasattr(self.execution_store, "list_execution_waits"):
+            return
+        pending = await self.execution_store.list_execution_waits(
+            execution.id,
+            status=ExecutionWaitStatus.PENDING,
+        )
+        closed = []
+        for wait in pending:
+            if kinds is not None and wait.kind not in kinds:
+                continue
+            resolved, claimed = await self.execution_store.resolve_execution_wait(
+                wait.id,
+                status=ExecutionWaitStatus.CANCELLED,
+                resolution_key=f"{reason}:{wait.id}"[:255],
+                resolution_payload={"reason": reason},
+                resolved_by="execution_control_plane",
+            )
+            if claimed and resolved is not None:
+                closed.append(resolved)
+        if not closed:
+            return
+
+        metadata = dict(execution.metadata or {})
+        active_wait = metadata.get("active_wait")
+        closed_ids = {wait.id for wait in closed}
+        if isinstance(active_wait, dict) and active_wait.get("wait_id") in closed_ids:
+            metadata.pop("active_wait", None)
+        metadata["last_resolved_wait"] = {
+            "wait_id": closed[-1].id,
+            "kind": closed[-1].kind.value,
+            "status": closed[-1].status.value,
+            "resolution_key": closed[-1].resolution_key,
+            "resolved_at": closed[-1].resolved_at.isoformat() if closed[-1].resolved_at else None,
+        }
+        execution.metadata = metadata
+        if set_paused:
+            execution.status = ExecutionStatus.PAUSED
+        await self.execution_store.update_execution(execution)
+
     async def approve(self, execution_id: str, tool_id: str, reason: str | None = None) -> bool:
-        return await self.approval_manager.approve(execution_id=execution_id, tool_id=tool_id, reason=reason)
+        approved = await self.approval_manager.approve(
+            execution_id=execution_id,
+            tool_id=tool_id,
+            reason=reason,
+        )
+        if approved:
+            await self._wake_after_approval_decision(execution_id)
+        return approved
 
     async def reject(self, execution_id: str, tool_id: str, reason: str | None = None) -> bool:
-        return await self.approval_manager.reject(execution_id=execution_id, tool_id=tool_id, reason=reason)
+        rejected = await self.approval_manager.reject(
+            execution_id=execution_id,
+            tool_id=tool_id,
+            reason=reason,
+        )
+        if rejected:
+            await self._wake_after_approval_decision(execution_id)
+        return rejected
+
+    async def _wake_after_approval_decision(self, execution_id: str) -> None:
+        """Claim the durable continuation after the approval row is resolved."""
+        execution = await self.execution_store.get_execution(execution_id)
+        if execution is None:
+            return
+        active_wait = (execution.metadata or {}).get("active_wait")
+        wait_id = active_wait.get("wait_id") if isinstance(active_wait, dict) else None
+        if not isinstance(wait_id, str) or not hasattr(self.execution_store, "get_execution_wait"):
+            return
+        wait = await self.execution_store.get_execution_wait(wait_id)
+        if wait is None or wait.kind != ExecutionWaitKind.APPROVAL:
+            return
+        if wait.status == ExecutionWaitStatus.PENDING:
+            return
+
+        # A very fast approval can arrive before the suspending coroutine has
+        # released its lock. Wait for that local owner before queueing resume.
+        owner_task = self._tasks.get(execution_id)
+        if owner_task is not None and owner_task is not asyncio.current_task() and not owner_task.done():
+            await owner_task
+
+        execution = await self.execution_store.get_execution(execution_id)
+        if execution is None:
+            return
+        metadata = dict(execution.metadata or {})
+        active_wait = metadata.get("active_wait")
+        if not isinstance(active_wait, dict) or active_wait.get("wait_id") != wait_id:
+            return
+        metadata.pop("active_wait", None)
+        metadata["last_resolved_wait"] = {
+            "wait_id": wait.id,
+            "kind": wait.kind.value,
+            "status": wait.status.value,
+            "resolution_key": wait.resolution_key,
+            "resolved_at": wait.resolved_at.isoformat() if wait.resolved_at else None,
+        }
+        execution.metadata = metadata
+        wait_resolutions = dict((execution.input_payload or {}).get("wait_resolutions") or {})
+        wait_resolutions[wait.id] = {
+            "kind": wait.kind.value,
+            "status": wait.status.value,
+            "payload": dict(wait.resolution_payload or {}),
+            "resolved_at": wait.resolved_at.isoformat() if wait.resolved_at else None,
+        }
+        execution.input_payload = {**(execution.input_payload or {}), "wait_resolutions": wait_resolutions}
+        execution.status = ExecutionStatus.PAUSED
+        await self.execution_store.update_execution(execution)
+
+        state = NativeExecutionState(execution_id=execution.id, workflow_id=execution.workflow_id)
+        events = await self.execution_store.list_events(execution.id)
+        if events:
+            state.sequence = events[-1].sequence
+            state.last_event_id = events[-1].id
+            state.trace_id = events[-1].trace_id or state.trace_id
+        await self.emitter.emit(
+            state,
+            ExecutionEventType.EXECUTION_WOKEN,
+            payload={
+                "wait_id": wait.id,
+                "kind": wait.kind.value,
+                "status": wait.status.value,
+                "resolution_key": wait.resolution_key,
+                "resume_requested": True,
+            },
+        )
+        await self._wait_for_approval_worker_release(execution.id)
+        await self.resume(execution.id)
+
+    async def _wait_for_approval_worker_release(self, execution_id: str) -> None:
+        """Wait until the suspending worker releases its lock or becomes stale."""
+        deadline = asyncio.get_running_loop().time() + max(1.0, float(self.stale_after_seconds) + 1.0)
+        while asyncio.get_running_loop().time() < deadline:
+            execution = await self.execution_store.get_execution(execution_id)
+            if execution is None or execution.worker_id is None:
+                return
+            heartbeat = execution.last_heartbeat_at
+            if heartbeat is None or (utc_now() - heartbeat).total_seconds() > self.stale_after_seconds:
+                # queue_start can safely take over a stale lock using the same
+                # ownership rule as ordinary execution recovery.
+                return
+            await asyncio.sleep(0.05)
 
     async def heartbeat(self, execution_id: str):
         return await self.execution_store.heartbeat(execution_id, self.worker_id)
@@ -352,7 +564,19 @@ class ExecutionControlPlane:
                 continue
             previous_status = execution.status.value
             completed_checkpoint = await self._has_completed_workflow_checkpoint(execution)
-            if completed_checkpoint and previous_status != "cancelling":
+            if previous_status == "waiting_for_approval":
+                # The suspended Python continuation cannot be reconstructed after
+                # its worker dies. Failing is safer than requeueing and possibly
+                # repeating side effects that occurred before the approval point.
+                repair_action = "failed_abandoned_approval"
+                execution.status = execution.status.__class__.FAILED
+                execution.completed_at = execution.completed_at or utc_now()
+                execution.error = (
+                    "Approval wait was abandoned because the execution worker stopped heartbeating. "
+                    "Resume from a safe checkpoint or start a replacement execution."
+                )
+                event_type = ExecutionEventType.EXECUTION_FAILED
+            elif completed_checkpoint and previous_status != "cancelling":
                 repair_action = "marked_completed"
                 execution.status = execution.status.__class__.COMPLETED
                 execution.completed_at = execution.completed_at or utc_now()
@@ -376,15 +600,23 @@ class ExecutionControlPlane:
                 )
             state = await self._event_state_for(execution.id, execution.workflow_id)
             container_repair = None
-            if repair_action in {"requeued", "marked_completed"}:
+            if repair_action in {"requeued", "marked_completed", "failed_abandoned_approval"}:
                 container_repair = await self._cleanup_stale_execution_container(
                     execution,
                     state=state,
                     reason=f"stale_execution_{repair_action}",
                 )
+            expired_approvals = []
+            if repair_action == "failed_abandoned_approval":
+                expired_approvals = await self._expire_pending_execution_approvals(
+                    execution,
+                    reason=execution.error or "Approval worker stopped heartbeating.",
+                )
             execution.worker_id = None
             execution.last_heartbeat_at = None
             metadata = dict(execution.metadata or {})
+            if repair_action == "failed_abandoned_approval":
+                metadata.pop("pending_approval", None)
             if preservation:
                 metadata["partial_result_preservation"] = preservation
             stale_repair = {
@@ -396,6 +628,8 @@ class ExecutionControlPlane:
             }
             if container_repair:
                 stale_repair["container_repair"] = container_repair
+            if expired_approvals:
+                stale_repair["expired_approval_request_ids"] = expired_approvals
             metadata["stale_repair"] = stale_repair
             execution.metadata = metadata
             execution.updated_at = utc_now()
@@ -413,6 +647,7 @@ class ExecutionControlPlane:
                     **({"output": execution.output_payload} if repair_action == "marked_completed" else {}),
                     **({"partial_result_preservation": preservation} if preservation else {}),
                     **({"container_repair": container_repair} if container_repair else {}),
+                    **({"expired_approval_request_ids": expired_approvals} if expired_approvals else {}),
                 },
             )
             if self.runtime_operations is not None:
@@ -437,6 +672,33 @@ class ExecutionControlPlane:
                 }
             )
         return recovered
+
+    async def _expire_pending_execution_approvals(self, execution, *, reason: str) -> list[str]:
+        """Make abandoned approval rows non-actionable when their owning continuation is gone."""
+        if not all(
+                hasattr(self.execution_store, method)
+                for method in ("list_approval_requests", "resolve_pending_approval_request")
+        ):
+            return []
+        requests = await self.execution_store.list_approval_requests(execution.id)
+        expired_ids: list[str] = []
+        for request in requests:
+            if request.get("status") != "pending" or not request.get("tool_id"):
+                continue
+            expired = await self.execution_store.resolve_pending_approval_request(
+                execution_id=execution.id,
+                tool_id=str(request["tool_id"]),
+                status="expired",
+                response_payload={
+                    "granted": False,
+                    "reason": reason,
+                    "metadata": {"mode": "runtime_reconciler", "cause": "worker_unresponsive"},
+                },
+                responded_by="runtime_reconciler",
+            )
+            if expired is not None:
+                expired_ids.append(str(expired["id"]))
+        return expired_ids
 
     async def _has_completed_workflow_checkpoint(self, execution) -> bool:
         output_payload = execution.output_payload
@@ -494,24 +756,13 @@ class ExecutionControlPlane:
         return terminal_node_ids.issubset(completed_node_ids)
 
     def _classify_stale_execution(self, execution) -> dict[str, object]:
-        reference = execution.last_heartbeat_at or execution.updated_at or execution.started_at or execution.created_at
-        reference_at = ensure_utc(reference)
-        age_seconds = max(0, int((utc_now() - reference_at).total_seconds()))
-        is_stale = age_seconds > self.stale_after_seconds
-        reason = None
-        if is_stale:
-            reason = (
-                f"Execution has status '{execution.status.value}' with no recent heartbeat or update for "
-                f"{age_seconds} seconds."
-            )
-        return {
-            "is_stale": is_stale,
-            "status": execution.status.value,
-            "reference_at": reference_at.isoformat(),
-            "age_seconds": age_seconds,
-            "stale_after_seconds": self.stale_after_seconds,
-            "reason": reason,
-        }
+        # Repair and supervision must agree about intentional waits. A separate
+        # timestamp-only check can otherwise restart paused work or consume a
+        # durable continuation before its wake condition is satisfied.
+        return classify_execution_staleness(
+            execution,
+            stale_after_seconds=self.stale_after_seconds,
+        )
 
     async def _cleanup_stale_execution_container(
             self,

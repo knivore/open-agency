@@ -17,6 +17,7 @@ from app.services.agent_tools import (
     SYSTEM_EXECUTION_LIST_TOOL_ID,
     SYSTEM_EXECUTION_TOOL_TARGET,
     SYSTEM_GRAPH_TOOL_TARGET,
+    SYSTEM_GRAPH_CONTEXT_TOOL_ID,
     SYSTEM_GRAPH_WORKING_SET_ADD_TOOL_ID,
     SYSTEM_GRAPH_WORKING_SET_CLEAR_TOOL_ID,
     SYSTEM_GRAPH_WORKING_SET_CREATE_TOOL_ID,
@@ -40,6 +41,8 @@ _GRAPH_WORKING_SET_TOOL_IDS = {
     SYSTEM_GRAPH_WORKING_SET_CLEAR_TOOL_ID,
     SYSTEM_GRAPH_WORKING_SET_PERSIST_CONTEXT_PACK_TOOL_ID,
 }
+
+_SYSTEM_TOOL_TARGET_PREFIX = "agency.system."
 
 
 class WorkflowToolExecutor:
@@ -65,6 +68,10 @@ class WorkflowToolExecutor:
             return await self._execute_system_workflow_tool(tool, arguments, context)
         if tool.implementation.target == SYSTEM_GRAPH_TOOL_TARGET and tool.id in _GRAPH_WORKING_SET_TOOL_IDS:
             return await self._execute_graph_working_set_tool(tool, arguments, context)
+        if tool.implementation.target.startswith(_SYSTEM_TOOL_TARGET_PREFIX):
+            # System targets are routing namespaces owned by ToolRuntimeExecutor,
+            # not persisted workflow IDs that the runtime registry can resolve.
+            return await self._execute_api_system_tool(tool, arguments, context)
         if context.runtime_registry is None:
             raise ToolExecutionError(f"Workflow tool '{tool.id}' cannot execute without a runtime registry")
         workflow_id = arguments.get("workflow_id") or tool.implementation.config.get(
@@ -81,6 +88,42 @@ class WorkflowToolExecutor:
             "output": result.output_payload,
             "error": result.error,
         }
+
+    async def _execute_api_system_tool(
+            self,
+            tool: ToolDefinition,
+            arguments: dict[str, object],
+            context: ToolExecutionContext,
+    ) -> dict[str, object]:
+        executor = context.api_tool_runtime_executor
+        if executor is None:
+            raise ToolExecutionError(
+                f"System tool '{tool.id}' cannot execute without an API tool runtime"
+            )
+
+        payload = dict(arguments)
+        if tool.id == SYSTEM_GRAPH_CONTEXT_TOOL_ID:
+            # Preserve the active execution as implicit graph provenance without
+            # overwriting an explicit user or agent scope.
+            provided_scope = payload.get("scope")
+            scope = dict(provided_scope) if isinstance(provided_scope, dict) else {}
+            provided_runtime_context = scope.get("runtime_context")
+            runtime_context = (
+                dict(provided_runtime_context) if isinstance(provided_runtime_context, dict) else {}
+            )
+            for key, value in context.safe_metadata().items():
+                if value is not None:
+                    runtime_context.setdefault(key, value)
+            scope["runtime_context"] = runtime_context
+            payload["scope"] = scope
+
+        response = await executor.run_async(tool.id, payload, actor=None)
+        result = getattr(response, "result", None)
+        if not isinstance(result, dict):
+            errors = getattr(response, "errors", None)
+            detail = "; ".join(str(item) for item in errors) if isinstance(errors, list) else ""
+            raise ToolExecutionError(detail or f"System tool '{tool.id}' returned no result")
+        return result
 
     async def _execute_graph_working_set_tool(
             self,

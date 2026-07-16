@@ -53,6 +53,12 @@ class WorkflowValidationService:
         warnings: List[ValidationIssue] = []
 
         node_ids = {node.id for node in workflow.nodes}
+        task_ids = {task.id for task in workflow.task_definitions}
+        executable_task_ids = {
+            node.task_id
+            for node in workflow.nodes
+            if node.node_type in {"task", "approval"} and node.task_id
+        }
         if workflow.entrypoint not in node_ids:
             errors.append(ValidationIssue(code="entrypoint.missing", message="Entrypoint node does not exist",
                                           field="entrypoint"))
@@ -87,6 +93,14 @@ class WorkflowValidationService:
                     )
 
         for node in workflow.nodes:
+            if node.node_type in {"task", "approval"} and node.task_id not in task_ids:
+                errors.append(
+                    ValidationIssue(
+                        code="node.task.missing",
+                        message=f"Node '{node.name}' references a missing task",
+                        node_id=node.id,
+                    )
+                )
             if node.agent_id and node.agent_id not in available_agent_ids:
                 errors.append(
                     ValidationIssue(code="node.agent.missing", message=f"Node '{node.name}' references a missing agent",
@@ -118,6 +132,24 @@ class WorkflowValidationService:
                 if tool_id not in available_tool_ids:
                     errors.append(ValidationIssue(code="task.tool.missing",
                                                   message=f"Task '{task.name}' references a missing tool"))
+            for dependency_id in task.depends_on_task_ids:
+                if dependency_id not in task_ids:
+                    errors.append(
+                        ValidationIssue(
+                            code="task.dependency.missing",
+                            message=f"Task '{task.name}' references missing dependency '{dependency_id}'",
+                        )
+                    )
+                elif dependency_id not in executable_task_ids:
+                    errors.append(
+                        ValidationIssue(
+                            code="task.dependency.not_executable",
+                            message=(
+                                f"Task '{task.name}' depends on '{dependency_id}', but no task or approval node "
+                                "executes that dependency."
+                            ),
+                        )
+                    )
 
         referenced_tool_ids: Set[str] = set()
         for node in workflow.nodes:
@@ -141,10 +173,14 @@ class WorkflowValidationService:
             if not tool.input_schema:
                 errors.append(ValidationIssue(code="tool.input_schema.missing",
                                               message=f"Tool '{tool.name}' is missing input_schema"))
+            # Allowlisted read-only filesystem adapters such as agency.repo.inspect
+            # do not need human approval. They still declare sandbox_required so the
+            # runtime can enforce the privileged filesystem boundary.
             dangerous = any([
+                tool.security.dangerous,
                 tool.security.allow_shell,
                 tool.security.allow_browser,
-                tool.security.allow_filesystem,
+                tool.security.allow_filesystem and not tool.security.read_only,
                 tool.security.allow_network,
             ])
             if dangerous and not (tool.security.sandbox_required or tool.security.approval_required):
@@ -293,6 +329,8 @@ class WorkflowValidationService:
         return None
 
     def _is_connector_backed_tool(self, tool: ToolDefinition) -> bool:
+        if tool.id == "agency.media.send":
+            return True
         tags = {tag.strip().lower() for tag in tool.tags if isinstance(tag, str)}
         if tool.implementation.target == "agency.system.connector" or "system" in tags:
             return False

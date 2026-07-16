@@ -153,6 +153,8 @@ class ApiTokensApiTests(unittest.TestCase):
         payload = response.json()
         scope_ids = {item["id"] for item in payload["items"]}
         self.assertIn("agents:write", scope_ids)
+        self.assertIn("conversations:read", scope_ids)
+        self.assertIn("conversations:write", scope_ids)
         self.assertIn("workflows:run", scope_ids)
         self.assertNotIn("profile:read", scope_ids)
 
@@ -180,6 +182,25 @@ class ApiTokensApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 422)
         self.assertIn("invalidScopes", response.json()["detail"])
+
+    def test_api_token_cannot_mint_broader_scopes(self) -> None:
+        raw_token = self._create_bearer_token(scopes=["workflows:read"], name="Delegator")
+        bearer_headers = {"authorization": f"Bearer {raw_token}"}
+
+        allowed = self.client.post(
+            "/api-tokens",
+            headers=bearer_headers,
+            json={"name": "Read-only child", "scopes": ["workflows:read"]},
+        )
+        self.assertEqual(allowed.status_code, 200)
+
+        escalated = self.client.post(
+            "/api-tokens",
+            headers=bearer_headers,
+            json={"name": "Escalated child", "scopes": ["workflows:write"]},
+        )
+        self.assertEqual(escalated.status_code, 403)
+        self.assertIn("only delegate", escalated.json()["detail"])
 
     def test_api_tokens_require_current_user(self) -> None:
         response = self.client.get("/api-tokens")

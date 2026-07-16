@@ -89,6 +89,17 @@ class ConnectorService:
             }
         return context
 
+    async def onecli_proxy_kwargs_for_owner(self, owner_user_id: str) -> dict[str, Any]:
+        """Build proxy settings from the owner's server-side OneCLI identity mapping."""
+
+        token_context = await self._onecli_agent_token_context(owner_user_id)
+        agent_token_secret_ref = token_context.get("agent_token_secret_ref")
+        if not isinstance(agent_token_secret_ref, str) or not agent_token_secret_ref.strip():
+            raise ValueError(
+                "No OneCLI agent token is mapped to this Agency user. Complete OneCLI identity setup first."
+            )
+        return self._onecli_proxy_kwargs(agent_token_secret_ref)
+
     def _onecli_metadata(self, identifier: str, agent_token_context: dict[str, Any]) -> dict[str, Any]:
         settings = get_settings()
         agent_token_secret_ref = agent_token_context.get("agent_token_secret_ref")
@@ -111,9 +122,7 @@ class ConnectorService:
         }
 
     def _onecli_unsupported_reason(self, health_check: Any) -> str | None:
-        if "{token}" in health_check.request.url_template:
-            return "OneCLI connector health does not support token-in-URL providers yet."
-        if health_check.request.auth_scheme == "none":
+        if health_check.request.auth_scheme == "none" and "{token}" not in health_check.request.url_template:
             return "OneCLI connector health only supports providers with header-based auth shapes."
         return None
 
@@ -147,7 +156,10 @@ class ConnectorService:
             credential_mode: str = "direct",
             onecli_agent_token_secret_ref: str | None = None,
     ) -> dict[str, Any]:
-        request_context = self._request_context(token, metadata)
+        # URL-path profiles need a stable placeholder for OneCLI to replace;
+        # Agency never receives the token represented by that placeholder.
+        effective_token = "onecli-managed" if credential_mode == "onecli" and not token else token
+        request_context = self._request_context(effective_token, metadata)
         request_kwargs: dict[str, Any] = {}
         if credential_mode == "onecli":
             request_kwargs.update(self._onecli_proxy_kwargs(onecli_agent_token_secret_ref))

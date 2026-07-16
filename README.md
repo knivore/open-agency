@@ -154,6 +154,11 @@ cd $HOME\OpenAgency\open-agency
 .\run-windows.cmd start
 ```
 
+The Windows launcher streams startup progress and automatically chooses how to run the sibling frontend. It uses the
+native Node.js checkout when writable; in restricted workspaces it mounts the frontend source read-only in Docker and
+keeps `node_modules` and `.next` in managed volumes. No ACL change or elevation is required. Set
+`AGENCY_FRONTEND_RUNTIME=native` or `container` only when you need to override the default `auto` selection.
+
 Useful commands:
 
 ```bash
@@ -169,7 +174,7 @@ Prerequisites:
 
 - Docker Desktop or Docker Engine
 - Python 3.12+
-- Node.js/npm when running the sibling `open-agency-fe` frontend locally
+- Node.js/npm only when forcing the native Windows frontend runtime; the automatic Docker fallback includes Node.js
 
 Installer options:
 
@@ -194,6 +199,7 @@ Tunnel behavior:
 - The setup UI can save local-only, ngrok, Cloudflare, or automatic mode.
 - A browser-saved tunnel preference becomes the default on later launches.
 - Custom domains can be stored for ngrok or Cloudflare-managed tunnel setups.
+- Selecting ngrok or Cloudflare in the setup UI saves the preference; the next restart automatically installs a missing selected provider through WinGet on Windows or Homebrew on macOS. Fresh starts also attempt the default Cloudflare provider. For ngrok, set `AGENCY_NGROK_AUTHTOKEN` when required (interactive startup can prompt once). Cloudflare quick tunnels need no token; managed/custom Cloudflare tunnels require `AGENCY_CLOUDFLARE_TUNNEL_TOKEN` and a public URL. If an executable is not on `PATH`, set `AGENCY_NGROK_BIN` or `AGENCY_CLOUDFLARE_TUNNEL_BIN` to its verified path. Set `AGENCY_TUNNEL_AUTO_INSTALL=false` to disable automatic installation.
 
 ## Example Usage
 

@@ -69,13 +69,13 @@ class ExecutionActivityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(classification["heartbeat_age_seconds"], 0)
         self.assertGreaterEqual(classification["activity_age_seconds"], 600)
 
-    async def test_paused_execution_is_intentional_wait_not_stale(self):
+    async def test_waiting_for_input_execution_is_intentional_wait_not_stale(self):
         now = utc_now()
         execution = Execution(
-            id="execution-paused",
-            workflow_id="workflow-paused",
+            id="execution-input-wait",
+            workflow_id="workflow-input-wait",
             runtime_adapter="native",
-            status=ExecutionStatus.PAUSED,
+            status=ExecutionStatus.WAITING_FOR_INPUT,
             started_at=now - timedelta(hours=2),
             updated_at=now - timedelta(hours=2),
             metadata={"pending_subagent_input": {"status": "needs_input", "step_id": "step-review"}},
@@ -90,10 +90,37 @@ class ExecutionActivityTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(classification["is_stale"])
         self.assertTrue(classification["intentionally_waiting"])
-        self.assertEqual(classification["wait_state"], "paused")
+        self.assertEqual(classification["wait_state"], "waiting_for_input")
         self.assertIsNone(classification["stale_kind"])
 
-    async def test_waiting_for_approval_execution_is_intentional_wait_not_stale(self):
+    async def test_event_and_sleep_waits_are_active_without_being_stale(self):
+        now = utc_now()
+        for status, wait_state in (
+                (ExecutionStatus.WAITING_FOR_EVENT, "waiting_for_event"),
+                (ExecutionStatus.SLEEPING, "sleeping"),
+        ):
+            with self.subTest(status=status.value):
+                execution = Execution(
+                    id=f"execution-{status.value}",
+                    workflow_id="workflow-durable-wait",
+                    runtime_adapter="native",
+                    status=status,
+                    started_at=now - timedelta(days=1),
+                    updated_at=now - timedelta(days=1),
+                )
+
+                classification = classify_execution_staleness(
+                    execution,
+                    stale_after_seconds=300,
+                    idle_timeout_seconds=600,
+                    run_timeout_seconds=3600,
+                )
+
+                self.assertFalse(classification["is_stale"])
+                self.assertTrue(classification["eligible_status"])
+                self.assertEqual(classification["wait_state"], wait_state)
+
+    async def test_live_waiting_for_approval_execution_is_intentional_wait_not_stale(self):
         now = utc_now()
         execution = Execution(
             id="execution-approval-wait",
@@ -102,6 +129,7 @@ class ExecutionActivityTests(unittest.IsolatedAsyncioTestCase):
             status=ExecutionStatus.WAITING_FOR_APPROVAL,
             started_at=now - timedelta(hours=2),
             updated_at=now - timedelta(hours=2),
+            last_heartbeat_at=now,
             metadata={"pending_subagent_approval": {"status": "needs_approval", "step_id": "step-approval"}},
         )
 
@@ -116,6 +144,30 @@ class ExecutionActivityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(classification["eligible_status"])
         self.assertTrue(classification["intentionally_waiting"])
         self.assertEqual(classification["wait_state"], "waiting_for_approval")
+
+    async def test_dead_waiting_for_approval_worker_is_stale(self):
+        now = utc_now()
+        execution = Execution(
+            id="execution-abandoned-approval",
+            workflow_id="workflow-approval-wait",
+            runtime_adapter="native",
+            status=ExecutionStatus.WAITING_FOR_APPROVAL,
+            started_at=now - timedelta(hours=2),
+            updated_at=now - timedelta(minutes=20),
+            last_heartbeat_at=now - timedelta(minutes=20),
+            metadata={"pending_approval": {"tool_id": "agency.voice.generate"}},
+        )
+
+        classification = classify_execution_staleness(
+            execution,
+            stale_after_seconds=300,
+            idle_timeout_seconds=600,
+            run_timeout_seconds=3600,
+        )
+
+        self.assertTrue(classification["is_stale"])
+        self.assertEqual(classification["stale_kind"], "worker_unresponsive")
+        self.assertTrue(classification["intentionally_waiting"])
 
     async def test_always_on_execution_suppresses_run_timeout_but_not_dead_heartbeat(self):
         now = utc_now()

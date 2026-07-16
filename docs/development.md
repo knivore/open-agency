@@ -82,11 +82,16 @@ prints Docker Desktop WSL-integration guidance when Docker is not reachable. The
 in PowerShell before handing off to `.\run-windows.cmd start`. All installers run `./agency doctor` after bootstrap and
 preserve the requested tunnel mode for first start.
 
+On Windows, `run-windows.cmd` shows launcher output while retaining `%TEMP%\agency-run-windows.log`. When the sibling
+`open-agency-fe` checkout is read-only (for example, outside a restricted Codex workspace root), startup automatically
+uses the Compose `frontend` profile. The source bind is read-only and generated `.next` plus Linux `node_modules` state
+live in named Docker volumes, so startup does not request elevation or modify directory ACLs.
+
 Prerequisites:
 
 - Docker Desktop
 - Python 3.12 or newer
-- Node.js/npm only when you want the launcher to start `open-agency-fe`
+- Node.js/npm only when `AGENCY_FRONTEND_RUNTIME=native`; automatic/container mode supplies Node.js through Docker
 
 When `open-agency-fe` is present locally and setup has already been completed, the default dev login is:
 

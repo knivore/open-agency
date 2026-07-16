@@ -61,6 +61,9 @@ Environment overrides:
   AGENCY_FRONTEND_ENABLED=false     Run backend/runtime only.
   AGENCY_PUBLIC_TUNNEL_PROVIDER     auto, none, ngrok, or cloudflare.
   AGENCY_TUNNEL_CUSTOM_DOMAIN       Reserved ngrok/Cloudflare hostname.
+  AGENCY_NGROK_BIN / AGENCY_CLOUDFLARE_TUNNEL_BIN
+                                    Verified tunnel executable paths when not on PATH.
+  AGENCY_TUNNEL_AUTO_INSTALL        Allow automatic provider installation via Homebrew on macOS.
   AGENCY_OPEN_BROWSER=false         Do not open the browser automatically.
 
 Advanced overrides are documented in docs/runbook.md.
@@ -127,7 +130,7 @@ ngrok_has_authtoken() {
   local config_file=""
 
   config_file="$(ngrok_config_file)"
-  [ -f "${config_file}" ] && grep -q '^[[:space:]]*authtoken:' "${config_file}"
+  [ -f "${config_file}" ] && grep -Eq '^[[:space:]]*authtoken:[[:space:]]*[^[:space:]]+' "${config_file}"
 }
 
 cloudflare_enabled_mode() {
@@ -311,33 +314,68 @@ print_env_guidance() {
   echo
 }
 
-ngrok_download_url() {
-  local os=""
-  local arch=""
 
-  os="$(uname -s)"
-  arch="$(uname -m)"
+brew_bin_path() {
+  local candidate=""
 
-  case "${os}:${arch}" in
-    Darwin:arm64)
-      printf '%s\n' "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-darwin-arm64.zip"
+  if command_exists brew; then
+    command -v brew
+    return 0
+  fi
+  for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+    if [ -x "${candidate}" ]; then
+      printf '%s\n' "${candidate}"
       return 0
+    fi
+  done
+  return 1
+}
+
+refresh_brew_path() {
+  local brew_bin="$1"
+  local brew_prefix=""
+
+  brew_prefix="$("${brew_bin}" --prefix 2>/dev/null || true)"
+  if [ -n "${brew_prefix}" ] && [ -d "${brew_prefix}/bin" ]; then
+    export PATH="${brew_prefix}/bin:${PATH}"
+  fi
+}
+
+install_tunnel_provider() {
+  local provider="$1"
+  local brew_bin=""
+
+  tunnel_auto_install_enabled || return 1
+  if [ "$(uname -s)" != "Darwin" ]; then
+    echo "Automatic tunnel installation is only configured for macOS via Homebrew." >&2
+    return 1
+  fi
+
+  brew_bin="$(brew_bin_path || true)"
+  if [ -z "${brew_bin}" ]; then
+    echo "Homebrew is required to install ${provider} automatically. Install Homebrew or set its AGENCY_*_BIN path manually." >&2
+    return 1
+  fi
+
+  case "${provider}" in
+    ngrok)
+      echo "Installing ngrok with Homebrew..." >&2
+      "${brew_bin}" install --cask ngrok
+      refresh_brew_path "${brew_bin}"
       ;;
-    Darwin:x86_64)
-      printf '%s\n' "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-darwin-amd64.zip"
-      return 0
+    cloudflare)
+      echo "Installing cloudflared with Homebrew..." >&2
+      "${brew_bin}" install cloudflared
+      refresh_brew_path "${brew_bin}"
+      ;;
+    *)
+      return 1
       ;;
   esac
-
-  return 1
 }
 
 ensure_ngrok_installed() {
   local existing=""
-  local download_url=""
-  local install_dir="${HOME}/.local/bin"
-  local archive_dir="${HOME}/.cache/ngrok-install"
-  local archive_path=""
 
   existing="$(ngrok_bin_path || true)"
   if [ -n "${existing}" ]; then
@@ -345,23 +383,17 @@ ensure_ngrok_installed() {
     return 0
   fi
 
-  download_url="$(ngrok_download_url || true)"
-  if [ -z "${download_url}" ]; then
-    echo "Automatic ngrok install is only configured for macOS on Apple Silicon or Intel." >&2
-    return 1
-  fi
-  if ! command_exists curl || ! command_exists unzip; then
-    echo "curl and unzip are required to install ngrok automatically." >&2
+  if ! install_tunnel_provider ngrok; then
     return 1
   fi
 
-  mkdir -p "${install_dir}" "${archive_dir}"
-  archive_path="${archive_dir}/$(basename "${download_url}")"
-  echo "Installing ngrok into ${install_dir}..." >&2
-  curl -L "${download_url}" -o "${archive_path}"
-  unzip -o "${archive_path}" -d "${install_dir}" >/dev/null
-  chmod +x "${install_dir}/ngrok"
-  printf '%s\n' "${install_dir}/ngrok"
+  existing="$(ngrok_bin_path || true)"
+  if [ -n "${existing}" ]; then
+    printf '%s\n' "${existing}"
+    return 0
+  fi
+  echo "ngrok is not installed. Install Homebrew or set AGENCY_NGROK_BIN to a verified executable." >&2
+  return 1
 }
 
 ensure_ngrok_auth() {
@@ -413,33 +445,8 @@ cloudflared_bin_path() {
   return 1
 }
 
-cloudflared_download_url() {
-  local os=""
-  local arch=""
-
-  os="$(uname -s)"
-  arch="$(uname -m)"
-
-  case "${os}:${arch}" in
-    Darwin:arm64)
-      printf '%s\n' "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz"
-      return 0
-      ;;
-    Darwin:x86_64)
-      printf '%s\n' "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz"
-      return 0
-      ;;
-  esac
-
-  return 1
-}
-
 ensure_cloudflared_installed() {
   local existing=""
-  local download_url=""
-  local install_dir="${HOME}/.local/bin"
-  local archive_dir="${HOME}/.cache/cloudflared-install"
-  local archive_path=""
 
   existing="$(cloudflared_bin_path || true)"
   if [ -n "${existing}" ]; then
@@ -447,23 +454,17 @@ ensure_cloudflared_installed() {
     return 0
   fi
 
-  download_url="$(cloudflared_download_url || true)"
-  if [ -z "${download_url}" ]; then
-    echo "Automatic cloudflared install is only configured for macOS on Apple Silicon or Intel." >&2
-    return 1
-  fi
-  if ! command_exists curl || ! command_exists tar; then
-    echo "curl and tar are required to install cloudflared automatically." >&2
+  if ! install_tunnel_provider cloudflare; then
     return 1
   fi
 
-  mkdir -p "${install_dir}" "${archive_dir}"
-  archive_path="${archive_dir}/$(basename "${download_url}")"
-  echo "Installing cloudflared into ${install_dir}..." >&2
-  curl -L "${download_url}" -o "${archive_path}"
-  tar -xzf "${archive_path}" -C "${install_dir}" cloudflared
-  chmod +x "${install_dir}/cloudflared"
-  printf '%s\n' "${install_dir}/cloudflared"
+  existing="$(cloudflared_bin_path || true)"
+  if [ -n "${existing}" ]; then
+    printf '%s\n' "${existing}"
+    return 0
+  fi
+  echo "cloudflared is not installed. Install Homebrew or set AGENCY_CLOUDFLARE_TUNNEL_BIN to a verified executable." >&2
+  return 1
 }
 
 ensure_host_backend_env_files() {
@@ -941,6 +942,7 @@ start_ngrok_tunnel() {
   local public_url=""
   local discovered_url=""
   local attempts=0
+  local ngrok_pid=""
   local custom_domain="${AGENCY_TUNNEL_CUSTOM_DOMAIN:-}"
 
   mode="$(ngrok_enabled_mode)"
@@ -969,11 +971,21 @@ start_ngrok_tunnel() {
   else
     nohup "${ngrok_bin}" http "http://127.0.0.1:${BACKEND_PORT}" >"${NGROK_LOG_FILE}" 2>&1 </dev/null &
   fi
-  printf '%s\n' "$!" >"${NGROK_PID_FILE}"
+  ngrok_pid="$!"
+  printf '%s\n' "${ngrok_pid}" >"${NGROK_PID_FILE}"
 
   while [ "${attempts}" -lt 20 ]; do
-    discovered_url="$(ngrok_public_url || true)"
-    if [ -n "${discovered_url}" ]; then
+    if [ -n "${custom_domain}" ]; then
+      if process_alive "${ngrok_pid}"; then
+        public_url="$(public_tunnel_url || true)"
+      else
+        public_url=""
+      fi
+    else
+      discovered_url="$(ngrok_public_url || true)"
+      public_url="$(public_tunnel_url || true)"
+    fi
+    if [ -n "${public_url}" ]; then
       public_url="$(public_tunnel_url || true)"
       echo "ngrok tunnel: ${public_url}"
       print_chat_endpoints "${public_url}"
@@ -984,6 +996,9 @@ start_ngrok_tunnel() {
   done
 
   echo "ngrok did not report a public URL. See ${NGROK_LOG_FILE}." >&2
+  tail -n 40 "${NGROK_LOG_FILE}" >&2 || true
+  stop_ngrok || true
+  disable_public_tunnel
   return 0
 }
 
@@ -1043,15 +1058,17 @@ start_cloudflare_tunnel() {
   fi
 
   while [ "${attempts}" -lt 20 ]; do
+    if ! process_alive "${cloudflared_pid}"; then
+      echo "cloudflared exited before it reported a public URL. See ${CLOUDFLARED_LOG_FILE}." >&2
+      print_cloudflared_log_tail "${CLOUDFLARED_LOG_FILE}"
+      stop_cloudflared || true
+      disable_public_tunnel
+      return 0
+    fi
     public_url="$(public_tunnel_url || true)"
     if [ -n "${public_url}" ]; then
       echo "Cloudflare tunnel: ${public_url}"
       print_chat_endpoints "${public_url}"
-      return 0
-    fi
-    if ! process_alive "${cloudflared_pid}"; then
-      echo "cloudflared exited before it reported a public URL. See ${CLOUDFLARED_LOG_FILE}." >&2
-      print_cloudflared_log_tail "${CLOUDFLARED_LOG_FILE}"
       return 0
     fi
     sleep 1
@@ -1061,10 +1078,15 @@ start_cloudflare_tunnel() {
   if cloudflared_log_has_startup_error "${CLOUDFLARED_LOG_FILE}"; then
     echo "cloudflared failed to start a quick tunnel. See ${CLOUDFLARED_LOG_FILE}." >&2
     print_cloudflared_log_tail "${CLOUDFLARED_LOG_FILE}"
+    stop_cloudflared || true
+    disable_public_tunnel
     return 0
   fi
 
   echo "cloudflared did not report a public URL. See ${CLOUDFLARED_LOG_FILE}." >&2
+  print_cloudflared_log_tail "${CLOUDFLARED_LOG_FILE}"
+  stop_cloudflared || true
+  disable_public_tunnel
   return 0
 }
 
@@ -1258,6 +1280,7 @@ start_background() {
   local startup_url=""
 
   ensure_host_backend_env_files
+  load_dotenv_preserving_cli_tunnel_overrides
   resolve_frontend_workspace_choice
 
   if frontend_available; then
@@ -1477,6 +1500,10 @@ stop_all() {
 show_status() {
   local env_file="${FE_DIR}/.env.local"
 
+  cd "${ROOT_DIR}"
+  load_dotenv_preserving_cli_tunnel_overrides
+  apply_saved_or_detected_tunnel_preference
+
   echo "Docker services:"
   docker compose ps || true
 
@@ -1559,6 +1586,10 @@ doctor() {
   local failures=0
   local candidate_python=""
 
+  cd "${ROOT_DIR}"
+  load_dotenv_preserving_cli_tunnel_overrides
+  apply_saved_or_detected_tunnel_preference
+
   echo "Agency local setup doctor"
   echo
 
@@ -1630,7 +1661,7 @@ doctor() {
       if [ -n "${ngrok_bin}" ]; then
         echo "ngrok: present at ${ngrok_bin}"
       else
-        echo "ngrok: not installed yet; launcher will attempt a local user install when start enables ngrok."
+        echo "ngrok: not installed yet; launcher will attempt a Homebrew install when start enables ngrok."
       fi
       if [ -n "${AGENCY_NGROK_AUTHTOKEN:-}" ] || ngrok_has_authtoken; then
         echo "ngrok authtoken: configured"
@@ -1644,7 +1675,7 @@ doctor() {
       if [ -n "${cloudflared_bin}" ]; then
         echo "cloudflared: present at ${cloudflared_bin}"
       else
-        echo "cloudflared: not installed yet; launcher will attempt a local user install when start enables Cloudflare Tunnel."
+        echo "cloudflared: not installed yet; launcher will attempt a Homebrew install when start enables Cloudflare Tunnel."
       fi
       if [ -n "${AGENCY_CLOUDFLARE_TUNNEL_TOKEN:-}" ]; then
         echo "Cloudflare Tunnel mode: managed token"

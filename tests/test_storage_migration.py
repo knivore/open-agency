@@ -230,7 +230,9 @@ class StorageMigrationIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(stored_provider)
         stored_execution = await self.context.execution_store.get_execution(execution_id)
         self.assertIsNotNone(stored_execution)
-        self.assertEqual(stored_execution.created_by, "api-test")
+        # Request trigger metadata is descriptive only; the authenticated principal
+        # owns the execution and cannot be replaced by a caller-supplied actor.
+        self.assertEqual(stored_execution.created_by, "user-storage-api")
 
     async def test_runtime_tool_history_allows_workflow_embedded_tools(self) -> None:
         tool_fk_targets = {

@@ -158,11 +158,12 @@ app_tools:
     id: "agency.voice.generate"
     name: "generate_voice"
     display_name: "Generate Voice"
-    description: "Generate a local-first spoken audio file from text, publish it into Agency storage, and return a reusable voice artifact with file_path, storage_key, storage_uri, and media_url. provider=system_tts uses the host TTS engine; provider=openvoice_local uses Agency's local OpenVoice checkout and consented reference voice. Required inputs: text and ai_disclosure=true. openvoice_local also requires consent_confirmed=true and reference_voice_path. Delivery is intentionally separate so workflows can route the generated voice to any tied application or downstream tool."
+    description: "Generate a local-first spoken audio file from text, publish it into Agency storage, and return a reusable voice artifact with file_path, storage_key, storage_uri, and media_url. provider=system_tts uses the host TTS engine; provider=openvoice_local uses Agency's local OpenVoice checkout. OpenVoice uses its built-in friendly voice when no reference is supplied, or clones a consented reference when reference_voice_path and consent_confirmed=true are provided. Required inputs: text and ai_disclosure=true. Delivery is intentionally separate so workflows can route the generated voice to any tied application or downstream tool."
     created_by: "agency"
     owned_by: "agency"
     tags: [ "catalog", "voice", "speech", "media", "storage", "agent_assignable", "risk:medium" ]
     security:
+      requires_approval: false
       allow_network: false
       allowlisted_domains: []
       redaction_enabled: false
@@ -187,7 +188,7 @@ app_tools:
         mandatory: false
         type: "string"
         filled_by: "user_or_agent"
-        description: "Reference voice path for Agency's local OpenVoice generation. Required with openvoice_local."
+        description: "Optional reference voice path for Agency's local OpenVoice cloning. Omit it to use the built-in friendly voice."
       output_name:
         mandatory: false
         type: "string"
@@ -288,6 +289,8 @@ app_tools:
     created_by: "agency"
     owned_by: "agency"
     tags: [ "catalog", "media", "delivery", "agent_assignable", "risk:medium" ]
+    security:
+      requires_approval: false
     parameters:
       provider:
         mandatory: true
@@ -368,6 +371,8 @@ app_tools:
     description: "Send one HTTP request to an explicit URL when an agent needs to call an external API or webhook. Use this only for APIs that are expected by the workflow and whose domain is allowed by the tool security policy. Required inputs: `url` and `method`. Optional inputs: `headers`, `query_params`, `body`, `verify_ssl`, and `credential_mode`. Output includes the HTTP status code and parsed response body when JSON is returned. Side effect: performs a network call and may mutate external systems depending on the HTTP method."
     created_by: "agency"
     owned_by: "agency"
+    security:
+      requires_approval: false
     parameters:
       url:
         mandatory: true
@@ -438,6 +443,8 @@ app_tools:
     description: "Write or append text content to a file under an allowed base folder. Use this for workflow artifacts and controlled local text outputs, not for editing source code or credential files. Required inputs: `base_folder`, `content`, and `mode`. Optional input: `filename`; if omitted, the configured default filename is used. Output includes status, message, and full path. Side effect: creates or modifies a file and requires filesystem permission."
     created_by: "agency"
     owned_by: "agency"
+    security:
+      requires_approval: false
     parameters:
       base_folder:
         mandatory: true

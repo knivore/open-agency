@@ -14,8 +14,8 @@ They are intended to back the main agent's normalized desktop-control contract t
 
 Default seeded commands:
 
-- macOS: `uvx macos-mcp`
-- Windows: `uvx windows-mcp`
+- macOS: `uvx macos-mcp==0.3.10`
+- Windows: disabled until an operator supplies an approved exact `windows-mcp` package/version
 
 ## Configuration
 
@@ -23,9 +23,10 @@ Override the default backend commands with environment variables when needed:
 
 ```env
 COMPUTER_USE_MACOS_MCP_COMMAND=uvx
-COMPUTER_USE_MACOS_MCP_ARGS="macos-mcp"
+COMPUTER_USE_MACOS_MCP_ARGS="macos-mcp==0.3.10"
 COMPUTER_USE_WINDOWS_MCP_COMMAND=uvx
 COMPUTER_USE_WINDOWS_MCP_ARGS="windows-mcp"
+COMPUTER_USE_WINDOWS_MCP_ENABLED=false
 ```
 
 ## Startup Behavior
@@ -38,6 +39,8 @@ COMPUTER_USE_WINDOWS_MCP_ARGS="windows-mcp"
 
 - the configured command must exist on the host
 - the command name must be allowlisted by the MCP registry bootstrap
+- package-manager commands must use an exact package version; the Windows adapter remains disabled until an
+  operator supplies an approved exact `windows-mcp` package/version
 - the external MCP package itself must already be installable on that machine
 
 For the normalized tool contract the main agent sees, use [Tools](./tools.md).

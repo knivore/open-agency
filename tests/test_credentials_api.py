@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.api.context import create_test_api_context
 from app.api.main import create_app
+from app.domain import ConnectorInstallation
 
 
 class CredentialsApiTests(unittest.TestCase):
@@ -50,7 +51,9 @@ class CredentialsApiTests(unittest.TestCase):
             },
         )
         self.assertEqual(create_response.status_code, 200)
-        self.assertEqual(create_response.json()["secret_ref"], "secret://agency/openai-api-key")
+        self.assertNotIn("secret_ref", create_response.json())
+        self.assertTrue(create_response.json()["secret_ref_configured"])
+        self.assertEqual(create_response.json()["secret_ref_scheme"], "secret")
         self.assertEqual(create_response.json()["owner_user_id"], "user-1")
         self.assertEqual(create_response.json()["status"], "active")
 
@@ -85,6 +88,51 @@ class CredentialsApiTests(unittest.TestCase):
 
         missing_response = self.client.get("/credentials/credential-openai", headers=self.owner_headers)
         self.assertEqual(missing_response.status_code, 404)
+
+    def test_credential_api_rejects_nested_or_literal_secrets_and_hides_reference(self) -> None:
+        nested_secret = self.client.post(
+            "/credentials",
+            headers=self.owner_headers,
+            json={
+                "id": "credential-nested-secret",
+                "name": "Nested secret",
+                "secret_ref": "secret://agency/nested-secret",
+                "metadata": {"connection": {"apiKey": "raw-nested-value"}},
+            },
+        )
+        self.assertEqual(nested_secret.status_code, 400)
+        self.assertIn("Raw secret material", nested_secret.json()["detail"])
+
+        literal_reference = self.client.post(
+            "/credentials",
+            headers=self.owner_headers,
+            json={
+                "id": "credential-literal-secret",
+                "name": "Literal secret",
+                "secret_ref": "raw-secret-value",
+            },
+        )
+        self.assertEqual(literal_reference.status_code, 400)
+        self.assertIn("supported reference scheme", literal_reference.json()["detail"])
+
+        valid = self.client.post(
+            "/credentials",
+            headers=self.owner_headers,
+            json={
+                "id": "credential-public-shape",
+                "name": "Reference only",
+                "secret_ref": "secret://agency/reference-only",
+                "metadata": {"environment": "test"},
+            },
+        )
+        self.assertEqual(valid.status_code, 200)
+        self.assertNotIn("secret_ref", valid.json())
+        self.assertTrue(valid.json()["secret_ref_configured"])
+        self.assertEqual(valid.json()["secret_ref_scheme"], "secret")
+
+        listed = self.client.get("/credentials", headers=self.owner_headers).json()["items"]
+        self.assertEqual([item["id"] for item in listed], ["credential-public-shape"])
+        self.assertNotIn("secret_ref", listed[0])
 
     def test_revoking_onecli_credential_ref_disables_owner_mappings(self) -> None:
         mapping_response = self.client.post(
@@ -255,8 +303,58 @@ class CredentialsApiTests(unittest.TestCase):
         self.assertEqual(create_response.status_code, 200)
         body = create_response.json()
         self.assertEqual(body["provider"], "discord-bot")
-        self.assertEqual(body["secret_ref"], "onecli://users/user-1/discord/dev-bot")
+        self.assertNotIn("secret_ref", body)
+        self.assertEqual(body["secret_ref_scheme"], "onecli")
         self.assertEqual(body["owner_user_id"], "user-1")
+
+    def test_installation_secret_ref_is_owner_scoped(self) -> None:
+        installation_id = "installation-owner-scoped"
+        asyncio.run(
+            self.context.connector_installation_repo.create(
+                ConnectorInstallation(
+                    id=installation_id,
+                    owner_user_id="user-1",
+                    provider="telegram",
+                    name="Owner installation",
+                    onecli_credential_ref=f"secret://agency/installations/{installation_id}",
+                )
+            )
+        )
+
+        cross_owner = self.client.post(
+            "/credentials",
+            headers=self.other_owner_headers,
+            json={
+                "name": "Cross-owner ref",
+                "provider": "telegram",
+                "secret_ref": f"secret://agency/installations/{installation_id}",
+            },
+        )
+        self.assertEqual(cross_owner.status_code, 400)
+        self.assertIn("unavailable", cross_owner.json()["detail"])
+
+        cross_provider = self.client.post(
+            "/credentials",
+            headers=self.owner_headers,
+            json={
+                "name": "Cross-provider ref",
+                "provider": "discord-bot",
+                "secret_ref": f"secret://agency/installations/{installation_id}",
+            },
+        )
+        self.assertEqual(cross_provider.status_code, 400)
+        self.assertIn("unavailable", cross_provider.json()["detail"])
+
+        owner = self.client.post(
+            "/credentials",
+            headers=self.owner_headers,
+            json={
+                "name": "Owner ref",
+                "provider": "telegram",
+                "secret_ref": f"secret://agency/installations/{installation_id}",
+            },
+        )
+        self.assertEqual(owner.status_code, 200)
 
     def test_connector_create_rejects_cross_owner_onecli_reference(self) -> None:
         validate_response = self.client.post(
@@ -453,7 +551,8 @@ class CredentialsApiTests(unittest.TestCase):
         self.assertEqual(rotate_response.status_code, 200)
         body = rotate_response.json()
         self.assertEqual(body["status"], "active")
-        self.assertEqual(body["secret_ref"], "secret://agency/openai-api-key/v2")
+        self.assertNotIn("secret_ref", body)
+        self.assertEqual(body["secret_ref_scheme"], "secret")
         self.assertEqual(body["secret_version"], 2)
         self.assertIsNotNone(body["last_rotated_at"])
         self.assertIsNone(body["revoked_at"])

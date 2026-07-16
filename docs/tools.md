@@ -70,6 +70,10 @@ It does not receive:
 - credentials
 - internal security logic
 
+Tool and connector definitions may refer to backend environment credentials only when the variable name appears in
+`AGENCY_CREDENTIAL_ENV_ALLOWLIST`. This keeps a user-authored definition from turning an arbitrary backend
+environment variable into an accessible secret reference.
+
 The implementation reference stays server-side in `ToolDefinition.implementation`, for example:
 
 ```python
@@ -447,6 +451,11 @@ This metadata is used to:
 - scope file-system and network access
 - separate safe read-only utilities from state-changing tools
 
+`agency.voice.generate`, `agency.media.send`, `agency.http.request`, and `agency.file.write-text` are explicit autonomous
+exceptions: they set `requires_approval: false` so workflows can invoke them without a durable approval pause. They
+remain sandboxed and continue to enforce their path, domain, connector, credential, input-schema, and callable
+allowlists. This exception applies globally to the canonical built-in definitions, not to one workflow only.
+
 ## Approval Model
 
 Approval-gated tools are expected to:
@@ -456,7 +465,14 @@ Approval-gated tools are expected to:
 3. pause the execution until approval or rejection
 4. emit canonical execution events and invocation records for the decision
 
-The approval model is enforced in the runtime layer, not inside arbitrary tool code.
+The approval model is enforced in the runtime layer, not inside arbitrary tool code. The approval request row is the
+decision source of truth, and a linked `execution_waits` row records the execution's durable wait state. Before a gated
+native tool suspends, the agent executor persists the transcript and exact pending tool position. The worker then exits;
+an API process can approve or reject the request, atomically wake the execution, and queue a fresh worker that consumes
+the decision and continues without replaying prior calls in that model response.
+
+The synchronous `agency.human.ask` channel remains suitable for short, live interactions; it is not the durable source
+of truth for long-lived workflow suspension.
 
 ## Executors
 

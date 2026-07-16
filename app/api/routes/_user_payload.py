@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from app.domain import UserDefinition
-from app.services.local_auth import LOCAL_AUTH_METADATA_KEY
+from app.services.local_auth import LOCAL_AUTH_METADATA_KEY, has_local_password
 
 
 def public_user_payload(user: UserDefinition) -> dict:
     payload = user.model_dump(mode="json")
+    payload["local_credentials_enabled"] = has_local_password(user)
     metadata = payload.get("metadata")
     if not isinstance(metadata, dict):
         return payload

@@ -10,7 +10,8 @@ from .base import ToolExecutionContext
 
 class SqlQueryToolExecutor:
     tool_type = ToolType.SQL_QUERY
-    _write_pattern = re.compile(r"\b(insert|update|delete|drop|alter|truncate|create|replace|attach|vacuum|pragma)\b",
+    _write_pattern = re.compile(
+        r"\b(insert|update|delete|drop|alter|truncate|create|replace|attach|vacuum|pragma|analyze|reindex)\b",
                                 re.IGNORECASE)
 
     def execute(self, tool: ToolDefinition, arguments: dict[str, object], context: ToolExecutionContext) -> dict[

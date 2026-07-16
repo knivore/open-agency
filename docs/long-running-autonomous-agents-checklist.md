@@ -22,6 +22,85 @@ carrying `goal_id` into execution creation, trigger payload, or runtime input; t
 the goal, not the workflow definition itself. Workflow definitions may provide goal defaults in metadata, but the
 selected `goal_id` should remain run-specific so one workflow can advance different goals over time.
 
+## Long-Running Workflow Runtime
+
+A long-running agent and a long-running workflow are related but not interchangeable. The agent is the actor that
+reasons, uses tools, and retains goal context. The workflow is the durable execution state machine that determines when
+work runs, waits without consuming a worker, wakes, repeats, pauses, and terminates.
+
+Agency should support three workflow forms:
+
+- **Waitable workflow:** runs until it needs input, approval, an event, or a wake time, then releases compute and resumes
+  from a persisted checkpoint.
+- **Persistent monitor workflow:** runs bounded cycles under one execution until an operator cancels it. Each cycle must
+  checkpoint progress and obey retry, budget, backoff, and no-progress limits.
+- **Goal-driven recurring workflow:** performs finite execution attempts under a durable goal, with the scheduler or
+  supervisor deciding when another attempt is needed. This is the preferred mode when one continuous execution is not
+  required.
+
+`always_on` by itself relaxes the default finite worker timeout; it does not make a completed workflow graph start
+another cycle. Adding `execution_lifecycle.persistent_cycle.enabled=true` opts a native workflow into durable cycles
+under one execution id. Each cycle releases compute through a persisted sleep wait, and isolated workers exit cleanly
+until the wake reconciler starts the next worker.
+
+The current durable-wait implementation can suspend input, event, and sleep waits at a persisted native node boundary,
+discard process-local engine state, and resume the same execution from its recorded outputs. Approval-gated tool calls
+also persist their agent transcript and remaining tool-call position, release their worker or container, and resume from
+the approval checkpoint after a persisted decision without replaying earlier calls in the same model response.
+
+### Lifecycle Foundation
+
+- [x] Store execution status as an extensible string so new states do not require a database enum migration.
+- [x] Represent `waiting_for_input`, `waiting_for_approval`, `waiting_for_event`, `sleeping`, and operator `paused` as
+  distinct execution states.
+- [x] Keep durable wait states active and exempt them from idle and total-run timeout findings.
+- [x] Preserve `always_on` as an explicit run mode rather than inferring it from a long timeout.
+- [x] Persist a structured wait record with kind, checkpoint, correlation key, wake deadline, policy, and resolution.
+- [x] Distinguish worker-owned waits from suspended durable waits so a dead approval worker is still detected as stale.
+- [x] Emit explicit `execution.waiting` and `execution.woken` audit events for durable wait-service and subagent wait
+  transitions.
+- [x] Emit the same explicit wait and wake audit events for the tool approval path.
+
+### Suspend And Wake
+
+- [x] Resume a suspended native execution at a persisted safe node boundary under the same execution id.
+- [x] Release the worker/container for every wait type, including a tool call paused mid-execution for approval.
+- [x] Add an input-response API that resolves one pending input wait idempotently and resumes from its checkpoint.
+- [x] Resolve approval waits from persisted approval decisions without depending on an in-process future.
+- [x] Add event subscriptions with correlation keys, deadlines, and single-consumer idempotency.
+- [ ] Add optional structured filters to event subscriptions.
+- [x] Add reconciler-backed sleep wakeups that survive backend restart.
+- [x] Reconcile due waits on startup and on the periodic runtime reconciliation cadence.
+- [ ] Detect and repair orphaned waits whose execution or continuation cannot be recovered.
+- [x] Expire timed-out waits without resuming compute while preserving persisted outputs and metadata.
+
+### Persistent Cycles
+
+- [x] Add a persistent cycle policy with interval, backoff, jitter, maximum consecutive failures, and optional deadline.
+- [x] Start the next cycle only after the prior cycle checkpoint and audit events are durable.
+- [x] Keep cycle number, last progress signature, next wake time, and bounded recent outcomes in execution metadata.
+- [ ] Add cumulative token, cost, and runtime budget accounting across persistent cycles.
+- [ ] Stop persistent execution only on cancellation, terminal policy, deadline, exhausted budget, or unrecoverable failure.
+- [x] Add no-progress and repeated-output loop guards that pause and emit an escalation event instead of spinning forever.
+- [x] Ensure cancellation cooperatively interrupts active compute and removes scheduled wakeups or event subscriptions.
+- [ ] Let the goal supervisor choose between continuing a persistent execution and starting a fresh finite attempt.
+
+### Operator Experience
+
+- [ ] Show the exact wait reason, requested input or approval, checkpoint, and expected wake condition.
+- [ ] Show current cycle, next wake time, cumulative runtime/budget, and recent cycle outcomes.
+- [ ] Let operators provide input, approve/reject, wake now, pause, resume, and cancel from execution and goal views.
+- [ ] Require confirmation for cancelling high-priority persistent workflows or discarding unresolved waits.
+
+### Runtime Acceptance Criteria
+
+- [x] A waiting workflow consumes no dedicated worker and resumes after backend restart.
+- [x] Duplicate input, approval, event, or timer resolutions cannot claim the same wait twice.
+- [x] A persistent monitor completes multiple bounded cycles under one execution id until manually cancelled or a terminal policy is reached.
+- [x] A dead active worker is stale, while a suspended durable wait is not.
+- [x] Every wait, wake, cycle, retry, guard escalation, and termination decision is auditable.
+- [x] Finite workflows retain their current behavior when no long-running policy is configured.
+
 ## Goal
 
 - [x] Support durable goals that can outlive one workflow execution.
@@ -179,6 +258,12 @@ selected `goal_id` should remain run-specific so one workflow can advance differ
 
 ## Testing
 
+- [x] Unit test durable wait creation, one-pending-wait enforcement, policy persistence, and atomic resolution.
+- [x] Unit test input, event, sleep, deadline-expiration, and repeated approval wait behavior.
+- [x] Integration test native checkpoint resume under the same execution id after process-local state loss.
+- [x] Regression test generic start/resume commands cannot bypass a pending wait.
+- [x] Integration test workerless approval continuation after the original worker exits.
+- [x] Integration test persistent monitor cycles, loop guards, suspended isolated workers, and cancellation of scheduled wakeups.
 - [x] Unit test goal lifecycle transitions.
 - [x] Unit test goal-to-execution linking.
 - [x] Unit test supervisor finding creation.
@@ -206,4 +291,4 @@ selected `goal_id` should remain run-specific so one workflow can advance differ
 - [x] The main agent cannot perform high-risk mutations without approval.
 - [x] Goal completion requires recorded evidence and evaluation.
 - [x] Operators can see what the main agent did, why it did it, and what remains blocked.
-- [x] Long-running autonomous workflows remain auditable, governable, and resumable.
+- [ ] Waitable and persistent long-running workflows meet all runtime acceptance criteria above.

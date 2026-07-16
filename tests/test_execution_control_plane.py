@@ -12,11 +12,15 @@ from app.api.routes.executions import create_executions_router
 from app.core.config import reset_settings_cache
 from app.core.time import utc_now
 from app.domain import AgentDefinition, Execution, ExecutionArtifact, ExecutionEvent, ExecutionEventType, \
+    ExecutionStatus, \
+    ExecutionWait, ExecutionWaitKind, ExecutionWaitStatus, \
     ModelProfileDefinition, RuntimeRevision, RuntimeRevisionStatus, TaskDefinition, ToolDefinition, UserDefinition, \
     WorkflowDefinition, WorkflowEdgeDefinition, WorkflowNodeDefinition
 from app.domain.models import FrameworkHints, MCPExposureSettings, MemorySettings, SecuritySettings, \
     ToolImplementationReference
 from app.llm.base import ModelResponse, ModelToolCall
+from app.runtime.control_plane import ExecutionControlPlane
+from app.runtime.native.approvals import ApprovalManager
 from app.runtime.containers import RuntimeContainerState
 
 
@@ -30,6 +34,29 @@ class ApprovalAwareModelClient:
 
     def generate_text(self, messages, *, temperature=None, max_tokens=None, **kwargs):
         self.calls += 1
+        if any(message.role == "tool" for message in messages):
+            content = "Click completed" if self.mode == "computer_use" else "Approved answer"
+            return ModelResponse(
+                content=content,
+                provider=self.profile.provider,
+                model=self.profile.model,
+                latency_ms=1,
+            )
+        if self.mode == "multi_tool_approval":
+            return ModelResponse(
+                content="Read first, then request approval",
+                tool_calls=[
+                    ModelToolCall(id="tool-read", name="Read Tool", arguments={"text": "already done"}),
+                    ModelToolCall(
+                        id="tool-approval",
+                        name="Approval Tool",
+                        arguments={"text": "approve me"},
+                    ),
+                ],
+                provider=self.profile.provider,
+                model=self.profile.model,
+                latency_ms=1,
+            )
         if self.mode == "computer_use":
             if self.calls == 1:
                 return ModelResponse(
@@ -105,7 +132,12 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
             input_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
             output_schema={"type": "object"},
             implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
-            security=SecuritySettings(approval_required=True, sandbox_required=True),
+            security=SecuritySettings(
+                approval_required=True,
+                sandbox_required=True,
+                module_allowlist=["tests.native_test_tools"],
+                function_allowlist=["echo_tool"],
+            ),
             mcp_exposure=MCPExposureSettings(),
         )
         agent = AgentDefinition(
@@ -144,6 +176,72 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.context.runtime_registry.register_workflow(self.workflow)
 
+    async def _wait_for_execution_status(self, execution_id: str, expected_status: str):
+        async with asyncio.timeout(2):
+            while True:
+                execution = await self.context.execution_store.get_execution(execution_id)
+                if execution is not None and execution.status.value == expected_status:
+                    return execution
+                if execution is not None and execution.status.value in {"completed", "failed", "cancelled"}:
+                    events = await self.context.execution_store.list_events(execution_id)
+                    self.fail(
+                        f"Execution reached {execution.status.value} while waiting for {expected_status}: "
+                        f"{execution.error}; events="
+                        f"{[(event.event_type.value, event.payload.get('tool_id')) for event in events]}"
+                    )
+                await asyncio.sleep(0.01)
+
+    async def test_terminal_executions_cannot_start_resume_or_requeue(self):
+        for terminal_status in (
+            ExecutionStatus.COMPLETED,
+            ExecutionStatus.FAILED,
+            ExecutionStatus.CANCELLED,
+        ):
+            with self.subTest(status=terminal_status.value):
+                execution = await self.context.runtime_registry.create_execution(
+                    self.workflow.id,
+                    {"topic": "terminal replay guard"},
+                    {"created_by": "tester"},
+                    runtime_adapter_id="native",
+                )
+                execution.status = terminal_status
+                await self.context.execution_store.update_execution(execution)
+                state = self.context.execution_engine._states[execution.id]  # noqa: SLF001
+                state.paused = True
+                state.cancelled = True
+
+                for transition in (
+                    self.context.execution_engine.start_execution,
+                    self.context.execution_engine.resume_execution,
+                    self.context.control_plane.queue_start,
+                    self.context.control_plane.resume,
+                ):
+                    with self.subTest(status=terminal_status.value, transition=transition.__name__):
+                        with self.assertRaisesRegex(ValueError, "must be retried through a replacement execution"):
+                            await transition(execution.id)
+                        current = await self.context.execution_store.get_execution(execution.id)
+                        self.assertEqual(current.status, terminal_status)
+                        self.assertTrue(state.paused)
+                        self.assertTrue(state.cancelled)
+                        self.assertNotIn(execution.id, self.context.control_plane._tasks)  # noqa: SLF001
+
+    async def test_native_resume_preserves_valid_paused_transition(self):
+        execution = await self.context.runtime_registry.create_execution(
+            self.workflow.id,
+            {"topic": "valid resume"},
+            {"created_by": "tester"},
+            runtime_adapter_id="native",
+        )
+        execution.status = ExecutionStatus.PAUSED
+        await self.context.execution_store.update_execution(execution)
+        state = self.context.execution_engine._states[execution.id]  # noqa: SLF001
+        state.paused = True
+
+        resumed = await self.context.execution_engine.resume_execution(execution.id)
+
+        self.assertEqual(resumed.status, ExecutionStatus.QUEUED)
+        self.assertFalse(state.paused)
+
     async def test_approval_flow(self):
         execution = await self.context.runtime_registry.create_execution(
             self.workflow.id,
@@ -156,15 +254,44 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
 
         current = await self.context.execution_store.get_execution(execution.id)
         self.assertIsNotNone(current)
-        self.assertIn(current.status.value, {"waiting_for_approval", "running", "completed"})
+        self.assertEqual(current.status.value, "waiting_for_approval")
+        async with asyncio.timeout(2):
+            while current.worker_id is not None:
+                await asyncio.sleep(0.01)
+                current = await self.context.execution_store.get_execution(execution.id)
+        self.assertIsNone(current.worker_id)
+        self.assertNotIn(execution.id, self.context.control_plane._tasks)  # noqa: SLF001
+
+        # Isolated workers can still be unwinding after the wait becomes
+        # visible. The approval path must not queue the replacement until that
+        # durable lock is released.
+        current.worker_id = "container-worker-finishing"
+        current.last_heartbeat_at = utc_now()
+        await self.context.execution_store.update_execution(current)
+
+        async def release_finishing_worker() -> None:
+            await asyncio.sleep(0.05)
+            await self.context.execution_store.release_lock(
+                execution.id,
+                "container-worker-finishing",
+            )
+
+        release_task = asyncio.create_task(release_finishing_worker())
 
         approved = await self.context.control_plane.approve(execution.id, "tool-approval", "approved in test")
+        await release_task
         self.assertTrue(approved)
         await asyncio.sleep(0.05)
 
         final = await self.context.execution_store.get_execution(execution.id)
         self.assertIsNotNone(final)
-        self.assertIn(final.status.value, {"completed", "running"})
+        self.assertEqual(final.status.value, "completed")
+        event_types = [
+            event.event_type.value
+            for event in await self.context.execution_store.list_events(execution.id)
+        ]
+        self.assertIn("execution.waiting", event_types)
+        self.assertIn("execution.woken", event_types)
 
     async def test_low_risk_approval_can_be_delegated_to_main_agent(self):
         workflow = self.workflow.model_copy(
@@ -187,9 +314,7 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
             runtime_adapter_id="native",
         )
         await self.context.control_plane.queue_start(execution.id)
-        await asyncio.sleep(0.1)
-
-        final = await self.context.execution_store.get_execution(execution.id)
+        final = await self._wait_for_execution_status(execution.id, "completed")
         events = await self.context.execution_store.list_events(execution.id)
 
         assert final is not None
@@ -206,6 +331,110 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(approval_requests[0]["status"], "approved")
         self.assertEqual(approval_requests[0]["responded_by"], "main_agent")
         self.assertEqual(approval_requests[0]["response_payload"]["metadata"]["mode"], "delegated")
+
+    async def test_workerless_approval_resume_does_not_repeat_prior_tool_calls(self):
+        self.context.llm_provider_registry.register(
+            "fake",
+            lambda profile, env: ApprovalAwareModelClient(profile, env, mode="multi_tool_approval"),
+        )
+        read_tool = self.workflow.tool_definitions[0].model_copy(
+            deep=True,
+            update={
+                "id": "tool-read",
+                "name": "Read Tool",
+                "display_name": "Read Tool",
+                "security": SecuritySettings(
+                    approval_required=False,
+                    sandbox_required=True,
+                    module_allowlist=["tests.native_test_tools"],
+                    function_allowlist=["echo_tool"],
+                ),
+            },
+        )
+        approval_tool = self.workflow.tool_definitions[0]
+        agent = self.workflow.agent_definitions[0].model_copy(
+            deep=True,
+            update={"id": "agent-multi-approval", "tool_ids": [read_tool.id, approval_tool.id]},
+        )
+        task = self.workflow.task_definitions[0].model_copy(
+            deep=True,
+            update={
+                "id": "task-multi-approval",
+                "agent_id": agent.id,
+                "tool_ids": [read_tool.id, approval_tool.id],
+            },
+        )
+        node = self.workflow.nodes[0].model_copy(
+            deep=True,
+            update={"id": "node-multi-approval", "task_id": task.id, "agent_id": agent.id},
+        )
+        workflow = self.workflow.model_copy(
+            deep=True,
+            update={
+                "id": "workflow-multi-approval",
+                "nodes": [node],
+                "entrypoint": node.id,
+                "task_definitions": [task],
+                "agent_definitions": [agent],
+                "tool_definitions": [read_tool, approval_tool],
+            },
+        )
+        await self.context.runtime_registry.register_workflow(workflow)
+        execution = await self.context.runtime_registry.create_execution(
+            workflow.id,
+            {"topic": "multi-tool-approval"},
+            {"created_by": "tester"},
+            runtime_adapter_id="native",
+        )
+        await self.context.control_plane.queue_start(execution.id)
+        waiting = await self._wait_for_execution_status(execution.id, "waiting_for_approval")
+        async with asyncio.timeout(2):
+            while waiting.worker_id is not None:
+                await asyncio.sleep(0.01)
+                waiting = await self.context.execution_store.get_execution(execution.id)
+
+        before_events = await self.context.execution_store.list_events(execution.id)
+        read_completions = [
+            event for event in before_events
+            if event.event_type == ExecutionEventType.TOOL_CALL_COMPLETED
+            and event.payload.get("tool_id") == read_tool.id
+        ]
+        self.assertEqual(len(read_completions), 1)
+
+        # Rebuild the process-local pieces while retaining only the durable
+        # execution, event, wait, and approval records.
+        self.context.execution_engine._states.clear()  # noqa: SLF001
+        restarted_manager = ApprovalManager(self.context.execution_store, poll_interval_seconds=0.01)
+        self.context.execution_engine.approval_manager = restarted_manager
+        self.context.execution_engine.agent_executor.tool_executor.approval_manager = restarted_manager
+        restarted_control_plane = ExecutionControlPlane(
+            runtime_registry=self.context.runtime_registry,
+            execution_store=self.context.execution_store,
+            approval_manager=restarted_manager,
+            execution_isolation_enabled=False,
+            worker_id="restarted-test-worker",
+        )
+        self.assertTrue(await restarted_control_plane.approve(
+            execution.id,
+            approval_tool.id,
+            "approved after restart",
+        ))
+        final = await self._wait_for_execution_status(execution.id, "completed")
+        self.assertEqual(final.status.value, "completed")
+
+        final_events = await self.context.execution_store.list_events(execution.id)
+        read_completions = [
+            event for event in final_events
+            if event.event_type == ExecutionEventType.TOOL_CALL_COMPLETED
+            and event.payload.get("tool_id") == read_tool.id
+        ]
+        approval_completions = [
+            event for event in final_events
+            if event.event_type == ExecutionEventType.TOOL_CALL_COMPLETED
+            and event.payload.get("tool_id") == approval_tool.id
+        ]
+        self.assertEqual(len(read_completions), 1)
+        self.assertEqual(len(approval_completions), 1)
 
     async def test_computer_use_mutation_requires_approval_and_completes_after_approval(self):
         self.context.llm_provider_registry.register(
@@ -236,6 +465,8 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
                 sandbox_required=True,
                 redaction_enabled=True,
                 redaction_rules=["token"],
+                module_allowlist=["tests.native_test_tools"],
+                function_allowlist=["computer_use_click"],
             ),
             mcp_exposure=MCPExposureSettings(),
         )
@@ -337,7 +568,12 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
                 callable_name="computer_use_click",
                 config={"tool_family": "computer_use", "canonical_tool_name": "click"},
             ),
-            security=SecuritySettings(approval_required=True, sandbox_required=True),
+            security=SecuritySettings(
+                approval_required=True,
+                sandbox_required=True,
+                module_allowlist=["tests.native_test_tools"],
+                function_allowlist=["computer_use_click"],
+            ),
             mcp_exposure=MCPExposureSettings(),
         )
         agent = AgentDefinition(
@@ -447,6 +683,60 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
         resumed = await self.context.control_plane.resume(execution.id)
         self.assertIn(resumed.status.value, {"queued", "running", "completed"})
 
+    async def test_pause_sleeping_execution_cancels_cycle_timer(self):
+        execution = await self.context.runtime_registry.create_execution(
+            self.workflow.id,
+            {"topic": "pause cycle"},
+            {"created_by": "tester"},
+            runtime_adapter_id="native",
+        )
+        wait = await self.context.execution_store.create_execution_wait(
+            ExecutionWait(
+                execution_id=execution.id,
+                kind=ExecutionWaitKind.SLEEP,
+                idempotency_key="persistent-cycle:2",
+                wake_at=utc_now() + timedelta(minutes=5),
+                metadata={"source": "persistent_cycle"},
+            )
+        )
+        execution.status = execution.status.__class__.SLEEPING
+        execution.metadata["active_wait"] = {"wait_id": wait.id, "kind": "sleep"}
+        await self.context.execution_store.update_execution(execution)
+
+        paused = await self.context.control_plane.pause(execution.id)
+        waits = await self.context.execution_store.list_execution_waits(execution.id)
+
+        self.assertEqual(paused.status.value, "paused")
+        self.assertEqual(waits[0].status, ExecutionWaitStatus.CANCELLED)
+        self.assertNotIn("active_wait", paused.metadata)
+
+    async def test_cancel_sleeping_execution_cancels_cycle_timer(self):
+        execution = await self.context.runtime_registry.create_execution(
+            self.workflow.id,
+            {"topic": "cancel cycle"},
+            {"created_by": "tester"},
+            runtime_adapter_id="native",
+        )
+        wait = await self.context.execution_store.create_execution_wait(
+            ExecutionWait(
+                execution_id=execution.id,
+                kind=ExecutionWaitKind.SLEEP,
+                idempotency_key="persistent-cycle:2",
+                wake_at=utc_now() + timedelta(minutes=5),
+                metadata={"source": "persistent_cycle"},
+            )
+        )
+        execution.status = execution.status.__class__.SLEEPING
+        execution.metadata["active_wait"] = {"wait_id": wait.id, "kind": "sleep"}
+        await self.context.execution_store.update_execution(execution)
+
+        cancelled = await self.context.control_plane.cancel(execution.id)
+        waits = await self.context.execution_store.list_execution_waits(execution.id)
+
+        self.assertEqual(cancelled.status.value, "cancelled")
+        self.assertEqual(waits[0].status, ExecutionWaitStatus.CANCELLED)
+        self.assertNotIn("active_wait", cancelled.metadata)
+
     async def test_stale_execution_recovery(self):
         execution = await self.context.runtime_registry.create_execution(
             self.workflow.id,
@@ -465,10 +755,68 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current.status.value, "queued")
         self.assertIsNone(current.worker_id)
 
-    async def test_stale_execution_repair_handles_queued_running_paused_and_cancelling(self):
+    async def test_stale_approval_wait_is_failed_and_its_request_is_expired(self):
+        execution = await self.context.runtime_registry.create_execution(
+            self.workflow.id,
+            {"topic": "abandoned approval"},
+            {"created_by": "tester"},
+            runtime_adapter_id="native",
+        )
+        execution.status = execution.status.__class__.WAITING_FOR_APPROVAL
+        execution.worker_id = "dead-approval-worker"
+        execution.last_heartbeat_at = utc_now() - timedelta(seconds=10)
+        execution.metadata = {
+            **execution.metadata,
+            "pending_approval": {"tool_id": "tool-approval", "payload": {"text": "approve me"}},
+        }
+        await self.context.execution_store.update_execution(execution)
+        request_id = await self.context.execution_store.create_approval_request(
+            execution_id=execution.id,
+            event_id=None,
+            tool_id="tool-approval",
+            status="pending",
+            payload={"arguments": {"text": "approve me"}},
+        )
+
+        repaired = await self.context.control_plane.repair_stale_executions(execution_id=execution.id)
+
+        current = await self.context.execution_store.get_execution(execution.id)
+        approval = await self.context.execution_store.get_approval_request(request_id)
+        events = await self.context.execution_store.list_events(execution.id)
+        self.assertEqual(repaired[0]["repair_action"], "failed_abandoned_approval")
+        self.assertEqual(current.status.value, "failed")
+        self.assertIsNotNone(current.completed_at)
+        self.assertIn("worker stopped heartbeating", current.error)
+        self.assertNotIn("pending_approval", current.metadata)
+        self.assertEqual(current.metadata["stale_repair"]["expired_approval_request_ids"], [request_id])
+        self.assertEqual(approval["status"], "expired")
+        self.assertFalse(approval["response_payload"]["granted"])
+        self.assertEqual(approval["responded_by"], "runtime_reconciler")
+        self.assertEqual(events[-1].event_type, ExecutionEventType.EXECUTION_FAILED)
+
+    async def test_live_approval_wait_is_not_repaired(self):
+        execution = await self.context.runtime_registry.create_execution(
+            self.workflow.id,
+            {"topic": "live approval"},
+            {"created_by": "tester"},
+            runtime_adapter_id="native",
+        )
+        execution.status = execution.status.__class__.WAITING_FOR_APPROVAL
+        execution.worker_id = "live-approval-worker"
+        execution.last_heartbeat_at = utc_now()
+        await self.context.execution_store.update_execution(execution)
+
+        repaired = await self.context.control_plane.repair_stale_executions(execution_id=execution.id)
+
+        current = await self.context.execution_store.get_execution(execution.id)
+        self.assertEqual(repaired, [])
+        self.assertEqual(current.status.value, "waiting_for_approval")
+        self.assertEqual(current.worker_id, "live-approval-worker")
+
+    async def test_stale_execution_repair_handles_queued_running_and_cancelling(self):
         old_heartbeat = utc_now() - timedelta(seconds=10)
         executions = {}
-        for status in ("queued", "running", "paused", "cancelling"):
+        for status in ("queued", "running", "cancelling"):
             execution = await self.context.runtime_registry.create_execution(
                 self.workflow.id,
                 {"topic": status},
@@ -504,11 +852,10 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
             {
                 "queued": "requeued",
                 "running": "requeued",
-                "paused": "requeued",
                 "cancelling": "marked_cancelled",
             },
         )
-        for status in ("queued", "running", "paused"):
+        for status in ("queued", "running"):
             current = await self.context.execution_store.get_execution(executions[status].id)
             self.assertEqual(current.status.value, "queued")
             self.assertIsNone(current.worker_id)
@@ -533,9 +880,38 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cancelling_events[-1].payload["partial_result_preservation"], preservation)
 
         metrics = self.context.runtime_operations.snapshot_dict()
-        self.assertEqual(metrics["counters"]["stale_execution_repairs"], 4)
-        self.assertEqual(metrics["counters"]["stale_execution_repairs.requeued"], 3)
+        self.assertEqual(metrics["counters"]["stale_execution_repairs"], 3)
+        self.assertEqual(metrics["counters"]["stale_execution_repairs.requeued"], 2)
         self.assertEqual(metrics["counters"]["stale_execution_repairs.marked_cancelled"], 1)
+
+    async def test_stale_repair_preserves_paused_and_durable_waits(self):
+        old_heartbeat = utc_now() - timedelta(seconds=10)
+        executions = []
+        for status in (
+                "paused",
+                "waiting_for_input",
+                "waiting_for_event",
+                "sleeping",
+        ):
+            execution = await self.context.runtime_registry.create_execution(
+                self.workflow.id,
+                {"topic": status},
+                {"created_by": "tester"},
+                runtime_adapter_id="native",
+            )
+            execution.status = execution.status.__class__(status)
+            execution.worker_id = f"worker-{status}"
+            execution.last_heartbeat_at = old_heartbeat
+            await self.context.execution_store.update_execution(execution)
+            executions.append(execution)
+
+        repaired = await self.context.control_plane.repair_stale_executions()
+
+        self.assertEqual(repaired, [])
+        for execution in executions:
+            current = await self.context.execution_store.get_execution(execution.id)
+            self.assertEqual(current.status, execution.status)
+            self.assertNotIn("stale_repair", current.metadata)
 
     async def test_stale_execution_repair_marks_completed_when_checkpoint_finished_terminal_nodes(self):
         agent = self.workflow.agent_definitions[0]
@@ -745,6 +1121,18 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(current)
         self.assertIsNotNone(current.last_heartbeat_at)
         self.assertGreaterEqual(current.last_heartbeat_at, current.started_at)
+
+    async def test_global_isolation_cannot_be_downgraded_by_execution_metadata(self):
+        self.context.control_plane.execution_isolation_enabled = True
+        execution = await self.context.runtime_registry.create_execution(
+            self.workflow.id,
+            {"topic": "isolation-boundary"},
+            {"created_by": "tester", "execution_host": "local"},
+            runtime_adapter_id="native",
+        )
+
+        self.assertEqual(execution.metadata["execution_host"], "local")
+        self.assertEqual(self.context.control_plane._execution_host_for(execution), "docker")
 
     async def test_queue_start_prepares_isolated_runtime_when_enabled(self):
         class FakeRuntimeRevisionService:
@@ -1912,6 +2300,7 @@ class ExecutionControlPlaneStreamingTests(unittest.TestCase):
                     id="user-execution-stream",
                     email="execution-stream@example.com",
                     display_name="Execution Stream User",
+                    roles=["admin"],
                 )
             )
         )

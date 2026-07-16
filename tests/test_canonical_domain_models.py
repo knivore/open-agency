@@ -44,6 +44,19 @@ from app.domain.models import (
 
 
 class CanonicalDomainModelTests(unittest.TestCase):
+    def test_privileged_security_capabilities_always_require_sandboxing(self):
+        for capability in ("allow_shell", "allow_browser", "allow_filesystem", "allow_network"):
+            with self.subTest(capability=capability):
+                security = SecuritySettings.model_validate(
+                    {"sandbox_required": False, capability: True}
+                )
+                self.assertTrue(security.has_privileged_capabilities)
+                self.assertTrue(security.sandbox_required)
+
+        unprivileged = SecuritySettings(sandbox_required=False)
+        self.assertFalse(unprivileged.has_privileged_capabilities)
+        self.assertFalse(unprivileged.sandbox_required)
+
     def test_model_provider_and_profile_round_trip(self):
         provider = ModelProviderDefinition(
             name="Local vLLM",

@@ -55,7 +55,6 @@ _CONNECTOR_DEFINITIONS: tuple[ConnectorDefinition, ...] = (
     ConnectorDefinition(
         key="telegram-bot",
         aliases=("telegram",),
-        onecli_transport_mode="direct",
         instance_identity_metadata=(
             _identity("bot_user_id", "Telegram bot user id for distinguishing multiple bot tokens."),
             _identity("bot_username", "Telegram bot username shown to operators and agents."),
@@ -63,7 +62,7 @@ _CONNECTOR_DEFINITIONS: tuple[ConnectorDefinition, ...] = (
         required_metadata=(
             ConnectorRequirement(
                 metadata_key="webhook_secret_ref",
-                alternative_metadata_keys=("webhook_secret_token",),
+                alternative_metadata_keys=("webhook_secret_token", "webhook_secret_token_sha256"),
                 description=(
                     "Telegram production webhooks require metadata.webhook_secret_ref "
                     "or metadata.webhook_secret_token."

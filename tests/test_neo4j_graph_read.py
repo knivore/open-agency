@@ -58,8 +58,8 @@ class FakeNeo4jReadSession:
     async def __aexit__(self, _exc_type, exc, _tb):
         return None
 
-    async def run(self, cypher: str, **params):
-        self.driver.calls.append({"cypher": cypher, "params": params})
+    async def run(self, query: str, parameters: dict | None = None, **params):
+        self.driver.calls.append({"cypher": query, "params": {**(parameters or {}), **params}})
         return FakeAsyncResult(self.driver.records)
 
 

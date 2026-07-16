@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from .agents import FrameworkHints
 from .credentials import ConnectorBindingDefinition, CredentialReference, DomainModel
+from .intent_routing import ToolRoutingMetadata
 
 
 class ToolType(str, Enum):
@@ -59,6 +60,18 @@ class SecuritySettings(DomainModel):
     connector_bindings: List[ConnectorBindingDefinition] = Field(default_factory=list)
     redaction_enabled: bool = False
     redaction_rules: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def require_sandbox_for_privileged_capabilities(self) -> "SecuritySettings":
+        if self.has_privileged_capabilities and not self.sandbox_required:
+            # Privileged adapters are executable boundaries. Normalize legacy and
+            # user-authored definitions before they can reach the native executor.
+            self.sandbox_required = True
+        return self
+
+    @property
+    def has_privileged_capabilities(self) -> bool:
+        return any((self.allow_shell, self.allow_browser, self.allow_filesystem, self.allow_network))
 
     @property
     def approval_required(self) -> bool:
@@ -135,6 +148,7 @@ class ToolDefinition(DomainModel):
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     mcp_exposure: MCPExposureSettings = Field(default_factory=MCPExposureSettings)
     tags: List[str] = Field(default_factory=list)
+    routing: ToolRoutingMetadata | None = None
     framework_hints: FrameworkHints = Field(default_factory=FrameworkHints)
 
     @model_validator(mode="after")

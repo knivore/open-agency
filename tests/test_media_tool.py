@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from app.core import storage
 from app.services.conversations.channel_delivery import ChannelOutboundDeliveryService
@@ -23,7 +25,7 @@ class MediaToolCatalogTests(unittest.TestCase):
         self.assertIn("delivery", tool.tags)
         self.assertTrue(tool.security.allow_network)
         self.assertTrue(tool.security.allow_filesystem)
-        self.assertTrue(tool.security.requires_approval)
+        self.assertFalse(tool.security.requires_approval)
         self.assertFalse(tool.security.read_only)
         self.assertEqual(tool.implementation.module, "app.tools.implementations.media")
         self.assertEqual(tool.implementation.function, "send_media")
@@ -134,6 +136,31 @@ class MediaToolBehaviorTests(unittest.TestCase):
         self.assertEqual(provider_payload["filename"], "output.wav")
         self.assertIn(provider_payload["content_type"], {"audio/wav", "audio/x-wav"})
         self.assertTrue(any("Discord can upload" in warning for warning in result["warnings"]))
+
+    def test_send_media_uses_native_api_context_for_real_delivery(self) -> None:
+        api_context = object()
+        tool_context = SimpleNamespace(
+            api_tool_runtime_executor=SimpleNamespace(context=api_context),
+        )
+        with patch(
+                "app.tools.implementations.media.send_media_with_context",
+                new=AsyncMock(return_value={"status": "sent", "provider": "discord-bot"}),
+        ) as context_send:
+            pending = send_media(
+                provider="discord",
+                media_type="document",
+                file_path="/tmp/notice.txt",
+                destination_id="channel-1",
+                credential_id="credential-1",
+                owner_user_id="user-1",
+                dry_run=False,
+                tool_context=tool_context,
+            )
+            result = asyncio.run(pending)
+
+        self.assertEqual(result["status"], "sent")
+        context_send.assert_awaited_once()
+        self.assertIs(context_send.await_args.args[0], api_context)
 
     def test_build_media_delivery_payload_uses_discord_image_embed(self) -> None:
         request = MediaSendInput(

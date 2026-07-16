@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from fastapi.testclient import TestClient
+from unittest.mock import patch
 
 from app.api.context import create_test_api_context
 from app.api.main import create_app
@@ -118,6 +119,29 @@ class ModelHealthApiTests(unittest.TestCase):
         self.assertEqual(payload["source"], "curated")
         model_ids = {item["id"] for item in payload["models"]}
         self.assertIn("gpt-4.1", model_ids)
+
+    def test_official_provider_models_rejects_custom_credential_destination(self) -> None:
+        self._run(
+            self.context.model_provider_repo.create(
+                ModelProviderDefinition(
+                    id="provider-openai-custom-host",
+                    name="OpenAI redirected",
+                    provider_type="openai",
+                    config={"base_url": "https://attacker.test/v1"},
+                )
+            )
+        )
+
+        with patch("app.services.models.httpx.AsyncClient") as client_factory:
+            response = self.client.get(
+                "/model-providers/provider-openai-custom-host/models",
+                headers=self.owner_headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["source"], "curated")
+        self.assertIn("Custom base_url is not allowed", response.json()["error"])
+        client_factory.assert_not_called()
 
     def test_model_provider_models_endpoint_returns_deepseek_curated_models(self) -> None:
         self._run(

@@ -73,6 +73,14 @@ def _env_name_for_ref(secret_ref: Any) -> str | None:
     return None
 
 
+def _source_env_name(secret_ref: Any) -> str | None:
+    if secret_ref.ref.startswith("env://"):
+        return secret_ref.ref[len("env://"):].strip() or None
+    if secret_ref.ref.startswith("env:"):
+        return secret_ref.ref[len("env:"):].strip() or None
+    return None
+
+
 def _settings_env_fallback(env_name: str) -> str | None:
     mapping = {
         "FIRECRAWL_API_KEY": "firecrawl_api_key",
@@ -100,6 +108,23 @@ def build_mcp_process_environment(definition: MCPServerDefinition) -> dict[str, 
             raise MCPClientError(
                 f"MCP server '{definition.id}' has env ref '{secret_ref.ref}' without a target env var key"
             )
+        settings = get_settings()
+        if settings.app_env != "test" and env_name not in settings.parsed_mcp_server_allowed_env_vars:
+            raise MCPClientError(
+                f"MCP server '{definition.id}' env var '{env_name}' is not allowed by MCP_SERVER_ALLOWED_ENV_VARS"
+            )
+        source_env_name = _source_env_name(secret_ref)
+        if settings.app_env != "test" and source_env_name is not None:
+            if source_env_name not in settings.parsed_mcp_server_allowed_env_vars:
+                raise MCPClientError(
+                    f"MCP server '{definition.id}' source env var is not allowed by MCP_SERVER_ALLOWED_ENV_VARS"
+                )
+            if source_env_name != env_name:
+                # Prevent an allowed child key from becoming a laundering target
+                # for a different parent-process secret.
+                raise MCPClientError(
+                    f"MCP server '{definition.id}' env ref source must match its target env var"
+                )
         resolved = resolve_secret_ref(secret_ref.ref)
         if resolved.error:
             fallback_value = _settings_env_fallback(env_name)

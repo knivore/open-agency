@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app.core.config import get_settings
 from app.tools.implementations.custom.repo_inspect import inspect_repo
@@ -50,6 +51,36 @@ class RepoInspectToolTest(unittest.TestCase):
         get_settings.cache_clear()
         with self.assertRaisesRegex(ValueError, "Unknown repo"):
             inspect_repo(repo="agency-fe")
+
+    def test_inspect_repo_uses_runtime_workspace_when_configured_allowlist_is_unavailable(self) -> None:
+        repo = self._create_repo("agency")
+        (repo / "README.md").write_text("# Mounted Agency\n", encoding="utf-8")
+        self._git(repo, "add", "README.md")
+        self._git(repo, "commit", "-m", "seed mounted repo")
+
+        os.environ["SANDBOX_EDIT_ALLOWED_REPOS"] = str(self.temp_dir / "missing-repo")
+        with patch.dict(os.environ, {"AGENCY_BACKEND_WORKSPACE": str(repo)}, clear=False):
+            get_settings.cache_clear()
+            result = inspect_repo(repo="agency")
+        get_settings.cache_clear()
+
+        self.assertEqual(result["repo_id"], "agency")
+        self.assertEqual(result["repo_path"], str(repo.resolve()))
+
+    def test_inspect_repo_uses_runtime_workspace_when_configured_allowlist_is_unavailable(self) -> None:
+        repo = self._create_repo("agency")
+        (repo / "README.md").write_text("# Mounted Agency\n", encoding="utf-8")
+        self._git(repo, "add", "README.md")
+        self._git(repo, "commit", "-m", "seed mounted repo")
+
+        os.environ["SANDBOX_EDIT_ALLOWED_REPOS"] = str(self.temp_dir / "missing-repo")
+        with patch.dict(os.environ, {"AGENCY_BACKEND_WORKSPACE": str(repo)}, clear=False):
+            get_settings.cache_clear()
+            result = inspect_repo(repo="agency")
+        get_settings.cache_clear()
+
+        self.assertEqual(result["repo_id"], "agency")
+        self.assertEqual(result["repo_path"], str(repo.resolve()))
 
     def test_inspect_repo_collects_hits_beyond_max_files_preview(self) -> None:
         repo = self._create_repo("scan-target")

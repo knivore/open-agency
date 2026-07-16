@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 import unittest
@@ -54,8 +55,21 @@ from app.db.repositories import (
     WorkflowVersionRepository,
 )
 from app.db.session import get_async_engine, get_session_maker, reset_session_state
-from app.domain import ContextHealth, Execution, ExecutionEvent, ExecutionEventType, ExecutionStatus, MemoryRecord, TokenUsage
+from app.domain import (
+    ContextHealth,
+    Execution,
+    ExecutionEvent,
+    ExecutionEventType,
+    ExecutionStatus,
+    ExecutionWait,
+    ExecutionWaitKind,
+    ExecutionWaitStatus,
+    MemoryRecord,
+    TokenUsage,
+)
 from app.runtime.governance.recorder import record_context_health_snapshot, record_token_usage_snapshot
+from app.runtime.native.approvals import ApprovalManager
+from app.runtime.native.errors import ExecutionApprovalSuspendedError
 from app.runtime.native.state import SQLExecutionStore
 
 
@@ -104,6 +118,7 @@ class PostgresSchemaTests(unittest.IsolatedAsyncioTestCase):
             "executions",
             "execution_events",
             "execution_artifacts",
+            "execution_waits",
             "schedules",
             "schedule_fire_claims",
             "credentials",
@@ -458,6 +473,116 @@ class PostgresSchemaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.sequence, 1)
         self.assertEqual(second.sequence, 2)
 
+    async def test_sql_execution_wait_resolution_is_atomic_and_idempotent(self) -> None:
+        async with self.session_factory() as session:
+            session.add(WorkflowORM(id="workflow-wait-store", name="Wait Store", current_version=1, enabled=True))
+            await session.commit()
+
+        store = SQLExecutionStore(self.session_factory)
+        execution = await store.save_execution(
+            Execution(
+                id="execution-wait-store",
+                workflow_id="workflow-wait-store",
+                runtime_adapter="native",
+                status=ExecutionStatus.PAUSED,
+            )
+        )
+        wait = await store.create_execution_wait(
+            ExecutionWait(
+                id="wait-store-1",
+                execution_id=execution.id,
+                kind=ExecutionWaitKind.INPUT,
+                idempotency_key="input:store",
+            )
+        )
+
+        resolved, claimed = await store.resolve_execution_wait(
+            wait.id,
+            status=ExecutionWaitStatus.RESOLVED,
+            resolution_key="message:store-1",
+            resolution_payload={"answer": "yes"},
+            resolved_by="operator",
+        )
+        duplicate, duplicate_claimed = await store.resolve_execution_wait(
+            wait.id,
+            status=ExecutionWaitStatus.RESOLVED,
+            resolution_key="message:store-1",
+            resolution_payload={"answer": "yes"},
+            resolved_by="operator",
+        )
+        conflicting, conflicting_claimed = await store.resolve_execution_wait(
+            wait.id,
+            status=ExecutionWaitStatus.RESOLVED,
+            resolution_key="message:store-2",
+            resolution_payload={"answer": "no"},
+            resolved_by="operator",
+        )
+
+        self.assertTrue(claimed)
+        self.assertFalse(duplicate_claimed)
+        self.assertFalse(conflicting_claimed)
+        self.assertEqual(resolved.resolution_payload, {"answer": "yes"})
+        self.assertEqual(duplicate.id, wait.id)
+        self.assertIsNone(conflicting)
+
+        next_wait = await store.create_execution_wait(
+            ExecutionWait(
+                id="wait-store-2",
+                execution_id=execution.id,
+                kind=ExecutionWaitKind.EVENT,
+                idempotency_key="event:store",
+                correlation_key="deploy:store",
+            )
+        )
+        self.assertEqual(next_wait.status, ExecutionWaitStatus.PENDING)
+
+    async def test_sql_approval_decision_is_consumed_after_durable_resume(self) -> None:
+        async with self.session_factory() as session:
+            session.add(WorkflowORM(id="workflow-sql-approval", name="SQL Approval", current_version=1, enabled=True))
+            await session.commit()
+
+        worker_store = SQLExecutionStore(self.session_factory)
+        api_store = SQLExecutionStore(self.session_factory)
+        execution = await worker_store.save_execution(
+            Execution(
+                id="execution-sql-approval",
+                workflow_id="workflow-sql-approval",
+                runtime_adapter="native",
+                status=ExecutionStatus.RUNNING,
+            )
+        )
+        worker_manager = ApprovalManager(worker_store, poll_interval_seconds=0.01)
+        api_manager = ApprovalManager(api_store, poll_interval_seconds=0.01)
+        with self.assertRaises(ExecutionApprovalSuspendedError):
+            await worker_manager.request_approval(
+                execution_id=execution.id,
+                tool_id="agency.voice.generate",
+                payload={"text": "hello"},
+            )
+        for _ in range(100):
+            if await api_store.list_approval_requests(execution.id):
+                break
+            await asyncio.sleep(0.01)
+        else:
+            self.fail("SQL approval request was not persisted")
+
+        approved = await api_manager.approve(
+            execution_id=execution.id,
+            tool_id="agency.voice.generate",
+            reason="Approved by API process",
+        )
+        decision = await worker_manager.request_approval(
+            execution_id=execution.id,
+            tool_id="agency.voice.generate",
+            payload={"text": "hello"},
+        )
+
+        self.assertTrue(approved)
+        self.assertTrue(decision.granted)
+        self.assertEqual(decision.reason, "Approved by API process")
+        requests = await api_store.list_approval_requests(execution.id)
+        self.assertEqual(requests[-1]["status"], "approved")
+
     async def test_sql_execution_store_persists_runtime_governance_metadata_across_status_update(self) -> None:
         async with self.session_factory() as session:
             session.add(
@@ -574,8 +699,9 @@ class AlembicUpgradeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             db_path = Path(tmp_dir) / "alembic.db"
             db_url = f"sqlite+aiosqlite:///{db_path}"
-            ini_path = Path("/Users/kehchinleong/Documents/Personal/Agency/agency/alembic.ini")
-            alembic_path = Path("/Users/kehchinleong/Documents/Personal/Agency/agency/alembic")
+            repository_root = Path(__file__).resolve().parents[1]
+            ini_path = repository_root / "alembic.ini"
+            alembic_path = repository_root / "alembic"
             with patch.dict(
                     os.environ,
                     {
@@ -598,6 +724,7 @@ class AlembicUpgradeTests(unittest.TestCase):
             execution_columns = {column["name"] for column in inspector.get_columns("executions")}
             execution_indexes = {index["name"] for index in inspector.get_indexes("executions")}
             runtime_revision_indexes = {index["name"] for index in inspector.get_indexes("runtime_revisions")}
+            execution_wait_indexes = {index["name"] for index in inspector.get_indexes("execution_waits")}
             channel_identity_indexes = {
                 index["name"] for index in inspector.get_indexes("channel_identity_mappings")
             }
@@ -610,6 +737,7 @@ class AlembicUpgradeTests(unittest.TestCase):
         self.assertIn("workflow_versions", tables)
         self.assertIn("runtime_revisions", tables)
         self.assertIn("approval_requests", tables)
+        self.assertIn("execution_waits", tables)
         self.assertIn("outbound_webhook_attempts", tables)
         self.assertIn("channel_identity_mappings", tables)
         self.assertIn("home_context_rooms", tables)
@@ -619,6 +747,8 @@ class AlembicUpgradeTests(unittest.TestCase):
         self.assertIn("metadata_json", execution_columns)
         self.assertIn("ix_executions_runtime_revision_id", execution_indexes)
         self.assertIn("ix_runtime_revisions_fingerprint", runtime_revision_indexes)
+        self.assertIn("ix_execution_waits_status_wake_at", execution_wait_indexes)
+        self.assertIn("ix_execution_waits_correlation_key", execution_wait_indexes)
         self.assertIn("ix_channel_identity_mappings_channel", channel_identity_indexes)
         self.assertIn("ix_channel_identity_mappings_internal_user_id", channel_identity_indexes)
         self.assertIn("ix_conversation_messages_external_message", conversation_message_indexes)

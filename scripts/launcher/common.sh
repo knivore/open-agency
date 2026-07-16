@@ -9,7 +9,67 @@ command_exists() {
 }
 
 saved_tunnel_preference_path() {
-  printf '%s\n' "${AGENCY_TUNNEL_PREFERENCE_PATH:-${ROOT_DIR}/.agency/tunnel-preference.json}"
+  local configured="${AGENCY_TUNNEL_PREFERENCE_PATH:-}"
+
+  if [ -z "${configured}" ]; then
+    printf '%s\n' "${ROOT_DIR}/.agency/tunnel-preference.json"
+    return 0
+  fi
+
+  case "${configured}" in
+    /*)
+      printf '%s\n' "${configured}"
+      ;;
+    [A-Za-z]:[\\/]*)
+      if command_exists cygpath; then
+        cygpath -u "${configured}"
+      else
+        printf '%s\n' "${configured}"
+      fi
+      ;;
+    ~/*)
+      printf '%s/%s\n' "${HOME}" "${configured#~/}"
+      ;;
+    *)
+      # Relative values in .env are workspace-relative, independent of the
+      # directory from which the launcher was invoked.
+      printf '%s/%s\n' "${ROOT_DIR}" "${configured#./}"
+      ;;
+  esac
+}
+
+load_dotenv() {
+  if [ -f "${ROOT_DIR}/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "${ROOT_DIR}/.env"
+    set +a
+  fi
+}
+
+load_dotenv_preserving_cli_tunnel_overrides() {
+  local cli_tunnel_override="${AGENCY_TUNNEL_CLI_OVERRIDE:-false}"
+  local cli_tunnel_provider="${AGENCY_PUBLIC_TUNNEL_PROVIDER:-}"
+  local cli_tunnel_domain="${AGENCY_TUNNEL_CUSTOM_DOMAIN:-}"
+  local cli_tunnel_domain_set="${AGENCY_TUNNEL_CUSTOM_DOMAIN+x}"
+
+  load_dotenv
+
+  if [ "${cli_tunnel_override}" = "true" ]; then
+    if [ -n "${cli_tunnel_provider}" ]; then
+      export AGENCY_PUBLIC_TUNNEL_PROVIDER="${cli_tunnel_provider}"
+    fi
+    if [ "${cli_tunnel_domain_set}" = "x" ]; then
+      export AGENCY_TUNNEL_CUSTOM_DOMAIN="${cli_tunnel_domain}"
+    fi
+    export AGENCY_TUNNEL_CLI_OVERRIDE="true"
+  fi
+}
+
+tunnel_auto_install_enabled() {
+  # Automatic installation is opt-out so fresh starts and saved setup
+  # preferences behave the same on macOS and Windows.
+  [ "${AGENCY_TUNNEL_AUTO_INSTALL:-true}" = "true" ]
 }
 
 detected_tunnel_provider() {

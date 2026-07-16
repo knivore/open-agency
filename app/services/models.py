@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.api.context import ApiContext
+from app.core.config import get_settings
+from app.core.outbound_http import validate_model_provider_url
 from app.domain import ModelProfileDefinition, ModelProviderDefinition, ModelProviderType
 
 CURATED_MODEL_OPTIONS: dict[str, list[dict[str, str]]] = {
@@ -115,18 +117,23 @@ class ModelCatalogService:
 
     def _provider_base_url(self, provider: ModelProviderDefinition) -> str | None:
         configured = provider.endpoint.base_url if provider.endpoint else (provider.config or {}).get("base_url")
-        if configured:
-            return configured
         provider_type = self._provider_type(provider)
-        if provider_type == ModelProviderType.OPENAI.value:
-            return "https://api.openai.com/v1"
-        if provider_type == ModelProviderType.OPENAI_CODEX.value:
-            return "https://api.openai.com/v1"
-        if provider_type == ModelProviderType.DEEPSEEK.value:
-            return "https://api.deepseek.com"
-        if provider_type == ModelProviderType.QWEN.value:
-            return "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-        return None
+        if not configured:
+            configured = {
+                ModelProviderType.OPENAI.value: "https://api.openai.com/v1",
+                ModelProviderType.OPENAI_CODEX.value: "https://api.openai.com/v1",
+                ModelProviderType.DEEPSEEK.value: "https://api.deepseek.com",
+                ModelProviderType.QWEN.value: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            }.get(provider_type)
+        if not configured:
+            return None
+        provider_key = self._provider_family(provider) if provider_type == ModelProviderType.OTHER.value else provider_type
+        validate_model_provider_url(
+            str(configured),
+            provider_key=provider_key,
+            allowed_custom_hosts=get_settings().parsed_model_provider_allowed_hosts,
+        )
+        return str(configured)
 
     def _provider_auth_profile(self, provider: ModelProviderDefinition) -> dict[str, Any]:
         config = dict(provider.config or {})

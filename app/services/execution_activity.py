@@ -8,6 +8,10 @@ from app.domain import Execution, ExecutionEvent, ExecutionEventType
 
 ACTIVITY_EVENT_TYPES = {
     ExecutionEventType.EXECUTION_STARTED,
+    ExecutionEventType.EXECUTION_CYCLE_STARTED,
+    ExecutionEventType.EXECUTION_CYCLE_COMPLETED,
+    ExecutionEventType.EXECUTION_CYCLE_FAILED,
+    ExecutionEventType.EXECUTION_CYCLE_GUARD_TRIGGERED,
     ExecutionEventType.EXECUTION_PAUSED,
     ExecutionEventType.EXECUTION_RESUMED,
     ExecutionEventType.TASK_STARTED,

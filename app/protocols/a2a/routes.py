@@ -12,6 +12,8 @@ from fastapi import APIRouter, HTTPException, Request, status
 from typing import Optional
 
 from app.api.context import ApiContext, get_default_api_context
+from app.api.identity import request_has_identity, resolve_current_user
+from app.core.config import get_settings
 from app.runtime.native.errors import WorkflowNotFoundError
 from app.services.executions import ExecutionService
 from .adapter import A2AAdapter
@@ -26,6 +28,17 @@ def create_a2a_router(context: Optional[ApiContext] = None) -> APIRouter:
     adapter = A2AAdapter(execution_store=context.execution_store)
     execution_service = ExecutionService(context)
     router = APIRouter(tags=["A2A"])
+
+    async def require_task_access(task_id: str, request: Request, *, scopes: list[str]):
+        execution = await context.execution_store.get_execution(task_id)
+        if execution is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"A2A task '{task_id}' was not found")
+        if get_settings().app_env == "test" and not request_has_identity(request):
+            return execution
+        user = await resolve_current_user(request, context, required_scopes=scopes)
+        if "admin" in user.roles or execution.created_by == user.id:
+            return execution
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"A2A task '{task_id}' was not found")
 
     @router.get("/.well-known/agent-card.json", summary="Get A2A Agent Card")
     async def get_agent_card(request: Request):
@@ -48,7 +61,10 @@ def create_a2a_router(context: Optional[ApiContext] = None) -> APIRouter:
         return agent_definition_to_card(agent, base_url=str(request.base_url).rstrip(" /"), endpoint_path="/a2a/tasks")
 
     @router.post("/a2a/tasks", summary="Create A2A Task")
-    async def create_a2a_task(payload: A2ATaskCreate):
+    async def create_a2a_task(payload: A2ATaskCreate, request: Request):
+        current_user = None
+        if get_settings().app_env != "test" or request_has_identity(request):
+            current_user = await resolve_current_user(request, context, required_scopes=["workflows:run"])
         workflow_id = payload.workflow_id
         if workflow_id is None and payload.agent_id is not None:
             workflows = await context.workflow_repo.list()
@@ -58,12 +74,22 @@ def create_a2a_router(context: Optional[ApiContext] = None) -> APIRouter:
                     break
         if workflow_id is None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="workflowId or agentId is required")
+        workflow = await context.workflow_repo.get(workflow_id)
+        if workflow is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Workflow '{workflow_id}' not found")
+        if current_user is not None and "admin" not in current_user.roles:
+            owner_ids = workflow.metadata.get("owner_ids") if isinstance(workflow.metadata, dict) else None
+            created_by = workflow.metadata.get("created_by") if isinstance(workflow.metadata, dict) else None
+            explicit_owners = {item for item in (owner_ids or []) if isinstance(item, str)}
+            if (explicit_owners or created_by) and current_user.id not in explicit_owners and created_by != current_user.id:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Workflow owner access is required")
         try:
             execution = await execution_service.create_execution(
                 workflow_id=workflow_id,
                 input_payload=payload.input,
-                trigger=payload.trigger or {"created_by": "a2a"},
+                trigger={**(payload.trigger or {}), "created_by": current_user.id if current_user else "a2a"},
                 runtime_adapter_id=payload.runtime_adapter_id,
+                current_user=current_user,
             )
         except (WorkflowNotFoundError, KeyError) as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -73,17 +99,16 @@ def create_a2a_router(context: Optional[ApiContext] = None) -> APIRouter:
         return execution_to_a2a_task((await context.execution_store.get_execution(execution["id"])))
 
     @router.get("/a2a/tasks/{task_id}", summary="Get A2A Task")
-    async def get_a2a_task(task_id: str):
+    async def get_a2a_task(task_id: str, request: Request):
+        await require_task_access(task_id, request, scopes=["executions:read"])
         task = await adapter.get_task(task_id)
         if task is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"A2A task '{task_id}' was not found")
         return task
 
     @router.post("/a2a/tasks/{task_id}/messages", summary="Post A2A Task Message")
-    async def post_a2a_message(task_id: str, payload: A2AMessageCreate):
-        execution = await context.execution_store.get_execution(task_id)
-        if execution is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"A2A task '{task_id}' was not found")
+    async def post_a2a_message(task_id: str, payload: A2AMessageCreate, request: Request):
+        await require_task_access(task_id, request, scopes=["executions:write"])
         event = await adapter.append_message(task_id, payload.model_dump(mode="json"))
         artifact = None
         if payload.artifact is not None:
@@ -94,10 +119,8 @@ def create_a2a_router(context: Optional[ApiContext] = None) -> APIRouter:
         }
 
     @router.get("/a2a/tasks/{task_id}/artifacts", summary="List A2A Task Artifacts")
-    async def list_a2a_artifacts(task_id: str):
-        execution = await context.execution_store.get_execution(task_id)
-        if execution is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"A2A task '{task_id}' was not found")
+    async def list_a2a_artifacts(task_id: str, request: Request):
+        await require_task_access(task_id, request, scopes=["executions:read"])
         artifacts = await context.execution_store.list_artifacts(task_id)
         return {"items": [execution_artifact_to_a2a_artifact(artifact) for artifact in artifacts]}
 

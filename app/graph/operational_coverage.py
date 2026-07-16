@@ -16,7 +16,10 @@ ACTIVE_STATUSES = {
     ExecutionStatus.CREATED.value,
     ExecutionStatus.QUEUED.value,
     ExecutionStatus.RUNNING.value,
+    ExecutionStatus.WAITING_FOR_INPUT.value,
     ExecutionStatus.WAITING_FOR_APPROVAL.value,
+    ExecutionStatus.WAITING_FOR_EVENT.value,
+    ExecutionStatus.SLEEPING.value,
     ExecutionStatus.PAUSED.value,
     ExecutionStatus.CANCELLING.value,
 }

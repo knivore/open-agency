@@ -70,8 +70,15 @@ This keeps MCP as an adapter layer, not a new execution model.
 ## Security Model
 
 - MCP servers are disabled by default.
-- MCP server commands must be allowlisted with `MCP_SERVER_COMMAND_ALLOWLIST` or explicitly in the in-memory registry
-  configuration.
+- MCP server executables must be allowlisted with `MCP_SERVER_ALLOWED_COMMANDS`; the default permits only `npx` and
+  `uvx` for the built-in package-based adapters.
+- In production, `npx` packages must use an exact numeric version such as `package@1.2.3`, and `uvx` packages must use
+  an exact equality pin such as `package==1.2.3`. Tags, ranges, unversioned names, and package-selection flags are
+  rejected before an MCP subprocess is created. Configure exact reviewed versions for enabled built-in servers;
+  unversioned compatibility defaults fail closed during discovery.
+- `MCP_SERVER_ALLOWED_ENV_VARS` limits both the source environment variables and child-process target keys. For
+  `env://` references the source and target must match, preventing an allowed child key from laundering another
+  backend secret.
 - Stdio MCP subprocesses receive a normalized PATH from `MCP_SERVER_EXTRA_PATHS` plus common system locations so `npx`,
   `uvx`, `node`, and Docker-backed servers are discoverable without hardcoding machine-specific absolute paths.
 - No command string is constructed from user input; `command` and `args` come from saved server definitions.
@@ -87,7 +94,7 @@ The backend seeds a built-in Firecrawl MCP server record with id `research-firec
 ```json
 {
   "command": "npx",
-  "args": ["-y", "firecrawl-mcp"],
+  "args": ["-y", "firecrawl-mcp@3.22.3"],
   "env_refs": [{"key": "FIRECRAWL_API_KEY", "ref": "env://FIRECRAWL_API_KEY"}]
 }
 ```
@@ -109,7 +116,7 @@ The backend seeds a built-in Context7 MCP server record with id `docs-context7`.
 ```json
 {
   "command": "npx",
-  "args": ["-y", "@upstash/context7-mcp"],
+  "args": ["-y", "@upstash/context7-mcp@3.2.3"],
   "env_refs": [{"key": "CONTEXT7_API_KEY", "ref": "env://CONTEXT7_API_KEY"}]
 }
 ```

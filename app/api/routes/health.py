@@ -9,12 +9,36 @@ from fastapi.responses import FileResponse, JSONResponse
 from typing import Optional
 
 from app.api.context import ApiContext, get_default_api_context
-from app.api.identity import resolve_current_user
+from app.api.identity import resolve_current_user, resolve_current_user_if_present
 from app.api.schemas.storage import PreSignedUrlRequest
 from app.core.config import get_settings
 from app.core.storage import generate_presigned_url, get_local_file_path, mock_upload_to_local
 from app.db.session import is_database_configured, ping_database
 from app.services.main_agent_setup.service import MainAgentSetupService
+
+MAX_LOCAL_STORAGE_UPLOAD_BYTES = 10 * 1024 * 1024
+
+
+async def _require_integrations_user(request: Request, context: ApiContext, *, scopes: list[str]):
+    if get_settings().app_env == "test":
+        return await resolve_current_user_if_present(request, context, required_scopes=scopes)
+    return await resolve_current_user(request, context, required_scopes=scopes)
+
+
+async def _read_limited_body(request: Request, *, limit: int) -> bytes:
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > limit:
+                raise HTTPException(status_code=413, detail="Upload exceeds the 10 MiB size limit")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Content-Length must be an integer") from exc
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > limit:
+            raise HTTPException(status_code=413, detail="Upload exceeds the 10 MiB size limit")
+    return bytes(body)
 
 
 async def _database_status(context: ApiContext) -> dict[str, object]:
@@ -80,6 +104,8 @@ def create_health_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @router.get("/setup/status")
     async def setup_status():
+        from app.services.openvoice_setup import OpenVoiceSetupService
+
         settings = get_settings()
         database = await _database_status(context)
         users = await context.user_repo.list()
@@ -105,6 +131,7 @@ def create_health_router(context: Optional[ApiContext] = None) -> APIRouter:
 
         ready = not blockers
         next_path = "/workflows" if ready else "/setup"
+        openvoice = OpenVoiceSetupService().status()
         return {
             "ready": ready,
             "next_path": next_path,
@@ -122,6 +149,16 @@ def create_health_router(context: Optional[ApiContext] = None) -> APIRouter:
             },
             "main_agent": {
                 "configured": main_agent_complete,
+            },
+            # The public setup summary intentionally omits local filesystem paths;
+            # authenticated Profile APIs expose the detailed diagnostic status.
+            "openvoice": {
+                "optional": True,
+                "ready": openvoice["ready"],
+                "supports_cloning": openvoice["supports_cloning"],
+                "runtime_installed": openvoice["runtime"]["installed"],
+                "checkpoints_installed": openvoice["checkpoints"]["installed"],
+                "default_voice": openvoice["settings"]["default_voice"],
             },
         }
 
@@ -156,24 +193,25 @@ def create_health_router(context: Optional[ApiContext] = None) -> APIRouter:
         )
 
     @router.post("/api/presigned")
-    async def generate_presigned_url_(request: PreSignedUrlRequest):
+    async def generate_presigned_url_(payload: PreSignedUrlRequest, request: Request):
         try:
+            await _require_integrations_user(request, context, scopes=["integrations:write"])
             url = generate_presigned_url(
-                operation=request.operation,
-                filename=request.filename,
-                content_type=request.content_type,
+                operation=payload.operation,
+                filename=payload.filename,
+                content_type=payload.content_type,
             )
             return JSONResponse(content={"url": url})
         except HTTPException as exc:
             raise exc
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            raise HTTPException(status_code=500, detail="Unable to generate a presigned URL") from exc
 
     @router.put("/api/local-storage/upload")
     async def upload_file(request: Request, file: str = Query(...)):
         try:
-            await resolve_current_user(request, context, required_scopes=["integrations:write"])
-            body = await request.body()
+            await _require_integrations_user(request, context, scopes=["integrations:write"])
+            body = await _read_limited_body(request, limit=MAX_LOCAL_STORAGE_UPLOAD_BYTES)
             if not file:
                 raise HTTPException(status_code=400, detail="Filename not provided")
             target_path = get_local_file_path(file)
@@ -187,12 +225,12 @@ def create_health_router(context: Optional[ApiContext] = None) -> APIRouter:
         except HTTPException as exc:
             raise exc
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Error uploading file: {str(exc)}") from exc
+            raise HTTPException(status_code=500, detail="Unable to upload the file") from exc
 
     @router.get("/api/local-storage/download")
     async def download_file(request: Request, file: str = Query(...)):
         try:
-            await resolve_current_user(request, context, required_scopes=["integrations:read"])
+            await _require_integrations_user(request, context, scopes=["integrations:read"])
             path_to_use = get_local_file_path(file)
             if not path_to_use or not path_to_use.strip():
                 raise HTTPException(status_code=400, detail="Filename not provided")
@@ -208,6 +246,6 @@ def create_health_router(context: Optional[ApiContext] = None) -> APIRouter:
         except HTTPException as exc:
             raise exc
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Error downloading file: {str(exc)}") from exc
+            raise HTTPException(status_code=500, detail="Unable to download the file") from exc
 
     return router

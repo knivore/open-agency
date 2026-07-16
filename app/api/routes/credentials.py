@@ -14,9 +14,6 @@ from app.integrations.connectors import get_connector_definition
 from app.services.credentials import CredentialService
 from ._crud import serializable_validation_errors
 
-RAW_SECRET_PAYLOAD_KEYS = {"secret", "raw_secret", "value", "token", "password", "api_key"}
-
-
 def _hide_missing_or_cross_owner() -> HTTPException:
     return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Credential not found")
 
@@ -34,22 +31,6 @@ async def _read_optional_json_payload(request: Request) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Payload must be a JSON object")
     return payload
-
-
-def _reject_raw_secret_payload(payload: dict[str, Any]) -> None:
-    raw_keys = RAW_SECRET_PAYLOAD_KEYS.intersection({key.lower() for key in payload})
-    if raw_keys:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Raw secret material must be stored in the secret store and referenced by secret_ref",
-        )
-
-
-def _raw_secret_payload_errors(payload: dict[str, Any]) -> list[str]:
-    raw_keys = sorted(RAW_SECRET_PAYLOAD_KEYS.intersection({key.lower() for key in payload}))
-    if not raw_keys:
-        return []
-    return ["Raw secret material must be stored in the secret store and referenced by secret_ref"]
 
 
 def create_credentials_router(context: Optional[ApiContext] = None) -> APIRouter:
@@ -121,7 +102,7 @@ def create_credentials_router(context: Optional[ApiContext] = None) -> APIRouter
             ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-        return created.model_dump(mode="json")
+        return service.credential_api_payload(created)
 
     @router.post("", summary="Create Credential")
     async def create_credential(payload: dict[str, Any], request: Request):
@@ -135,13 +116,13 @@ def create_credentials_router(context: Optional[ApiContext] = None) -> APIRouter
             ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-        return created.model_dump(mode="json")
+        return service.credential_api_payload(created)
 
     @router.get("", summary="List Credentials")
     async def list_credentials(request: Request):
         current_user = await resolve_current_user(request, context, required_scopes=["integrations:read"])
         items = await service.list_credentials_for_owner(current_user.id)
-        return {"items": [item.model_dump(mode="json") for item in items]}
+        return {"items": [service.credential_api_payload(item) for item in items]}
 
     @router.get("/{credential_id}", summary="Get Credential By Id")
     async def get_credential(credential_id: str, request: Request):
@@ -149,7 +130,7 @@ def create_credentials_router(context: Optional[ApiContext] = None) -> APIRouter
         item = await service.get_credential_for_owner(credential_id, current_user.id)
         if item is None:
             raise _hide_missing_or_cross_owner()
-        return item.model_dump(mode="json")
+        return service.credential_api_payload(item)
 
     @router.put("/{credential_id}", summary="Update Credential")
     async def update_credential(credential_id: str, patch: dict[str, Any], request: Request):
@@ -169,7 +150,7 @@ def create_credentials_router(context: Optional[ApiContext] = None) -> APIRouter
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         if item is None:
             raise _hide_missing_or_cross_owner()
-        return item.model_dump(mode="json")
+        return service.credential_api_payload(item)
 
     @router.put("/{credential_id}/connector", summary="Update Connector Credential")
     async def update_connector_credential(credential_id: str, patch: dict[str, Any], request: Request):
@@ -193,7 +174,7 @@ def create_credentials_router(context: Optional[ApiContext] = None) -> APIRouter
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                                     detail=f"Connector '{provider_key}' not found")
             raise _hide_missing_or_cross_owner()
-        return item.model_dump(mode="json")
+        return service.credential_api_payload(item)
 
     @router.post("/{credential_id}/revoke", summary="Revoke Credential")
     async def revoke_credential(credential_id: str, request: Request):
@@ -201,7 +182,7 @@ def create_credentials_router(context: Optional[ApiContext] = None) -> APIRouter
         item = await service.revoke_credential_for_owner(credential_id, current_user.id)
         if item is None:
             raise _hide_missing_or_cross_owner()
-        return item.model_dump(mode="json")
+        return service.credential_api_payload(item)
 
     @router.post("/{credential_id}/rotate", summary="Mark Credential Rotated")
     async def rotate_credential(credential_id: str, request: Request):
@@ -222,7 +203,7 @@ def create_credentials_router(context: Optional[ApiContext] = None) -> APIRouter
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         if item is None:
             raise _hide_missing_or_cross_owner()
-        return item.model_dump(mode="json")
+        return service.credential_api_payload(item)
 
     @router.delete("/{credential_id}", summary="Delete Credential")
     async def delete_credential(credential_id: str, request: Request):

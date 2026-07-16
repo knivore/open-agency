@@ -423,7 +423,11 @@ class ConversationsApiTests(unittest.TestCase):
                         callable_name="echo_tool",
                         config={"tool_family": "computer_use", "canonical_tool_name": "click"},
                     ),
-                    security=SecuritySettings(requires_approval=True),
+                    security=SecuritySettings(
+                        requires_approval=True,
+                        module_allowlist=["tests.native_test_tools"],
+                        function_allowlist=["echo_tool"],
+                    ),
                     mcp_exposure=MCPExposureSettings(),
                     tags=["computer_use"],
                 )

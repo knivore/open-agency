@@ -15,6 +15,7 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: "6379"
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      AGENCY_INTERNAL_API_KEY: ${AGENCY_INTERNAL_API_KEY:-}
       OBSERVABILITY_EXPORTERS: ${OBSERVABILITY_EXPORTERS:-jsonl}
       OBSERVABILITY_REDACT_SECRETS: ${OBSERVABILITY_REDACT_SECRETS:-true}
       OBSERVABILITY_JSONL_PATH: ${OBSERVABILITY_JSONL_PATH:-logs/observability.jsonl}
@@ -104,6 +105,57 @@ services:
     networks:
       - default
       - onecli_worker_egress
+
+  frontend:
+    image: ${AGENCY_FRONTEND_NODE_IMAGE:-node:22.14.0-alpine3.21}
+    container_name: open-agency-frontend
+    profiles:
+      - container-frontend
+    working_dir: /workspace/open-agency-fe
+    command:
+      - sh
+      - -c
+      - |
+        lock_hash="$$(sha256sum package-lock.json | awk '{print $$1}'):$$(node --version)"
+        installed_hash="$$(cat node_modules/.agency-package-lock-sha 2>/dev/null || true)"
+        if [ ! -x node_modules/.bin/next ] || [ "$${lock_hash}" != "$${installed_hash}" ]; then
+          echo "Installing frontend dependencies into the managed Docker volume..."
+          npm ci
+          printf '%s\n' "$${lock_hash}" > node_modules/.agency-package-lock-sha
+        fi
+        exec npm run dev:lan -- -p 3000
+    environment:
+      NEXT_TELEMETRY_DISABLED: "1"
+      NEXT_ALLOWED_DEV_ORIGINS: ${NEXT_ALLOWED_DEV_ORIGINS:-localhost,127.0.0.1}
+      NEXT_PUBLIC_APP_ENV: local
+      AGENCY_FE_ENABLE_BACKEND_REWRITE: "true"
+      NEXT_PUBLIC_AGENCY_API_BASE_URL: /backend
+      LOCAL_BACKEND: /backend
+      AGENCY_INTERNAL_API_BASE_URL: http://backend:8000
+      AGENCY_BACKEND_INTERNAL_API_KEY: ${AGENCY_INTERNAL_API_KEY:-}
+    ports:
+      - "${AGENCY_FRONTEND_BIND_HOST:-0.0.0.0}:${FRONTEND_PORT:-3000}:3000"
+    volumes:
+      # The source remains read-only when Codex cannot write to a sibling repo.
+      - type: bind
+        source: ${AGENCY_FE_DIR:-../open-agency-fe}
+        target: /workspace/open-agency-fe
+        read_only: true
+      - type: bind
+        source: ${AGENCY_FRONTEND_CONTAINER_ENV_FILE:-../open-agency-fe/.env.example}
+        target: /workspace/open-agency-fe/.env.local
+        read_only: true
+      - type: volume
+        source: frontend_node_modules
+        target: /workspace/open-agency-fe/node_modules
+      - type: volume
+        source: frontend_next
+        target: /workspace/open-agency-fe/.next
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - default
 
   postgres:
     build:
@@ -402,6 +454,8 @@ services:
 
 volumes:
   codex_home:
+  frontend_node_modules:
+  frontend_next:
   postgres_data:
   redis_data:
   neo4j_data:

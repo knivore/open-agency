@@ -23,6 +23,8 @@ from app.domain import (
 )
 from app.llm.base import ModelResponse
 from app.services.workflow_builder import WorkflowBuilderService
+from app.services.workflow_validation import WorkflowValidationService
+from app.tools.builtins import builtin_tool_definitions
 
 
 class FakeBuilderModelClient:
@@ -346,6 +348,143 @@ class WorkflowBuilderApiTests(unittest.TestCase):
             )
 
         self.assertEqual(updated.description, "Updated description")
+
+    def test_workflow_builder_does_not_treat_storage_prefix_as_code_fix_request(self):
+        service = WorkflowBuilderService(self.context)
+        workflow = WorkflowDefinition(
+            id="workflow-read-only-learning",
+            name="Agency Learning Workflow",
+            description="Teach from Agency repo improvement ideas without modifying code.",
+            entrypoint="node-voice",
+            nodes=[
+                WorkflowNodeDefinition(
+                    id="node-voice",
+                    name="Generate voice lesson",
+                    node_type=NodeType.TASK,
+                    task_id="task-voice",
+                )
+            ],
+            task_definitions=[
+                TaskDefinition(
+                    id="task-voice",
+                    name="Generate voice lesson",
+                    description="Generate the read-only lesson narration.",
+                    instructions='Use storage_key_prefix="media/learning" for the voice artifact.',
+                    expected_output="A voice artifact.",
+                    agent_id="agent-learning",
+                    tool_ids=["agency.voice.generate"],
+                )
+            ],
+            agent_definitions=[
+                AgentDefinition(
+                    id="agent-learning",
+                    name="Learning Agent",
+                    instructions="Explain source code without changing it.",
+                    tool_ids=["agency.voice.generate"],
+                )
+            ],
+        )
+
+        goal = (
+            "Keep this read-only: explain the Agency repo code and add robust Discord notifications, "
+            "but do not modify code."
+        )
+        enhanced = service._ensure_recommendation_to_code_pipeline(workflow=workflow, goal=goal)
+
+        self.assertIs(enhanced, workflow)
+        self.assertFalse(service._goal_requests_recommendation_to_code(goal=goal, workflow=workflow))
+        self.assertEqual(enhanced.task_definitions[0].agent_id, "agent-learning")
+        self.assertNotIn("agency.command.run", enhanced.task_definitions[0].tool_ids)
+        self.assertNotIn("Coder Agent", [agent.name for agent in enhanced.agent_definitions])
+
+    def test_workflow_builder_keeps_voice_task_out_of_explicit_code_pipeline(self):
+        service = WorkflowBuilderService(self.context)
+        workflow = WorkflowDefinition(
+            id="workflow-explicit-code",
+            name="Agency Improvement Workflow",
+            description="Review recommendation ideas for the Agency repository.",
+            entrypoint="node-voice",
+            nodes=[
+                WorkflowNodeDefinition(
+                    id="node-voice",
+                    name="Generate voice lesson",
+                    node_type=NodeType.TASK,
+                    task_id="task-voice",
+                )
+            ],
+            task_definitions=[
+                TaskDefinition(
+                    id="task-voice",
+                    name="Generate voice lesson",
+                    description="Generate narration for the recommendation brief.",
+                    instructions='Use storage_key_prefix="media/learning" for the voice artifact.',
+                    expected_output="A voice artifact.",
+                    agent_id="agent-learning",
+                    tool_ids=["agency.voice.generate"],
+                )
+            ],
+            agent_definitions=[
+                AgentDefinition(
+                    id="agent-learning",
+                    name="Learning Agent",
+                    instructions="Explain the recommendation clearly.",
+                    tool_ids=["agency.voice.generate"],
+                )
+            ],
+        )
+
+        enhanced = service._ensure_recommendation_to_code_pipeline(
+            workflow=workflow,
+            goal="Implement the approved Agency repository recommendation as code, then verify it with tests.",
+        )
+
+        voice_task = next(task for task in enhanced.task_definitions if task.id == "task-voice")
+        self.assertEqual(voice_task.agent_id, "agent-learning")
+        self.assertEqual(voice_task.tool_ids, ["agency.voice.generate"])
+        self.assertIn("Coder Agent", [agent.name for agent in enhanced.agent_definitions])
+        self.assertTrue(any("implement" in task.name.lower() for task in enhanced.task_definitions))
+        self.assertTrue(any("verify" in task.name.lower() for task in enhanced.task_definitions))
+
+    def test_workflow_validation_accepts_allowlisted_read_only_repo_inspection(self):
+        repo_inspect = next(tool for tool in builtin_tool_definitions() if tool.id == "agency.repo.inspect")
+        asyncio.run(self.context.tool_repo.save(repo_inspect))
+        workflow = WorkflowDefinition(
+            id="workflow-read-only-repo-inspection",
+            name="Read-only repo lesson",
+            entrypoint="node-inspect",
+            nodes=[
+                WorkflowNodeDefinition(
+                    id="node-inspect",
+                    name="Inspect source",
+                    node_type=NodeType.TASK,
+                    task_id="task-inspect",
+                )
+            ],
+            task_definitions=[
+                TaskDefinition(
+                    id="task-inspect",
+                    name="Inspect source",
+                    description="Inspect a bounded source-code scope without modifying it.",
+                    instructions="Read one bounded source-code scope.",
+                    expected_output="A source-code lesson.",
+                    agent_id="agent-inspect",
+                    tool_ids=[repo_inspect.id],
+                )
+            ],
+            agent_definitions=[
+                AgentDefinition(
+                    id="agent-inspect",
+                    name="Source teacher",
+                    instructions="Read source without modifying it.",
+                    tool_ids=[repo_inspect.id],
+                )
+            ],
+        )
+
+        result = asyncio.run(WorkflowValidationService(self.context).validate(workflow))
+
+        error_codes = {item["code"] for item in result.validation_errors}
+        self.assertNotIn("tool.security.dangerous", error_codes)
 
     def test_workflow_builder_rewrite_routes(self):
         agent_response = self.client.post(
@@ -739,12 +878,37 @@ class WorkflowBuilderApiTests(unittest.TestCase):
             "config_schema": {},
             "framework_hints": {"preferred_adapter": None, "adapter_config": {}, "metadata": {}},
         }
-        self.assertEqual(self.client.post("/runtime-adapters", json=payload).status_code, 200)
+        self.assertEqual(self.client.post("/runtime-adapters", json=payload).status_code, 403)
+        admin_headers = {
+            "x-agency-user-id": "user-runtime-admin",
+            "x-agency-user-email": "runtime-admin@example.com",
+        }
+        asyncio.run(
+            self.context.user_repo.create(
+                UserDefinition(
+                    id="user-runtime-admin",
+                    email="runtime-admin@example.com",
+                    display_name="Runtime Admin",
+                    roles=["admin"],
+                )
+            )
+        )
         self.assertEqual(
-            self.client.put("/runtime-adapters/adapter-custom", json={"description": "Updated"}).json()["description"],
+            self.client.post("/runtime-adapters", headers=admin_headers, json=payload).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.put(
+                "/runtime-adapters/adapter-custom",
+                headers=admin_headers,
+                json={"description": "Updated"},
+            ).json()["description"],
             "Updated")
-        self.assertEqual(self.client.delete("/runtime-adapters/adapter-custom").status_code, 200)
-        protected = self.client.delete("/runtime-adapters/native")
+        self.assertEqual(
+            self.client.delete("/runtime-adapters/adapter-custom", headers=admin_headers).status_code,
+            200,
+        )
+        protected = self.client.delete("/runtime-adapters/native", headers=admin_headers)
         self.assertEqual(protected.status_code, 400)
 
     def test_workflow_crud_publish_and_validate(self):
@@ -946,6 +1110,26 @@ class WorkflowBuilderApiTests(unittest.TestCase):
         self.assertEqual(validate.status_code, 200)
         error_codes = {item["code"] for item in validate.json()["validation_errors"]}
         self.assertNotIn("tool.connector_binding.missing", error_codes)
+
+    def test_workflow_validation_rejects_dependency_without_executable_node(self):
+        workflow = self._workflow_payload()
+        workflow["task_definitions"].append(
+            {
+                "id": "task-unmapped-dependency",
+                "name": "Unmapped dependency",
+                "description": "This task was accidentally omitted from the graph.",
+                "agent_id": workflow["agent_definitions"][0]["id"],
+                "tool_ids": [],
+            }
+        )
+        workflow["task_definitions"][0]["depends_on_task_ids"] = ["task-unmapped-dependency"]
+
+        result = asyncio.run(
+            WorkflowValidationService(self.context).validate(WorkflowDefinition.model_validate(workflow))
+        )
+
+        error_codes = {item["code"] for item in result.validation_errors}
+        self.assertIn("task.dependency.not_executable", error_codes)
 
     def test_execution_create_list_and_get(self):
         workflow = self._workflow_payload()

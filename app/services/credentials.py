@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pydantic import ValidationError
+import re
 from typing import Any
 
+from pydantic import ValidationError
+
 from app.api.context import ApiContext
+from app.core.config import get_settings
 from app.domain import ConnectorCredentialValidationPayload, CredentialDefinition, CredentialStatus
 from app.integrations.connectors import get_connector_definition, normalize_connector_provider_key
 from app.integrations.secrets import (
@@ -18,7 +21,20 @@ from app.services.integrations_registry import IntegrationsRegistryService
 from app.services.onecli import OneCLIIdentityMappingService
 from app.services.runtime_secrets import open_runtime_secret
 
-RAW_SECRET_PAYLOAD_KEYS = {"secret", "raw_secret", "value", "token", "password", "api_key"}
+RAW_SECRET_PAYLOAD_KEYS = {
+    "access_token",
+    "api_key",
+    "apikey",
+    "authorization",
+    "client_secret",
+    "password",
+    "raw_secret",
+    "refresh_token",
+    "secret",
+    "token",
+    "value",
+}
+SUPPORTED_SECRET_REF_PREFIXES = ("env://", "env:", "onecli://", "secret://")
 CONNECTOR_IDENTITY_SUMMARY_KEYS = (
     "workspace_id",
     "workspace_name",
@@ -72,10 +88,31 @@ class CredentialService:
         return messages or ["Invalid connector credential payload"]
 
     def raw_secret_payload_errors(self, payload: dict[str, Any]) -> list[str]:
-        raw_keys = sorted(RAW_SECRET_PAYLOAD_KEYS.intersection({key.lower() for key in payload}))
-        if not raw_keys:
+        def contains_raw_secret(item: Any) -> bool:
+            if isinstance(item, dict):
+                for key, value in item.items():
+                    normalized = re.sub(r"(?<!^)(?=[A-Z])", "_", str(key)).lower().replace("-", "_")
+                    if normalized in RAW_SECRET_PAYLOAD_KEYS or contains_raw_secret(value):
+                        return True
+            elif isinstance(item, list):
+                return any(contains_raw_secret(value) for value in item)
+            return False
+
+        if not contains_raw_secret(payload):
             return []
         return ["Raw secret material must be stored in the secret store and referenced by secret_ref"]
+
+    def secret_ref_format_errors(self, secret_ref: Any) -> list[str]:
+        if not isinstance(secret_ref, str) or not secret_ref.strip():
+            return ["secret_ref must be a non-empty secret-store reference."]
+        normalized = secret_ref.strip()
+        prefix = next((item for item in SUPPORTED_SECRET_REF_PREFIXES if normalized.startswith(item)), None)
+        if prefix is None:
+            return ["secret_ref must use a supported reference scheme."]
+        identifier = normalized.removeprefix(prefix).strip()
+        if not identifier or any(char.isspace() for char in identifier) or ".." in identifier.split("/"):
+            return ["secret_ref must contain a clean non-empty identifier."]
+        return []
 
     def onecli_secret_ref_errors(self, secret_ref: Any, owner_user_id: str) -> list[str]:
         if not is_onecli_secret_ref(secret_ref):
@@ -92,14 +129,72 @@ class CredentialService:
             return [f"OneCLI credential refs must be scoped under onecli://{owner_prefix}."]
         return []
 
+    def env_secret_ref_errors(self, secret_ref: Any) -> list[str]:
+        if not isinstance(secret_ref, str):
+            return []
+        normalized = secret_ref.strip()
+        if normalized.startswith("env://"):
+            variable = normalized.removeprefix("env://").strip()
+        elif normalized.startswith("env:"):
+            variable = normalized.removeprefix("env:").strip()
+        else:
+            return []
+        if not variable:
+            return ["Environment secret ref is empty."]
+        settings = get_settings()
+        if settings.app_env == "test":
+            return []
+        allowed = settings.parsed_agency_credential_env_allowlist
+        if variable and (variable in allowed or "*" in allowed):
+            return []
+        return ["Environment secret ref is not allowlisted for user-managed credentials."]
+
     def credential_payload_errors(self, payload: dict[str, Any], owner_user_id: str) -> list[str]:
         errors = self.raw_secret_payload_errors(payload)
         if "secret_ref" in payload:
-            errors.extend(self.onecli_secret_ref_errors(payload.get("secret_ref"), owner_user_id))
+            secret_ref = payload.get("secret_ref")
+            errors.extend(self.secret_ref_format_errors(secret_ref))
+            errors.extend(self.onecli_secret_ref_errors(secret_ref, owner_user_id))
+            errors.extend(self.env_secret_ref_errors(secret_ref))
         return errors
 
-    def _raise_for_credential_payload_errors(self, payload: dict[str, Any], owner_user_id: str) -> None:
+    async def _installation_secret_ref_errors(
+            self,
+            secret_ref: Any,
+            owner_user_id: str,
+            provider: str | None,
+    ) -> list[str]:
+        if not isinstance(secret_ref, str) or not secret_ref.startswith("secret://agency/installations/"):
+            return []
+        installation_id = secret_ref.removeprefix("secret://agency/installations/").strip()
+        installation = await self.context.connector_installation_repo.get(installation_id) if installation_id else None
+        expected_provider = normalize_connector_provider_key(provider)
+        actual_provider = normalize_connector_provider_key(installation.provider) if installation is not None else None
+        if (
+                installation is None
+                or installation.owner_user_id != owner_user_id
+                or expected_provider is None
+                or actual_provider != expected_provider
+        ):
+            # Keep missing, cross-owner, and cross-provider references indistinguishable.
+            return ["Connector installation secret ref is unavailable for this credential."]
+        return []
+
+    async def _raise_for_credential_payload_errors(
+            self,
+            payload: dict[str, Any],
+            owner_user_id: str,
+            *,
+            provider: str | None = None,
+    ) -> None:
         errors = self.credential_payload_errors(payload, owner_user_id)
+        errors.extend(
+            await self._installation_secret_ref_errors(
+                payload.get("secret_ref"),
+                owner_user_id,
+                provider or payload.get("provider"),
+            )
+        )
         if errors:
             raise ValueError(errors[0])
 
@@ -122,6 +217,7 @@ class CredentialService:
 
         merged = {**payload, "owner_user_id": owner_user_id, "provider": canonical}
         errors = self.credential_payload_errors(payload, owner_user_id)
+        errors.extend(await self._installation_secret_ref_errors(payload.get("secret_ref"), owner_user_id, canonical))
         if not errors:
             try:
                 CredentialDefinition.model_validate(merged)
@@ -136,7 +232,7 @@ class CredentialService:
         )
 
     async def create_credential(self, *, payload: dict[str, Any], owner_user_id: str) -> CredentialDefinition:
-        self._raise_for_credential_payload_errors(payload, owner_user_id)
+        await self._raise_for_credential_payload_errors(payload, owner_user_id)
         merged = {**payload, "owner_user_id": owner_user_id}
         return await self.context.credential_repo.create(CredentialDefinition.model_validate(merged))
 
@@ -150,7 +246,7 @@ class CredentialService:
         canonical, capability = self.resolve_connector_capability(provider_key)
         if canonical is None or capability is None:
             return None
-        self._raise_for_credential_payload_errors(payload, owner_user_id)
+        await self._raise_for_credential_payload_errors(payload, owner_user_id, provider=canonical)
         merged = {**payload, "owner_user_id": owner_user_id, "provider": canonical}
         return await self.context.credential_repo.create(CredentialDefinition.model_validate(merged))
 
@@ -175,6 +271,17 @@ class CredentialService:
             installation = await self.context.connector_installation_repo.get(installation_id)
             if installation is None:
                 return resolve_secret_ref(secret_ref)
+            if (
+                    installation.owner_user_id != credential.owner_user_id
+                    or normalize_connector_provider_key(installation.provider)
+                    != normalize_connector_provider_key(credential.provider)
+            ):
+                return SecretResolutionResult(
+                    value=None,
+                    source="agency",
+                    identifier=installation_id,
+                    error="Connector installation secret ref is unavailable for this credential.",
+                )
             sealed_value = installation.runtime_secret_encrypted
             if not sealed_value:
                 return resolve_secret_ref(secret_ref)
@@ -213,6 +320,17 @@ class CredentialService:
             return item
 
         return redact(value)
+
+    def credential_api_payload(self, credential: CredentialDefinition) -> dict[str, Any]:
+        """Expose credential identity and lifecycle without disclosing secret-store locators."""
+        payload = credential.model_dump(mode="json", exclude={"secret_ref"})
+        secret_ref = credential.secret_ref.strip() if isinstance(credential.secret_ref, str) else ""
+        secret_scheme = secret_ref.split(":", 1)[0].lower() if ":" in secret_ref else None
+        payload["secret_ref_configured"] = bool(secret_ref)
+        payload["secret_ref_scheme"] = secret_scheme
+        payload["metadata"] = self.redact_connector_payload(payload.get("metadata", {}))
+        payload["rotation_policy"] = self.redact_connector_payload(payload.get("rotation_policy", {}))
+        return payload
 
     def connector_identity_summary(self, credential: CredentialDefinition) -> str | None:
         parts: list[str] = []
@@ -339,7 +457,11 @@ class CredentialService:
         existing = await self.get_credential_for_owner(credential_id, owner_user_id)
         if existing is None:
             return None
-        self._raise_for_credential_payload_errors(patch, owner_user_id)
+        await self._raise_for_credential_payload_errors(
+            patch,
+            owner_user_id,
+            provider=str(patch.get("provider") or existing.provider or ""),
+        )
         sanitized_patch = {key: value for key, value in patch.items() if key != "owner_user_id"}
         return await self.context.credential_repo.update(credential_id, sanitized_patch)
 
@@ -358,7 +480,7 @@ class CredentialService:
         canonical, capability = self.resolve_connector_capability(str(provider_key) if provider_key is not None else "")
         if canonical is None or capability is None:
             return None
-        self._raise_for_credential_payload_errors(patch, owner_user_id)
+        await self._raise_for_credential_payload_errors(patch, owner_user_id, provider=canonical)
 
         sanitized_patch = {key: value for key, value in patch.items() if key != "owner_user_id"}
         sanitized_patch["provider"] = canonical
@@ -394,7 +516,7 @@ class CredentialService:
         existing = await self.get_credential_for_owner(credential_id, owner_user_id)
         if existing is None:
             return None
-        self._raise_for_credential_payload_errors(payload, owner_user_id)
+        await self._raise_for_credential_payload_errors(payload, owner_user_id, provider=existing.provider)
 
         patch: dict[str, Any] = {
             "status": CredentialStatus.ACTIVE,

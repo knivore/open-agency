@@ -7,7 +7,8 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 from openpyxl import Workbook, load_workbook
@@ -43,12 +44,14 @@ from app.domain import (
     WorkflowDefinition,
 )
 from app.services.main_agent_setup.service import MainAgentSetupConfig, MainAgentSetupService
+from app.services.executions import ExecutionService
 from app.tools.cli_discovery import list_builtin_tool_definitions
 from app.tools.contracts.loader import load_contracts
 from app.tools.contracts.registry import ToolContractRegistry, get_default_contract_registry
 from app.tools.contracts.validator import ToolContractValidationError, validate_tool_input, validate_tool_output
 from app.tools.definitions import get_tool_catalog_specs
 from app.tools.policies.engine import PolicyEngine
+from app.tools.implementations.http_integrations import execute_custom_api
 from app.tools.registry import ToolRegistry
 from app.tools.runtime.executor import ToolRuntimeExecutor
 from app.tools.runtime.pr_payloads import build_dry_run_pr_payload
@@ -1631,8 +1634,10 @@ class ToolContractRuntimeTests(unittest.TestCase):
             self.assertIn("ONECLI_EXTERNAL_CALLS_DISABLED", response.errors[0])
             mock_execute.assert_not_called()
 
+    @patch("app.core.outbound_http.socket.getaddrinfo")
     @patch("app.tools.runtime.executor.execute_custom_api")
-    def test_runtime_fails_closed_when_onecli_gateway_unavailable_in_production(self, mock_execute):
+    def test_runtime_fails_closed_when_onecli_gateway_unavailable_in_production(self, mock_execute, getaddrinfo):
+        getaddrinfo.return_value = [(2, 1, 6, "", ("93.184.216.34", 443))]
         mock_execute.side_effect = RuntimeError("onecli gateway unavailable")
 
         async def run_assertions():
@@ -1648,6 +1653,7 @@ class ToolContractRuntimeTests(unittest.TestCase):
                             "AGENCY_INTERNAL_API_KEY": "trusted-key",
                             "ONECLI_ENABLED": "true",
                             "ONECLI_GATEWAY_URL": "http://onecli.local:10255",
+                            "TOOL_HTTP_ALLOWED_HOSTS": "api.example.test",
                         },
                         clear=False,
                 ):
@@ -1723,7 +1729,7 @@ class ToolContractRuntimeTests(unittest.TestCase):
             self.assertEqual(mock_execute.call_args.kwargs["proxies"]["https"], "http://onecli.local:10255")
 
     @patch("app.tools.runtime.executor.execute_custom_api")
-    def test_runtime_runs_agency_approval_policy_before_onecli_proxy(self, mock_execute):
+    def test_runtime_denies_unapproved_mutation_before_onecli_proxy(self, mock_execute):
         mock_execute.return_value = {"status_code": 200, "response": {"ok": True}}
 
         async def run_assertions():
@@ -1756,21 +1762,19 @@ class ToolContractRuntimeTests(unittest.TestCase):
                     )
                     await asyncio.sleep(0)
 
-                    self.assertEqual(response.verdict, "warn")
+                    self.assertEqual(response.verdict, "deny")
                     rules_by_id = {rule.id: rule for rule in response.policyVerdict.rules}
-                    self.assertEqual(rules_by_id["http-mutation-approval-context"].outcome, "warn")
-                    self.assertIn("not explicitly approved", rules_by_id["http-mutation-approval-context"].reason)
-                    mock_execute.assert_called_once()
+                    self.assertEqual(rules_by_id["http-mutation-approval-context"].outcome, "deny")
+                    self.assertIn("requires an explicitly approved", rules_by_id["http-mutation-approval-context"].reason)
+                    mock_execute.assert_not_called()
 
                     events = []
                     while not subscriber.empty():
                         events.append(await subscriber.get())
                     semantic_types = [event.metadata.get("semanticType") for event in events]
                     policy_index = semantic_types.index("tool.policy.completed")
-                    onecli_start_index = semantic_types.index("onecli.http.request.started")
-                    self.assertLess(policy_index, onecli_start_index)
-                    self.assertEqual(events[policy_index].metadata["verdict"], "warn")
-                    self.assertEqual(events[onecli_start_index].metadata["target_host"], "api.example.test")
+                    self.assertNotIn("onecli.http.request.started", semantic_types)
+                    self.assertEqual(events[policy_index].metadata["verdict"], "deny")
             finally:
                 reset_settings_cache()
                 set_default_runtime_event_bus(None)
@@ -2101,15 +2105,16 @@ class ToolContractRuntimeTests(unittest.TestCase):
             mock_open_browser.assert_called_once()
 
     @patch("app.tools.runtime.executor.click_element")
-    def test_runtime_runs_contract_backed_browser_mutation_with_policy_warning(self, mock_click):
+    def test_runtime_denies_contract_backed_browser_mutation_without_approval(self, mock_click):
         mock_click.return_value = "Clicked element matching instruction: Submit"
         with tempfile.TemporaryDirectory() as tmp:
             executor = ToolRuntimeExecutor(run_store=JsonlToolRunStore(Path(tmp) / "tool_runs.jsonl"))
             response = executor.run("agency.browser.click", {"instruction": "Submit"}, actor="user-runtime")
 
-            self.assertEqual(response.verdict, "warn")
-            self.assertEqual(response.result["status"], "ok")
+            self.assertEqual(response.verdict, "deny")
+            self.assertIsNone(response.result)
             self.assertIn("browser mutation", response.policyVerdict.rules[1].reason)
+            mock_click.assert_not_called()
 
     def test_runtime_routes_all_browser_tools_through_contract_executor(self):
         browser_cases = [
@@ -2669,8 +2674,23 @@ class ToolContractRuntimeTests(unittest.TestCase):
                 os.environ["TOOL_RUN_STORE_PATH"] = str(Path(tmp) / "api_tool_runs.jsonl")
                 reset_settings_cache()
                 context = create_test_api_context()
-                asyncio.run(context.workflow_repo.create(_workflow_definition("workflow-contract-run")))
+                asyncio.run(
+                    context.user_repo.create(
+                        UserDefinition(
+                            id="user-contract-run",
+                            email="contract-run@example.com",
+                            display_name="Contract Runner",
+                        )
+                    )
+                )
+                workflow = _workflow_definition("workflow-contract-run").model_copy(
+                    update={"metadata": {"created_by": "user-contract-run", "owner_ids": ["user-contract-run"]}}
+                )
+                asyncio.run(context.workflow_repo.create(workflow))
                 client = TestClient(create_app(context=context))
+                client.headers.update(
+                    {"x-agency-user-id": "user-contract-run", "x-agency-user-email": "contract-run@example.com"}
+                )
                 response = client.post(
                     "/tools/agency.workflow.run/run",
                     json={"workflow_id": "workflow-contract-run", "input_payload": {"topic": "launch"}},
@@ -2697,11 +2717,32 @@ class ToolContractRuntimeTests(unittest.TestCase):
                 os.environ["TOOL_RUN_STORE_PATH"] = str(Path(tmp) / "api_tool_runs.jsonl")
                 reset_settings_cache()
                 context = create_test_api_context()
+                asyncio.run(
+                    context.user_repo.create(
+                        UserDefinition(
+                            id="user-protected-run",
+                            email="protected-run@example.com",
+                            display_name="Protected Runner",
+                        )
+                    )
+                )
                 workflow = _workflow_definition("workflow-protected-contract-run").model_copy(
-                    update={"metadata": {"protected_execution": True}}
+                    update={
+                        "metadata": {
+                            "protected_execution": True,
+                            "created_by": "user-protected-run",
+                            "owner_ids": ["user-protected-run"],
+                        }
+                    }
                 )
                 asyncio.run(context.workflow_repo.create(workflow))
                 client = TestClient(create_app(context=context))
+                client.headers.update(
+                    {
+                        "x-agency-user-id": "user-protected-run",
+                        "x-agency-user-email": "protected-run@example.com",
+                    }
+                )
                 response = client.post(
                     "/tools/agency.workflow.run/run",
                     json={"workflow_id": "workflow-protected-contract-run"},
@@ -2726,11 +2767,29 @@ class ToolContractRuntimeTests(unittest.TestCase):
                 os.environ["TOOL_RUN_STORE_PATH"] = str(Path(tmp) / "api_tool_runs.jsonl")
                 reset_settings_cache()
                 context = asyncio.run(_prepare_conversation_context("conversation-contract-run"))
+                asyncio.run(
+                    context.user_repo.create(
+                        UserDefinition(
+                            id="user-contract",
+                            email="contract@example.com",
+                            display_name="Contract User",
+                        )
+                    )
+                )
                 workflow = _workflow_definition("workflow-protected-approval-contract").model_copy(
-                    update={"metadata": {"protected_execution": True}}
+                    update={
+                        "metadata": {
+                            "protected_execution": True,
+                            "created_by": "user-contract",
+                            "owner_ids": ["user-contract"],
+                        }
+                    }
                 )
                 asyncio.run(context.workflow_repo.create(workflow))
                 client = TestClient(create_app(context=context))
+                client.headers.update(
+                    {"x-agency-user-id": "user-contract", "x-agency-user-email": "contract@example.com"}
+                )
                 response = client.post(
                     "/tools/agency.workflow.run/run",
                     json={
@@ -2801,11 +2860,8 @@ class ToolContractRuntimeTests(unittest.TestCase):
                     json={"url": "https://api.example.test/items", "method": "POST", "body": {"name": "item"}},
                 )
 
-                self.assertEqual(response.status_code, 200)
-                body = response.json()
-                self.assertEqual(body["verdict"], "warn")
-                self.assertEqual(body["result"]["status_code"], 201)
-                self.assertEqual(body["result"]["response"], {"created": True})
+                self.assertEqual(response.status_code, 401)
+                mock_execute.assert_not_called()
         finally:
             if previous_store is None:
                 os.environ.pop("TOOL_RUN_STORE_PATH", None)
@@ -2824,6 +2880,15 @@ class ToolContractRuntimeTests(unittest.TestCase):
                 os.environ["TOOL_RUN_STORE_PATH"] = str(Path(tmp) / "api_tool_runs.jsonl")
                 reset_settings_cache()
                 context = create_test_api_context()
+                asyncio.run(
+                    context.user_repo.create(
+                        UserDefinition(
+                            id="user-execution-contract",
+                            email="execution-contract@example.com",
+                            display_name="Execution Contract User",
+                        )
+                    )
+                )
                 workflow = asyncio.run(context.workflow_repo.create(_workflow_definition("workflow-api")))
                 execution = Execution(
                     id="execution-api-eval",
@@ -2832,6 +2897,7 @@ class ToolContractRuntimeTests(unittest.TestCase):
                     status=ExecutionStatus.COMPLETED,
                     input_payload={"topic": "contracts"},
                     output_payload={"final_output": "done"},
+                    created_by="user-execution-contract",
                 )
                 asyncio.run(context.execution_store.save_execution(execution))
                 asyncio.run(
@@ -2858,6 +2924,12 @@ class ToolContractRuntimeTests(unittest.TestCase):
                 )
                 asyncio.run(context.ensure_builtin_tool_seed_data())
                 client = TestClient(create_app(context=context))
+                client.headers.update(
+                    {
+                        "x-agency-user-id": "user-execution-contract",
+                        "x-agency-user-email": "execution-contract@example.com",
+                    }
+                )
 
                 list_response = client.post("/tools/agency.workflow.list/run", json={})
                 get_response = client.post("/tools/agency.workflow.get/run", json={"workflow_id": workflow.id})
@@ -2899,6 +2971,188 @@ class ToolContractRuntimeTests(unittest.TestCase):
             else:
                 os.environ["TOOL_RUN_STORE_PATH"] = previous_store
             reset_settings_cache()
+
+    def test_execution_contract_runtime_enforces_owner_and_admin_access(self):
+        async def run_assertions() -> None:
+            context = create_test_api_context()
+            for user in (
+                UserDefinition(
+                    id="user-execution-owner",
+                    email="execution-owner@example.com",
+                    display_name="Execution Owner",
+                ),
+                UserDefinition(
+                    id="user-execution-other",
+                    email="execution-other@example.com",
+                    display_name="Other Execution User",
+                ),
+                UserDefinition(
+                    id="user-execution-admin",
+                    email="execution-admin@example.com",
+                    display_name="Execution Admin",
+                    roles=["admin"],
+                ),
+            ):
+                await context.user_repo.create(user)
+
+            workflow = await context.workflow_repo.create(_workflow_definition("workflow-execution-authz"))
+            foreign_workflow = await context.workflow_repo.create(
+                _workflow_definition("workflow-foreign-authz").model_copy(
+                    update={
+                        "metadata": {
+                            "created_by": "user-execution-other",
+                            "owner_ids": ["user-execution-other"],
+                        }
+                    }
+                )
+            )
+            owner_execution = Execution(
+                id="execution-owner-visible",
+                workflow_id=workflow.id,
+                runtime_adapter_id="native",
+                status=ExecutionStatus.COMPLETED,
+                input_payload={},
+                created_by="user-execution-owner",
+            )
+            foreign_execution = Execution(
+                id="execution-foreign-hidden",
+                workflow_id=workflow.id,
+                runtime_adapter_id="native",
+                status=ExecutionStatus.PAUSED,
+                input_payload={"secret": "foreign-input"},
+                created_by="user-execution-other",
+            )
+            await context.execution_store.save_execution(owner_execution)
+            await context.execution_store.save_execution(foreign_execution)
+            await context.execution_store.save_event(
+                ExecutionEvent(
+                    execution_id=foreign_execution.id,
+                    workflow_id=workflow.id,
+                    event_type=ExecutionEventType.EXECUTION_STARTED,
+                    sequence=1,
+                    payload={"secret": "foreign-event"},
+                )
+            )
+            await context.execution_store.save_artifact(
+                ExecutionArtifact(
+                    id="artifact-foreign-hidden",
+                    execution_id=foreign_execution.id,
+                    artifact_type="text",
+                    name="foreign.txt",
+                    content_text="foreign artifact",
+                )
+            )
+
+            context.control_plane.pause = AsyncMock(return_value=foreign_execution)
+            context.control_plane.resume = AsyncMock(return_value=foreign_execution)
+            context.control_plane.cancel = AsyncMock(return_value=foreign_execution)
+
+            with tempfile.TemporaryDirectory() as tmp:
+                executor = ToolRuntimeExecutor(
+                    context=context,
+                    run_store=JsonlToolRunStore(Path(tmp) / "tool_runs.jsonl"),
+                )
+                owner_list = await executor.run_async(
+                    "agency.execution.list", {}, actor="user-execution-owner"
+                )
+                self.assertEqual(
+                    [item["id"] for item in owner_list.result["items"]],
+                    [owner_execution.id],
+                )
+                foreign_workflow_run = await executor.run_async(
+                    "agency.workflow.run",
+                    {"workflow_id": foreign_workflow.id},
+                    actor="user-execution-owner",
+                )
+                self.assertEqual(foreign_workflow_run.result["status"], "error")
+                self.assertIn("not found", foreign_workflow_run.result["error"])
+                self.assertEqual(len(await context.execution_store.list_executions()), 2)
+
+                foreign_read_cases = (
+                    ("agency.execution.get", {"execution_id": foreign_execution.id}),
+                    ("agency.execution.events", {"execution_id": foreign_execution.id}),
+                    ("agency.execution.artifacts", {"execution_id": foreign_execution.id}),
+                )
+                for tool_name, payload in foreign_read_cases:
+                    response = await executor.run_async(tool_name, payload, actor="user-execution-owner")
+                    self.assertEqual(response.result["status"], "error", tool_name)
+                    self.assertIn("not found", response.result["error"], tool_name)
+
+                foreign_control_cases = (
+                    ("agency.execution.pause", {"execution_id": foreign_execution.id}),
+                    ("agency.execution.resume", {"execution_id": foreign_execution.id}),
+                    ("agency.execution.cancel", {"execution_id": foreign_execution.id}),
+                )
+                for tool_name, payload in foreign_control_cases:
+                    response = await executor.run_async(tool_name, payload, actor="user-execution-owner")
+                    self.assertEqual(response.result["status"], "error", tool_name)
+                context.control_plane.pause.assert_not_awaited()
+                context.control_plane.resume.assert_not_awaited()
+                context.control_plane.cancel.assert_not_awaited()
+
+                with (
+                    patch.object(
+                        ExecutionService,
+                        "list_execution_approvals",
+                        new_callable=AsyncMock,
+                    ) as list_approvals,
+                    patch.object(ExecutionService, "approve", new_callable=AsyncMock) as approve,
+                    patch.object(ExecutionService, "reject", new_callable=AsyncMock) as reject,
+                ):
+                    approval_cases = (
+                        ("agency.execution.approvals", {"execution_id": foreign_execution.id}),
+                        (
+                            "agency.execution.approve",
+                            {"execution_id": foreign_execution.id, "tool_id": "agency.command.run"},
+                        ),
+                        (
+                            "agency.execution.reject",
+                            {"execution_id": foreign_execution.id, "tool_id": "agency.command.run"},
+                        ),
+                    )
+                    for tool_name, payload in approval_cases:
+                        response = await executor.run_async(tool_name, payload, actor="user-execution-owner")
+                        self.assertEqual(response.result["status"], "error", tool_name)
+                    list_approvals.assert_not_awaited()
+                    approve.assert_not_awaited()
+                    reject.assert_not_awaited()
+
+                admin_list = await executor.run_async(
+                    "agency.execution.list", {}, actor="user-execution-admin"
+                )
+                self.assertEqual(
+                    {item["id"] for item in admin_list.result["items"]},
+                    {owner_execution.id, foreign_execution.id},
+                )
+                for tool_name in (
+                    "agency.execution.get",
+                    "agency.execution.events",
+                    "agency.execution.artifacts",
+                ):
+                    admin_response = await executor.run_async(
+                        tool_name,
+                        {"execution_id": foreign_execution.id},
+                        actor="user-execution-admin",
+                    )
+                    self.assertEqual(admin_response.result["status"], "ok", tool_name)
+
+                admin_pause = await executor.run_async(
+                    "agency.execution.pause",
+                    {"execution_id": foreign_execution.id},
+                    actor="user-execution-admin",
+                )
+                self.assertEqual(admin_pause.result["status"], "ok")
+                context.control_plane.pause.assert_awaited_once_with(foreign_execution.id)
+
+        asyncio.run(run_assertions())
+
+    def test_execution_contract_http_route_requires_authenticated_actor(self):
+        context = create_test_api_context()
+        client = TestClient(create_app(context=context))
+
+        response = client.post("/tools/agency.execution.list/run", json={})
+
+        self.assertEqual(response.status_code, 401)
 
     def test_api_marks_direct_proposal_tool_as_conversation_context_required(self):
         previous_store = os.environ.get("TOOL_RUN_STORE_PATH")
@@ -2968,7 +3222,7 @@ class ToolContractRuntimeTests(unittest.TestCase):
                 os.environ["TOOL_RUN_STORE_PATH"] = previous_store
             reset_settings_cache()
 
-    def test_api_runs_contract_backed_command(self):
+    def test_api_rejects_header_asserted_command_approval(self):
         previous_store = os.environ.get("TOOL_RUN_STORE_PATH")
         try:
             with tempfile.TemporaryDirectory() as tmp:
@@ -2984,22 +3238,34 @@ class ToolContractRuntimeTests(unittest.TestCase):
                         "display_name": "Command User",
                     },
                 )
-                response = client.post(
-                    "/tools/agency.command.run/run",
-                    headers={
-                        "x-agency-user-id": "user-command",
-                        "x-agency-user-email": "command@example.com",
-                        "x-agency-command-approved": "true",
-                    },
-                    json={"command": "printf 'api-command\\n'", "mode": "bash", "timeout_seconds": 2},
-                )
+                marker = Path(tmp) / "header-approval-bypass"
+                for asserted_approval in ("true", "1", "yes", "approved", "TRUE"):
+                    with self.subTest(asserted_approval=asserted_approval):
+                        response = client.post(
+                            "/tools/agency.command.run/run",
+                            headers={
+                                "x-agency-user-id": "user-command",
+                                "x-agency-user-email": "command@example.com",
+                                "x-agency-command-approved": asserted_approval,
+                            },
+                            json={
+                                "command": f"printf bypassed > {marker}",
+                                "mode": "bash",
+                                "timeout_seconds": 2,
+                            },
+                        )
 
-                self.assertEqual(response.status_code, 200)
-                body = response.json()
-                self.assertEqual(body["verdict"], "ok")
-                self.assertEqual(body["result"]["status"], "ok")
-                self.assertEqual(body["result"]["stdout"], "api-command")
-                self.assertTrue(body["signature"].startswith("sha256:"))
+                        self.assertEqual(response.status_code, 403)
+                        self.assertIn("execution-bound approval", response.json()["detail"])
+                        self.assertFalse(marker.exists())
+
+                anonymous = client.post(
+                    "/tools/agency.command.run/run",
+                    headers={"x-agency-command-approved": "true"},
+                    json={"command": f"printf bypassed > {marker}", "mode": "bash"},
+                )
+                self.assertEqual(anonymous.status_code, 401)
+                self.assertFalse(marker.exists())
         finally:
             if previous_store is None:
                 os.environ.pop("TOOL_RUN_STORE_PATH", None)
@@ -3007,7 +3273,7 @@ class ToolContractRuntimeTests(unittest.TestCase):
                 os.environ["TOOL_RUN_STORE_PATH"] = previous_store
             reset_settings_cache()
 
-    def test_api_runs_contract_backed_file_write_text(self):
+    def test_api_blocks_direct_file_write_text_before_mutation(self):
         previous_store = os.environ.get("TOOL_RUN_STORE_PATH")
         previous_allowed_dirs = os.environ.get("TOOL_FILE_WRITE_ALLOWED_DIRS")
         try:
@@ -3016,22 +3282,40 @@ class ToolContractRuntimeTests(unittest.TestCase):
                 os.environ["TOOL_RUN_STORE_PATH"] = str(root / "api_tool_runs.jsonl")
                 os.environ["TOOL_FILE_WRITE_ALLOWED_DIRS"] = str(root)
                 reset_settings_cache()
-                client = TestClient(create_app(context=create_test_api_context()))
-                response = client.post(
+                context = create_test_api_context()
+                asyncio.run(
+                    context.user_repo.create(
+                        UserDefinition(
+                            id="user-file-write",
+                            email="file-write@example.com",
+                            display_name="File Write User",
+                        )
+                    )
+                )
+                client = TestClient(create_app(context=context))
+                payload = {
+                    "base_folder": str(root),
+                    "filename": "api.txt",
+                    "content": "api file",
+                    "mode": "write",
+                }
+                anonymous_response = client.post(
                     "/tools/agency.file.write-text/run",
-                    json={
-                        "base_folder": str(root),
-                        "filename": "api.txt",
-                        "content": "api file",
-                        "mode": "write",
+                    json=payload,
+                )
+                authenticated_response = client.post(
+                    "/tools/agency.file.write-text/run",
+                    headers={
+                        "x-agency-user-id": "user-file-write",
+                        "x-agency-user-email": "file-write@example.com",
                     },
+                    json=payload,
                 )
 
-                self.assertEqual(response.status_code, 200)
-                body = response.json()
-                self.assertEqual(body["verdict"], "warn")
-                self.assertEqual(body["result"]["status"], "success")
-                self.assertEqual((root / "api.txt").read_text(encoding="utf-8"), "api file")
+                self.assertEqual(anonymous_response.status_code, 401)
+                self.assertEqual(authenticated_response.status_code, 403)
+                self.assertIn("execution-bound approval", authenticated_response.json()["detail"])
+                self.assertFalse((root / "api.txt").exists())
         finally:
             if previous_store is None:
                 os.environ.pop("TOOL_RUN_STORE_PATH", None)
@@ -3063,11 +3347,8 @@ class ToolContractRuntimeTests(unittest.TestCase):
                     },
                 )
 
-                self.assertEqual(response.status_code, 200)
-                body = response.json()
-                self.assertEqual(body["verdict"], "warn")
-                self.assertEqual(body["result"]["status"], "success")
-                self.assertEqual(body["result"]["storage_uri"], "s3://mybucket/user_api/workflow_reports/run_proc-api/report.docx")
+                self.assertEqual(response.status_code, 401)
+                mock_upload.assert_not_called()
         finally:
             if previous_store is None:
                 os.environ.pop("TOOL_RUN_STORE_PATH", None)
@@ -3099,11 +3380,8 @@ class ToolContractRuntimeTests(unittest.TestCase):
                     },
                 )
 
-                self.assertEqual(response.status_code, 200)
-                body = response.json()
-                self.assertEqual(body["verdict"], "warn")
-                self.assertEqual(body["result"]["status"], "success")
-                self.assertEqual(load_workbook(workbook_path).active["A2"].value, "api spreadsheet")
+                self.assertEqual(response.status_code, 401)
+                self.assertIsNone(load_workbook(workbook_path).active["A2"].value)
         finally:
             if previous_store is None:
                 os.environ.pop("TOOL_RUN_STORE_PATH", None)
@@ -3547,6 +3825,27 @@ class ToolContractRuntimeTests(unittest.TestCase):
         asyncio.run(run_assertions())
 
     @patch("app.tools.implementations.http_integrations.requests.request")
+    def test_http_interpolation_keeps_connector_binding_authoritative(self, mock_request):
+        mock_request.return_value = _RequestsResponse()
+        context = SimpleNamespace(
+            connector_binding={
+                "provider": "discord-bot",
+                "credential_id": "credential-trusted",
+                "target_scope": {"channel_id": "channel-trusted"},
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "cannot override connector context keys"):
+            execute_custom_api(
+                url="https://api.example.test/channels/{channel_id}/{credential_id}",
+                method="GET",
+                tool_context=context,
+                channel_id="channel-attacker",
+                credential_id="credential-attacker",
+            )
+        mock_request.assert_not_called()
+
+    @patch("app.tools.implementations.http_integrations.requests.request")
     def test_native_python_http_tool_denies_onecli_when_global_kill_switch_enabled(self, mock_request):
         async def run_assertions():
             bus = RuntimeEventBus()
@@ -3598,8 +3897,11 @@ class ToolContractRuntimeTests(unittest.TestCase):
 
         asyncio.run(run_assertions())
 
+    @patch("app.core.outbound_http.socket.getaddrinfo")
     @patch("app.tools.implementations.http_integrations.requests.request")
-    def test_native_python_http_tool_failed_event_is_deny_when_onecli_unavailable_in_production(self, mock_request):
+    def test_native_python_http_tool_failed_event_is_deny_when_onecli_unavailable_in_production(
+            self, mock_request, getaddrinfo):
+        getaddrinfo.return_value = [(2, 1, 6, "", ("93.184.216.34", 443))]
         mock_request.side_effect = RuntimeError("onecli gateway unavailable")
 
         async def run_assertions():
@@ -3615,6 +3917,7 @@ class ToolContractRuntimeTests(unittest.TestCase):
                             "AGENCY_INTERNAL_API_KEY": "trusted-key",
                             "ONECLI_ENABLED": "true",
                             "ONECLI_GATEWAY_URL": "http://onecli.local:10255",
+                            "TOOL_HTTP_ALLOWED_HOSTS": "api.example.test",
                         },
                         clear=False,
                 ):

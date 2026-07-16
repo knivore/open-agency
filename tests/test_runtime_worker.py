@@ -13,6 +13,7 @@ from app.llm.base import ModelResponse
 from app.runtime.worker import (
     WORKER_EXIT_INFRA_FAILED,
     WORKER_EXIT_SUCCESS,
+    WORKER_EXIT_SUSPENDED,
     load_worker_environment,
     run_execution_worker,
 )
@@ -125,6 +126,37 @@ class RuntimeWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current.metadata["worker_context"]["workflow_id"], self.workflow.id)
         self.assertIn("execution.started", [event.event_type.value for event in events])
         self.assertIn("execution.completed", [event.event_type.value for event in events])
+
+    async def test_runtime_worker_exits_cleanly_when_persistent_cycle_sleeps(self):
+        workflow = self.workflow.model_copy(deep=True, update={"id": "workflow-worker-cycle"})
+        workflow.metadata["execution_lifecycle"] = {
+            "persistent_cycle": {"enabled": True, "interval_seconds": 60}
+        }
+        await self.context.runtime_registry.register_workflow(workflow)
+        execution = await self.context.runtime_registry.create_execution(
+            workflow.id,
+            {"topic": "worker cycle"},
+            {"created_by": "tester"},
+            runtime_adapter_id="native",
+        )
+        execution.runtime_revision_id = "runtime-rev-cycle"
+        execution.runtime_fingerprint = "fp-cycle"
+        await self.context.execution_store.update_execution(execution)
+
+        exit_code = await run_execution_worker(
+            context=self.context,
+            execution_id=execution.id,
+            workflow_id=execution.workflow_id,
+            runtime_revision_id="runtime-rev-cycle",
+            runtime_adapter_id="native",
+            worker_id="worker-cycle",
+        )
+
+        current = await self.context.execution_store.get_execution(execution.id)
+        assert current is not None
+        self.assertEqual(exit_code, WORKER_EXIT_SUSPENDED)
+        self.assertEqual(current.status, ExecutionStatus.SLEEPING)
+        self.assertIsNotNone(current.metadata.get("active_wait"))
 
     def test_load_worker_environment_requires_core_values(self):
         payload = load_worker_environment(
@@ -324,3 +356,52 @@ class RuntimeWorkerTests(unittest.IsolatedAsyncioTestCase):
         assert current is not None
         self.assertEqual(current.status.value, "failed")
         self.assertIn("timed out", current.error or "")
+
+    async def test_runtime_worker_hard_timeout_pauses_during_approval_wait(self):
+        execution = await self.context.runtime_registry.create_execution(
+            self.workflow.id,
+            {"topic": "approval wait"},
+            {"created_by": "tester"},
+            runtime_adapter_id="native",
+        )
+        execution.runtime_revision_id = "runtime-rev-1"
+        execution.runtime_fingerprint = "fp-1"
+        await self.context.execution_store.update_execution(execution)
+        approval_requested = asyncio.Event()
+        approval_granted = asyncio.Event()
+
+        async def approval_waiting_start(execution_id: str):
+            current = await self.context.execution_store.get_execution(execution_id)
+            current.status = ExecutionStatus.WAITING_FOR_APPROVAL
+            await self.context.execution_store.update_execution(current)
+            approval_requested.set()
+            await approval_granted.wait()
+            current = await self.context.execution_store.get_execution(execution_id)
+            current.status = ExecutionStatus.COMPLETED
+            await self.context.execution_store.update_execution(current)
+            return current
+
+        self.context.runtime_registry.start_execution = approval_waiting_start
+        worker_task = asyncio.create_task(
+            run_execution_worker(
+                context=self.context,
+                execution_id=execution.id,
+                workflow_id=execution.workflow_id,
+                runtime_revision_id="runtime-rev-1",
+                runtime_adapter_id="native",
+                worker_id="worker-approval-wait",
+                heartbeat_interval_seconds=0.01,
+                execution_timeout_seconds=0.02,
+            )
+        )
+
+        await asyncio.wait_for(approval_requested.wait(), timeout=1)
+        await asyncio.sleep(0.06)
+        waiting = await self.context.execution_store.get_execution(execution.id)
+        self.assertFalse(worker_task.done())
+        self.assertEqual(waiting.status, ExecutionStatus.WAITING_FOR_APPROVAL)
+        self.assertIsNotNone(waiting.last_heartbeat_at)
+
+        approval_granted.set()
+        exit_code = await asyncio.wait_for(worker_task, timeout=1)
+        self.assertEqual(exit_code, WORKER_EXIT_SUCCESS)

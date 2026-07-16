@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from app.tools.implementations.browser import open_browser, page_url_host
+from app.core.outbound_http import validate_outbound_http_url
 from app.tools.implementations.browser_navigation import goto_with_readiness
 from app.tools.implementations.browser_runtime import configure_browser_runtime_env, ensure_browser_runtime_dir
 from app.tools.implementations.browser_session import BrowserSessionManager
@@ -106,6 +107,16 @@ class BrowserSessionStateTests(unittest.TestCase):
 
 
 class BrowserOpenToolTests(unittest.TestCase):
+    @patch("app.core.outbound_http.socket.getaddrinfo")
+    def test_outbound_url_rejects_allowlisted_hostname_resolving_private(self, getaddrinfo):
+        getaddrinfo.return_value = [(2, 1, 6, "", ("10.0.0.5", 443))]
+        with patch.dict("os.environ", {"APP_ENV": "development"}, clear=False):
+            with self.assertRaisesRegex(ValueError, "non-public address"):
+                validate_outbound_http_url(
+                    "https://allowed.example/path",
+                    allowed_hosts=["allowed.example"],
+                )
+
     def test_page_url_host_extracts_netloc(self):
         self.assertEqual(page_url_host("https://example.com/path?q=1"), "example.com")
         self.assertEqual(page_url_host("http://sub.example.com:8443/test"), "sub.example.com:8443")
@@ -148,6 +159,7 @@ class BrowserOpenToolTests(unittest.TestCase):
             locale="en-US",
             timezone_id="Asia/Singapore",
             extra_http_headers={"x-test": "1"},
+            _allowed_hosts=["example.com"],
         )
 
         self.assertEqual(result["trace_path"], "/tmp/runtime/artifacts/traces/example-com.zip")
@@ -159,6 +171,7 @@ class BrowserOpenToolTests(unittest.TestCase):
         self.assertEqual(kwargs["context_options"]["locale"], "en-US")
         self.assertEqual(kwargs["context_options"]["timezone_id"], "Asia/Singapore")
         self.assertEqual(kwargs["context_options"]["extra_http_headers"], {"x-test": "1"})
+        mock_manager.context.route.assert_called_once()
         mock_upload.assert_called_once()
 
 

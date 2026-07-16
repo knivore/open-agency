@@ -90,7 +90,7 @@ class A2AIntegrationTests(unittest.TestCase):
 
         lookup = self.client.get(f"/a2a/tasks/{task_id}")
         self.assertEqual(lookup.status_code, 200)
-        self.assertEqual(lookup.json()["metadata"]["trigger"]["created_by"], "tester")
+        self.assertEqual(lookup.json()["metadata"]["trigger"]["created_by"], "user-a2a")
 
     def test_message_exchange_and_artifact_creation(self):
         create = self.client.post("/a2a/tasks", json={"workflowId": "workflow-a2a", "input": {}})

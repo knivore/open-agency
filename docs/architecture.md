@@ -37,6 +37,7 @@ Important models:
 - `ToolDefinition`
 - `WorkflowDefinition`
 - `Execution`
+- `ExecutionWait`
 - `ExecutionEvent`
 - `ScheduleDefinition`
 - `MCPServerDefinition`
@@ -89,6 +90,30 @@ Current adapters:
 
 - `native`
 - `crewai`
+
+### Runtime Lifecycles
+
+A goal, workflow, and execution have separate lifetimes. A goal is a durable objective, a workflow is a reusable plan,
+and an execution is one stateful run of that plan. Long-running workflow support belongs to the execution control plane
+and uses three forms:
+
+- waitable executions suspend for input, approval, an event, or a wake time and resume from a durable checkpoint
+- persistent monitor executions repeat bounded, auditable cycles under one execution id until policy or an operator
+  stops them
+- goal-driven recurring workflows use multiple finite executions under one durable goal
+
+`ExecutionWait` is the durable wait ledger. `Execution.status` is the current-state view, while ordered
+`ExecutionEvent` records remain the runtime audit source of truth. Input, event, and sleep waits can resume a native
+execution from persisted node outputs after backend restart. Approval-gated tool calls additionally persist the current
+agent transcript, remaining tool calls, and pending call position so the worker can exit and a later worker can resume
+at that tool boundary without replaying completed calls from the same model response.
+
+Native persistent monitors use sleep waits between full graph cycles rather than keeping a worker alive. Cycle start,
+completion, failure, and guard events are projected like other execution events; bounded cycle state and recent outcomes
+remain on execution metadata, while the wait row owns the next timer claim.
+
+See [docs/long-running-autonomous-agents-checklist.md](./long-running-autonomous-agents-checklist.md) for implemented
+capabilities, remaining budget and operator-UI work, safety constraints, and acceptance criteria.
 
 ## app/tools
 

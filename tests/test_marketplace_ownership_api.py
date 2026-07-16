@@ -577,6 +577,42 @@ class MarketplaceOwnershipApiTests(unittest.TestCase):
             )
             self.assertEqual(direct_route_response.status_code, 403)
 
+    def test_execution_trigger_actor_is_derived_from_authenticated_owner(self) -> None:
+        workflow_id = "workflow-trigger-actor"
+        create_response = self.client.post(
+            "/workflows",
+            headers=self.owner_headers,
+            json=workflow_payload(workflow_id, "user-owner"),
+        )
+        self.assertEqual(create_response.status_code, 200)
+
+        run_response = self.client.post(
+            "/executions",
+            headers=self.owner_headers,
+            json={
+                "workflowId": workflow_id,
+                "input": {"topic": "identity regression"},
+                "trigger": {
+                    "type": "manual",
+                    "created_by": "user-other",
+                    "run_by": "user-other",
+                },
+                "runtimeAdapterId": "native",
+            },
+        )
+
+        self.assertEqual(run_response.status_code, 200)
+        execution = run_response.json()
+        self.assertEqual(execution["created_by"], "user-owner")
+        self.assertEqual(execution["trigger_payload"]["created_by"], "user-owner")
+        self.assertNotIn("run_by", execution["trigger_payload"])
+
+        cross_owner_read = self.client.get(
+            f"/executions/{execution['id']}",
+            headers=self.other_headers,
+        )
+        self.assertEqual(cross_owner_read.status_code, 404)
+
     def test_ownerless_workflow_execution_is_claimed_by_first_runner(self) -> None:
         payload = workflow_payload("workflow-runtime-ownerless", "user-owner")
         payload["metadata"] = {}

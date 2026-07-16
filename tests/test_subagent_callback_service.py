@@ -279,7 +279,7 @@ class SubAgentCallbackServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(checkpoint["ready_dependent_step_ids"], ["task-2"])
         self.assertEqual(self.dispatcher.actions, [("resume", "execution-1")])
 
-    async def test_needs_input_pauses_execution_and_dispatcher(self) -> None:
+    async def test_needs_input_marks_execution_waiting_and_pauses_dispatcher(self) -> None:
         await self.service.record_subagent_needs_input(
             run_id="execution-1",
             agent_id="agent-1",
@@ -290,9 +290,14 @@ class SubAgentCallbackServiceTests(unittest.IsolatedAsyncioTestCase):
         events = await self.store.list_events("execution-1")
         execution = await self.store.get_execution("execution-1")
 
-        self.assertEqual(events[-1].event_type, ExecutionEventType.SUBAGENT_NEEDS_INPUT)
-        self.assertEqual(execution.status, ExecutionStatus.PAUSED)
+        self.assertEqual(events[-2].event_type, ExecutionEventType.SUBAGENT_NEEDS_INPUT)
+        self.assertEqual(events[-1].event_type, ExecutionEventType.EXECUTION_WAITING)
+        self.assertEqual(execution.status, ExecutionStatus.WAITING_FOR_INPUT)
         self.assertEqual(execution.metadata["pending_subagent_input"]["status"], "needs_input")
+        waits = await self.store.list_execution_waits("execution-1")
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(waits[0].kind.value, "input")
+        self.assertEqual(execution.metadata["active_wait"]["wait_id"], waits[0].id)
         self.assertEqual(self.dispatcher.actions, [("pause", "execution-1")])
 
     async def test_needs_input_can_send_optional_outbound_webhook(self) -> None:
@@ -331,9 +336,13 @@ class SubAgentCallbackServiceTests(unittest.IsolatedAsyncioTestCase):
         events = await self.store.list_events("execution-1")
         execution = await self.store.get_execution("execution-1")
 
-        self.assertEqual(events[-1].event_type, ExecutionEventType.SUBAGENT_NEEDS_APPROVAL)
+        self.assertEqual(events[-2].event_type, ExecutionEventType.SUBAGENT_NEEDS_APPROVAL)
+        self.assertEqual(events[-1].event_type, ExecutionEventType.EXECUTION_WAITING)
         self.assertEqual(execution.status, ExecutionStatus.WAITING_FOR_APPROVAL)
         self.assertEqual(execution.metadata["pending_subagent_approval"]["status"], "needs_approval")
+        waits = await self.store.list_execution_waits("execution-1")
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(waits[0].kind.value, "approval")
         self.assertEqual(self.dispatcher.actions, [("pause", "execution-1")])
 
     async def test_metadata_configured_webhook_target_is_used_for_approval(self) -> None:

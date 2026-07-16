@@ -192,6 +192,21 @@ class ToolServiceLayerTests(unittest.TestCase):
         self.assertIn("agency.file.write-text", tool_ids)
         self.assertIn("agency.command.run", tool_ids)
 
+    def test_tool_repository_normalizes_stale_privileged_sandbox_metadata(self):
+        context = create_test_api_context()
+        tools = asyncio.run(context.ensure_builtin_tool_seed_data())
+        repo_inspect = next(tool for tool in tools if tool.id == "agency.repo.inspect")
+        stale_security = repo_inspect.security.model_copy(update={"sandbox_required": False})
+        stale_tool = repo_inspect.model_copy(update={"security": stale_security})
+        asyncio.run(context.tool_repo.save(stale_tool))
+
+        repaired = asyncio.run(context.tool_repo.get("agency.repo.inspect"))
+        self.assertIsNotNone(repaired)
+        self.assertTrue(repaired.security.sandbox_required)
+        self.assertTrue(repaired.security.allow_filesystem)
+        self.assertTrue(repaired.security.read_only)
+        self.assertFalse(repaired.security.requires_approval)
+
 
 if __name__ == "__main__":
     unittest.main()

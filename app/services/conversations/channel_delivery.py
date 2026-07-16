@@ -17,6 +17,7 @@ from app.integrations.connectors import get_connector_definition, normalize_conn
 from app.integrations.onecli import build_onecli_proxy_url
 from app.integrations.secrets import is_onecli_secret_ref, onecli_secret_identifier
 from app.services.credentials import CredentialService
+from app.services.onecli import OneCLIIdentityMappingService
 from .channel_adapters import AdapterInboundMessage, create_channel_outbound_formatter
 from .channel_registry import can_deliver_to_thread, can_deliver_to_user, chat_channel_types
 
@@ -27,7 +28,7 @@ class ChannelOutboundDeliveryService:
 
     def _allows_onecli_header_proxy(self, provider: str) -> bool:
         normalized = normalize_connector_provider_key(provider)
-        return normalized in {"discord-bot"}
+        return normalized in {"discord-bot", "telegram-bot"}
 
     def _direct_tls_verify(self) -> str | bool | None:
         return direct_tls_verify()
@@ -80,6 +81,10 @@ class ChannelOutboundDeliveryService:
                 raise ValueError(resolved.error or "Credential secret could not be resolved.")
             token = resolved.value
 
+        onecli_proxy_kwargs: dict[str, Any] | None = None
+        if credential_mode == "onecli":
+            onecli_proxy_kwargs = await self._onecli_proxy_kwargs_for_owner(owner_user_id)
+
         deliveries = [
             self._deliver_one(
                 provider=provider,
@@ -87,6 +92,7 @@ class ChannelOutboundDeliveryService:
                 credential_metadata=credential.metadata,
                 provider_message=message,
                 credential_mode=credential_mode,
+                onecli_proxy_kwargs=onecli_proxy_kwargs,
             )
             for message in provider_outbound_messages
         ]
@@ -231,6 +237,7 @@ class ChannelOutboundDeliveryService:
             credential_metadata: dict[str, Any],
             provider_message: dict[str, Any],
             credential_mode: str = "direct",
+            onecli_proxy_kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         request = self._request_for(
             provider=provider,
@@ -238,6 +245,7 @@ class ChannelOutboundDeliveryService:
             credential_metadata=credential_metadata,
             provider_message=provider_message,
             credential_mode=credential_mode,
+            onecli_proxy_kwargs=onecli_proxy_kwargs,
         )
         response = httpx.request(timeout=10.0, **request)
         payload = self._safe_json(response)
@@ -259,6 +267,7 @@ class ChannelOutboundDeliveryService:
             credential_metadata: dict[str, Any],
             provider_message: dict[str, Any],
             credential_mode: str = "direct",
+            onecli_proxy_kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized = normalize_connector_provider_key(provider) or provider.strip().lower()
         method = provider_message.get("method")
@@ -267,7 +276,7 @@ class ChannelOutboundDeliveryService:
             raise ValueError("Provider outbound message must include string method and object payload.")
         request_kwargs: dict[str, Any] = {}
         if credential_mode == "onecli":
-            request_kwargs.update(self._onecli_proxy_kwargs())
+            request_kwargs.update(onecli_proxy_kwargs or self._onecli_proxy_kwargs(None))
         else:
             # Direct deliveries must bypass inherited proxy env vars so Telegram
             # and other direct-capable connectors do not drift back through OneCLI.
@@ -277,11 +286,12 @@ class ChannelOutboundDeliveryService:
                 request_kwargs["verify"] = verify
 
         if normalized == "telegram-bot":
-            if credential_mode == "onecli":
-                raise ValueError("OneCLI channel delivery does not support token-in-URL providers yet.")
+            # OneCLI v1.40+ replaces this placeholder with the bot token using
+            # the configured `/bot{value}` URL-path injection template.
+            effective_token = "onecli-managed" if credential_mode == "onecli" else token
             return {
                 "method": "POST",
-                "url": f"https://api.telegram.org/bot{token}/{method}",
+                "url": f"https://api.telegram.org/bot{effective_token}/{method}",
                 "json": payload,
                 **request_kwargs,
             }
@@ -425,14 +435,23 @@ class ChannelOutboundDeliveryService:
 
         raise ValueError(f"Unsupported chat channel delivery provider '{provider}'")
 
-    def _onecli_proxy_kwargs(self) -> dict[str, Any]:
+    def _onecli_proxy_kwargs(self, agent_token_secret_ref: str | None) -> dict[str, Any]:
         settings = get_settings()
         kwargs: dict[str, Any] = {
-            "proxy": build_onecli_proxy_url(settings.onecli_gateway_url, settings.onecli_agent_token_secret_ref),
+            "proxy": build_onecli_proxy_url(settings.onecli_gateway_url, agent_token_secret_ref),
         }
         if settings.onecli_gateway_ca_bundle_path:
             kwargs["verify"] = settings.onecli_gateway_ca_bundle_path
         return kwargs
+
+    async def _onecli_proxy_kwargs_for_owner(self, owner_user_id: str) -> dict[str, Any]:
+        token_context = await OneCLIIdentityMappingService(self.context).resolve_agent_token_context(
+            owner_user_id=owner_user_id
+        )
+        agent_token_secret_ref = token_context.get("agent_token_secret_ref")
+        if not isinstance(agent_token_secret_ref, str):
+            agent_token_secret_ref = get_settings().onecli_agent_token_secret_ref
+        return self._onecli_proxy_kwargs(agent_token_secret_ref)
 
     def _onecli_metadata(self, identifier: str) -> dict[str, Any]:
         settings = get_settings()

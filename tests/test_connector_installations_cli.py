@@ -8,12 +8,26 @@ from unittest.mock import patch
 
 from app.api.context import create_test_api_context
 from app.cli import main
+from app.services.connector_installations import ConnectorInstallationService
 
 
 class ConnectorInstallationsCliTests(unittest.TestCase):
     def setUp(self) -> None:
         self.context = create_test_api_context()
         self.owner_user_id = "cli-user"
+
+        async def verified_ref(_service, installation):
+            return f"onecli://users/{installation.owner_user_id}/secrets/verified-cli"
+
+        self.verify_patcher = patch.object(
+            ConnectorInstallationService,
+            "_verified_onecli_ref",
+            new=verified_ref,
+        )
+        self.verify_patcher.start()
+
+    def tearDown(self) -> None:
+        self.verify_patcher.stop()
 
     def _run_cli(self, args: list[str]) -> tuple[int, str, str]:
         stdout = io.StringIO()
@@ -113,15 +127,13 @@ class ConnectorInstallationsCliTests(unittest.TestCase):
                 self.owner_user_id,
                 "--metadata-json",
                 '{"application_id":"app-123","bot_user_id":"bot-123","default_guild_id":"guild-123","webhook_public_key":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}',
-                "--runtime-secret-value",
-                "discord-runtime-secret",
                 "--json",
             ]
         )
         self.assertEqual(complete_code, 0, complete_stderr)
         self.assertEqual(json.loads(complete_stdout)["status"], "active")
 
-    def test_connector_complete_accepts_runtime_secret_value_for_direct_transport(self) -> None:
+    def test_connector_complete_uses_verified_onecli_resource_without_raw_secret(self) -> None:
         setup_code, setup_stdout, setup_stderr = self._run_cli(
             [
                 "connector",
@@ -144,8 +156,6 @@ class ConnectorInstallationsCliTests(unittest.TestCase):
                 self.owner_user_id,
                 "--metadata-json",
                 '{"bot_user_id":"telegram-bot","bot_username":"agency_bot"}',
-                "--runtime-secret-value",
-                "telegram-runtime-secret",
                 "--json",
             ]
         )
@@ -156,7 +166,7 @@ class ConnectorInstallationsCliTests(unittest.TestCase):
         self.assertEqual(complete_payload["provider"], "telegram-bot")
         self.assertEqual(
             complete_payload["onecli_credential_ref"],
-            f"onecli://users/{self.owner_user_id}/telegram-bot/{installation_id}",
+            f"onecli://users/{self.owner_user_id}/secrets/verified-cli",
         )
         self.assertEqual(complete_payload["metadata"]["bot_username"], "agency_bot")
 

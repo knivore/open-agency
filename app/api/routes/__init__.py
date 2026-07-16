@@ -87,7 +87,7 @@ def create_api_router(context: Optional[ApiContext] = None) -> APIRouter:
     router.include_router(create_main_agent_monitor_router(context))
     router.include_router(create_schedules_router(context))
     router.include_router(create_persona_router(context))
-    router.include_router(create_storage_router())
+    router.include_router(create_storage_router(context))
     router.include_router(create_runtime_adapters_router(context))
     router.include_router(create_workflow_builder_router(context))
     router.include_router(create_workflows_router(context))
@@ -97,8 +97,8 @@ def create_api_router(context: Optional[ApiContext] = None) -> APIRouter:
     router.include_router(create_a2a_router(context))
     router.include_router(create_observability_router(context))
     router.include_router(create_graph_stream_router(context))
-    router.include_router(create_runtime_sse_router())
-    router.include_router(create_runtime_websocket_router())
+    router.include_router(create_runtime_sse_router(context))
+    router.include_router(create_runtime_websocket_router(context))
     return router
 
 

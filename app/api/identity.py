@@ -14,7 +14,7 @@ from typing import Iterable
 
 from app.api.context import ApiContext
 from app.core.config import get_settings
-from app.domain import ApiTokenDefinition, UserDefinition
+from app.domain import API_TOKEN_SCOPE_DEFINITIONS, ApiTokenDefinition, UserDefinition
 
 
 def require_active_user(user: UserDefinition) -> None:
@@ -38,8 +38,12 @@ def require_trusted_identity_source(request: Request) -> None:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Trusted identity source is required")
         return
 
-    if settings.app_env == "production":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Trusted identity source is required")
+    if settings.app_env == "test":
+        return
+
+    # Identity headers are bearer-equivalent assertions. Development mode may
+    # be tunneled publicly, so only tests may use them without a shared secret.
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Trusted identity source is required")
 
 
 def hash_bearer_token(token: str) -> str:
@@ -150,6 +154,17 @@ async def resolve_bearer_token_auth(
             status_code=status.HTTP_401_UNAUTHORIZED,
         )
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or revoked API token")
+
+    if token.metadata.get("issued_by") == "local_auth" and token.metadata.get("session") is True:
+        # Local UI sessions intentionally receive the complete catalog. Refresh them on use so
+        # adding a new first-party scope does not strand already signed-in administrators.
+        catalog_scopes = [scope.id for scope in API_TOKEN_SCOPE_DEFINITIONS]
+        refreshed_scopes = list(dict.fromkeys([*token.scopes, *catalog_scopes]))
+        if refreshed_scopes != token.scopes:
+            refreshed_token = await context.api_token_repo.update(token.id, {"scopes": refreshed_scopes})
+            if refreshed_token is not None:
+                token = refreshed_token
+
     user = await context.user_repo.get(token.owner_user_id)
     if user is None:
         _record_authorization_failure(
@@ -240,6 +255,7 @@ async def resolve_current_user(
             required_scopes,
             identity_mode="bearer_token",
         )
+        request.state.authenticated_api_token = token
         return bearer_user
 
     try:
@@ -255,6 +271,7 @@ async def resolve_current_user(
         raise
 
     user_id = header_value(request, "x-agency-user-id")
+    request.state.authenticated_api_token = None
     if user_id:
         user = await context.user_repo.get(user_id)
         if user is not None:

@@ -61,6 +61,17 @@ class ConnectorSetupGuideDefinition(DomainModel):
     notes: list[str] = Field(default_factory=list)
 
 
+class ConnectorOneCLISecretProfileDefinition(DomainModel):
+    hostPattern: str
+    pathPattern: str | None = None
+    injectionTarget: Literal["header", "url_parameter", "url_path"] = "header"
+    headerName: str | None = None
+    valueFormat: str | None = None
+    parameterName: str | None = None
+    parameterFormat: str | None = None
+    pathTemplate: str | None = None
+
+
 class ConnectorCapabilityDefinition(DomainModel):
     backendKey: str
     displayName: str
@@ -71,6 +82,11 @@ class ConnectorCapabilityDefinition(DomainModel):
     dependsOnAgencyCapabilities: list[str] = Field(default_factory=list)
     ownershipNotes: list[str] = Field(default_factory=list)
     onecliTransportMode: OneCLITransportMode = "proxy"
+    runtimeSecretRequired: bool = False
+    setupSupported: bool = False
+    setupBlockReason: str | None = None
+    onecliAppId: str | None = None
+    onecliSecretProfile: ConnectorOneCLISecretProfileDefinition | None = None
     healthSupported: bool = False
     requiredMetadata: list[ConnectorMetadataRequirementDefinition] = Field(default_factory=list)
     instanceIdentityMetadata: list[ConnectorMetadataRequirementDefinition] = Field(default_factory=list)
@@ -109,6 +125,8 @@ class ConnectorInstallation(DomainModel):
     runtime_secret_encrypted: str | None = Field(default=None, exclude=True)
     status: Literal["setup_pending", "active", "revoked", "disabled", "rotation_required"] = "setup_pending"
     setup_session_id: str | None = None
+    setup_started_at: datetime | None = None
+    setup_expires_at: datetime | None = None
     last_rotated_at: datetime | None = None
     revoked_at: datetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -137,6 +155,7 @@ class ConnectorSetupSessionPayload(DomainModel):
     setup_url: str
     device_code: str
     onecli_credential_ref: str
+    onecli_resource_name: str
     expires_at: datetime | None = None
 
 

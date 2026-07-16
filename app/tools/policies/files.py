@@ -46,8 +46,8 @@ def evaluate_file_write_text_policy(
         rules.append(
             PolicyRuleResult(
                 id="file-write-approval-context",
-                outcome="warn",
-                reason="file write is policy-mediated but actor is not explicitly approved",
+                outcome="deny",
+                reason="file write requires an explicitly approved actor context",
             )
         )
 
@@ -87,8 +87,8 @@ def evaluate_spreadsheet_write_policy(
         rules.append(
             PolicyRuleResult(
                 id="spreadsheet-write-approval-context",
-                outcome="warn",
-                reason="spreadsheet write is policy-mediated but actor is not explicitly approved",
+                outcome="deny",
+                reason="spreadsheet write requires an explicitly approved actor context",
             )
         )
 
@@ -156,8 +156,8 @@ def evaluate_markdown_to_word_policy(payload: dict[str, Any], *, actor: str | No
         rules.append(
             PolicyRuleResult(
                 id="document-write-approval-context",
-                outcome="warn",
-                reason="document generation is policy-mediated but actor is not explicitly approved",
+                outcome="deny",
+                reason="document generation requires an explicitly approved actor context",
             )
         )
 

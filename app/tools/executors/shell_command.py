@@ -11,6 +11,7 @@ from uuid import uuid4
 from app.domain import ToolDefinition, ToolType
 from app.runtime.native.errors import ToolExecutionError
 from app.tools.policies.command import blocked_command_reason
+from app.tools.policies.paths import blocked_path_reason
 from .base import ToolExecutionContext
 
 
@@ -39,14 +40,14 @@ class ShellCommandToolExecutor:
         mode = str(arguments.get("mode") or tool.implementation.config.get("mode") or "auto").lower()
         executable, shell_label = self._resolve_shell(mode)
         timeout = self._resolve_timeout(arguments, tool)
-        cwd = arguments.get("cwd") or tool.implementation.config.get("cwd")
+        cwd = self._resolve_cwd(arguments.get("cwd") or tool.implementation.config.get("cwd"), tool)
         started_at = time.perf_counter()
         try:
             completed = subprocess.run(  # noqa: S603
                 self._build_shell_invocation(executable, shell_label, str(command)),
                 shell=False,
                 capture_output=True,
-                cwd=str(cwd) if cwd else None,
+                cwd=str(cwd),
                 timeout=timeout,
                 check=False,
             )
@@ -187,6 +188,20 @@ class ShellCommandToolExecutor:
         if timeout > max_timeout:
             raise ToolExecutionError(f"timeout_seconds cannot exceed {max_timeout}")
         return timeout
+
+    @staticmethod
+    def _resolve_cwd(value: object, tool: ToolDefinition) -> Path:
+        try:
+            cwd = Path(str(value)).expanduser().resolve() if value else Path.cwd().resolve()
+            roots = [Path(item).expanduser().resolve() for item in (tool.security.allowed_paths or [str(Path.cwd())])]
+        except (OSError, RuntimeError) as exc:
+            raise ToolExecutionError("Shell command cwd is invalid") from exc
+        blocked_reason = blocked_path_reason(str(cwd))
+        if blocked_reason:
+            raise ToolExecutionError(f"Blocked shell command cwd: {blocked_reason}")
+        if not any(cwd == root or root in cwd.parents for root in roots):
+            raise ToolExecutionError(f"Shell command cwd '{cwd}' is outside the tool's allowed paths")
+        return cwd
 
     def _format_presentation(
             self,

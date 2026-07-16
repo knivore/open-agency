@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from app.domain import ModelProfileDefinition
+from app.core.outbound_http import validate_model_provider_url
 from app.llm.fallback import FallbackModelClient, ModelFallbackExhaustedError
 from app.llm.base import ModelMessage, ModelResponse, ModelToolCall
 from app.llm.azure import AzureOpenAIModelClient
@@ -11,6 +12,7 @@ from app.llm.ollama import OllamaModelClient
 from app.llm.openai_codex import OpenAICodexModelClient
 from app.llm.openai_compatible import OpenAICompatibleModelClient
 from app.llm.openai_helpers import sanitize_openai_message_name
+from app.llm.openrouter import DEFAULT_OPENROUTER_BASE_URL, OpenRouterModelClient
 from app.llm.registry import LLMEnvironmentConfig, ModelProviderRegistry
 
 
@@ -69,6 +71,36 @@ class AlwaysFailingModelClient(FakeModelClient):
 
 
 class ModelProviderRegistryTests(unittest.TestCase):
+    def test_official_model_provider_rejects_plaintext_http(self):
+        with self.assertRaisesRegex(ValueError, "requires HTTPS"):
+            validate_model_provider_url(
+                "http://api.openai.com/v1",
+                provider_key="openai",
+                allowed_custom_hosts=set(),
+            )
+
+    @patch("app.llm.openai_compatible.OpenAI")
+    def test_custom_compatible_endpoint_does_not_inherit_local_gateway_key(self, openai_cls):
+        profile = ModelProfileDefinition(
+            name="Custom Compatible",
+            provider="openai_compatible",
+            model="custom-model",
+            base_url="https://custom-provider.example/v1",
+        )
+        client = OpenAICompatibleModelClient(
+            profile,
+            LLMEnvironmentConfig(
+                local_openai_base_url="http://localhost:11434/v1",
+                local_openai_api_key="local-gateway-secret",
+            ),
+        )
+
+        self.assertEqual(client.api_key, "not-required")
+        openai_cls.assert_called_once_with(
+            base_url="https://custom-provider.example/v1",
+            api_key="not-required",
+        )
+
     def test_sanitize_openai_message_name_strips_invalid_punctuation(self):
         self.assertEqual(sanitize_openai_message_name("Coder Agent"), "Coder_Agent")
         self.assertEqual(sanitize_openai_message_name(" tool/result "), "tool_result")
@@ -314,6 +346,68 @@ class ModelProviderRegistryTests(unittest.TestCase):
             "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
         )
         self.assertEqual(client.primary_client.api_key, "qwen-env-key")
+
+    def test_registry_routes_openrouter_through_registered_adapter(self):
+        registry = ModelProviderRegistry.create_default(
+            env_config=LLMEnvironmentConfig(openrouter_api_key="openrouter-env-key")
+        )
+        profile = ModelProfileDefinition(
+            name="OpenRouter",
+            provider="openrouter",
+            model="openai/gpt-4o-mini",
+        )
+
+        client = registry.resolve(profile)
+
+        self.assertIsInstance(client, OpenRouterModelClient)
+        self.assertEqual(client.base_url, DEFAULT_OPENROUTER_BASE_URL)
+        self.assertEqual(client.api_key, "openrouter-env-key")
+
+    @patch("app.llm.openrouter.OpenAI")
+    def test_openrouter_client_includes_route_and_provider_preferences(self, openai_cls):
+        openai_cls.return_value = MagicMock()
+        profile = ModelProfileDefinition(
+            name="OpenRouter",
+            provider="openrouter",
+            model="openai/gpt-4o-mini",
+            parameters={
+                "route_models": ["anthropic/claude-3.5-sonnet"],
+                "provider_sort": "latency",
+                "allow_fallbacks": False,
+                "max_price": {"prompt": "0.50", "completion": "1.50"},
+            },
+        )
+        client = OpenRouterModelClient(
+            profile,
+            LLMEnvironmentConfig(
+                openrouter_api_key="openrouter-env-key",
+                openrouter_site_url="https://agency.example",
+                openrouter_app_name="Agency",
+            ),
+        )
+
+        options = client._chat_options(
+            temperature=None,
+            max_tokens=None,
+            stream=False,
+        )
+
+        self.assertEqual(
+            options["models"],
+            ["openai/gpt-4o-mini", "anthropic/claude-3.5-sonnet"],
+        )
+        self.assertEqual(
+            options["provider"],
+            {"sort": "latency", "allow_fallbacks": False},
+        )
+        self.assertEqual(options["max_price"], {"prompt": "0.50", "completion": "1.50"})
+        self.assertEqual(
+            options["extra_headers"],
+            {
+                "HTTP-Referer": "https://agency.example",
+                "X-OpenRouter-Title": "Agency",
+            },
+        )
 
     @patch("app.llm.openai_compatible.OpenAI")
     def test_openai_compatible_generate_text_uses_profile_fields(self, openai_cls):

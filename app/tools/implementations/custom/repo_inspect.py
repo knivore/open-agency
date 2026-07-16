@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from typing import Any
 
 from app.core.config import get_settings
+from app.runtime.workspace_paths import default_repo_write_mounts
 
 
 class RepoInspectInput(BaseModel):
@@ -206,7 +207,10 @@ def _allowed_repo_candidates() -> list[Path]:
     # a usable allowlist configured. Once an explicit repo exists, do not widen
     # inspection scope with extra fallback aliases.
     if not candidates:
-        for fallback in (repo_root, repo_root.parent / "open-agency-fe"):
+        # Containerized backends run from /app, which is not the repository root.
+        # Include the canonical runtime mount targets before source-tree fallbacks.
+        runtime_targets = [Path(mount["target"]).expanduser() for mount in default_repo_write_mounts()]
+        for fallback in (*runtime_targets, repo_root, repo_root.parent / "open-agency-fe"):
             if fallback.exists() and (fallback / ".git").exists():
                 candidates.append(fallback.resolve())
     unique: list[Path] = []

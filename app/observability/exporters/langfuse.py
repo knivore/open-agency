@@ -8,6 +8,7 @@ from app.domain.events import ExecutionEventType
 
 FAILURE_EVENT_TYPES = {
     ExecutionEventType.EXECUTION_FAILED,
+    ExecutionEventType.EXECUTION_CYCLE_FAILED,
     ExecutionEventType.TOOL_CALL_FAILED,
     ExecutionEventType.CONTAINER_FAILED,
     ExecutionEventType.RUNTIME_BUILD_FAILED,

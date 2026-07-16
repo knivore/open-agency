@@ -27,7 +27,23 @@ from .credentials import (
 )
 from .documents import DocumentUploadMode, UploadedDocument, UploadedDocumentStatus
 from .events import ExecutionEvent, ExecutionEventType
+from .intent_routing import (
+    ContextScope,
+    ExecutionMode,
+    FastPathResult,
+    RequestComplexity,
+    RoutingDecision,
+    SpecialistAgentDescriptor,
+    ToolGroupDescriptor,
+    ToolRoutingMetadata,
+)
 from .executions import Execution, ExecutionArtifact, ExecutionStatus
+from .execution_waits import (
+    ExecutionWait,
+    ExecutionWaitKind,
+    ExecutionWaitStatus,
+    TERMINAL_EXECUTION_WAIT_STATUSES,
+)
 from .goals import GoalDefinition, GoalStatus
 from .graph_projection import GraphProjectionEvent
 from .integrations import (
@@ -42,6 +58,7 @@ from .integrations import (
     ConnectorInstallation,
     ConnectorInstallationStatus,
     ConnectorMetadataRequirementDefinition,
+    ConnectorOneCLISecretProfileDefinition,
     ConnectorSetupGuideDefinition,
     ConnectorSetupGuideFieldDefinition,
     ConnectorSetupGuideOptionDefinition,
@@ -132,6 +149,7 @@ __all__ = [
     "CredentialStatus",
     "ContextCompactionRecord",
     "ContextHealth",
+    "ContextScope",
     "Conversation",
     "ConversationChannelType",
     "ConversationMessage",
@@ -149,6 +167,7 @@ __all__ = [
     "ConnectorInstallation",
     "ConnectorInstallationStatus",
     "ConnectorMetadataRequirementDefinition",
+    "ConnectorOneCLISecretProfileDefinition",
     "ConnectorSetupGuideDefinition",
     "ConnectorSetupGuideFieldDefinition",
     "ConnectorSetupGuideOptionDefinition",
@@ -160,7 +179,12 @@ __all__ = [
     "ExecutionArtifact",
     "ExecutionEvent",
     "ExecutionEventType",
+    "ExecutionMode",
+    "FastPathResult",
     "ExecutionStatus",
+    "ExecutionWait",
+    "ExecutionWaitKind",
+    "ExecutionWaitStatus",
     "FrameworkHints",
     "GraphContextSettings",
     "GoalDefinition",
@@ -204,7 +228,11 @@ __all__ = [
     "TokenBudgetPolicy",
     "TokenBudgetStatus",
     "TokenUsage",
+    "TERMINAL_EXECUTION_WAIT_STATUSES",
     "RuntimeRevisionStatus",
+    "RequestComplexity",
+    "RoutingDecision",
+    "SpecialistAgentDescriptor",
     "ScheduleDefinition",
     "ScheduleType",
     "SecretReference",
@@ -225,6 +253,8 @@ __all__ = [
     "PersonaVersionStatus",
     "TaskDefinition",
     "ToolImplementationReference",
+    "ToolGroupDescriptor",
+    "ToolRoutingMetadata",
     "ToolType",
     "ToolDefinition",
     "UploadedDocument",

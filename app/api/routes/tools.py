@@ -5,7 +5,8 @@ from pydantic import BaseModel, Field
 from typing import Any, Optional
 
 from app.api.context import ApiContext, get_default_api_context
-from app.api.identity import resolve_current_user_if_present
+from app.api.identity import resolve_current_user, resolve_current_user_if_present
+from app.core.config import get_settings
 from app.domain import ToolDefinition
 from app.runtime.native.errors import ToolExecutionError
 from app.services.generated_tool_workspace import GeneratedToolWorkspaceError, GeneratedToolWorkspaceService
@@ -46,6 +47,13 @@ def create_tools_router(context: Optional[ApiContext] = None) -> APIRouter:
     context = context or get_default_api_context()
     router = APIRouter()
 
+    async def require_tool_user(request: Request, *, scopes: list[str]):
+        if get_settings().app_env == "test":
+            # Preserve direct fixture calls while keeping independently mounted
+            # deployable routers fail-closed without relying on app middleware.
+            return await resolve_current_user_if_present(request, context, required_scopes=scopes)
+        return await resolve_current_user(request, context, required_scopes=scopes)
+
     router.include_router(
         build_crud_router(
             prefix="/tools",
@@ -56,6 +64,8 @@ def create_tools_router(context: Optional[ApiContext] = None) -> APIRouter:
             context=context,
             read_scopes=["tools:read"],
             write_scopes=["tools:write"],
+            require_read_auth=get_settings().app_env != "test",
+            require_write_auth=get_settings().app_env != "test",
             before_list=context.ensure_builtin_tool_seed_data,
             response_filter=tool_definition_visible_with_enabled_modules,
         )
@@ -63,7 +73,7 @@ def create_tools_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @router.post("/tools/validate", tags=["Tools"], summary="Validate Tool")
     async def validate_tool(payload: ToolValidateRequest, request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["tools:write"])
+        await require_tool_user(request, scopes=["tools:write"])
         result = context.tool_service.validate_definition(payload.tool_definition)
         return {
             "tool": payload.tool_definition.model_dump(mode="json"),
@@ -74,7 +84,7 @@ def create_tools_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @router.post("/tools/{tool_id}/test", tags=["Tools"], summary="Test Tool")
     async def test_tool(tool_id: str, payload: ToolTestRequest, request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["tools:write"])
+        await require_tool_user(request, scopes=["tools:write"])
         tool = await context.tool_repo.get(tool_id)
         if tool is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Tool '{tool_id}' not found")
@@ -96,7 +106,7 @@ def create_tools_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @router.get("/tools/generated/packages", tags=["Tools"], summary="List Generated Tool Packages")
     async def list_generated_tool_packages(request: Request, package_id: str | None = None):
-        await resolve_current_user_if_present(request, context, required_scopes=["tools:read"])
+        await require_tool_user(request, scopes=["tools:read"])
         service = GeneratedToolWorkspaceService(context)
         result = await service.list_packages_with_registry()
         if package_id:
@@ -108,7 +118,7 @@ def create_tools_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @router.get("/tools/generated/packages/{package_id}", tags=["Tools"], summary="Inspect Generated Tool Package")
     async def inspect_generated_tool_package(package_id: str, request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["tools:read"])
+        await require_tool_user(request, scopes=["tools:read"])
         service = GeneratedToolWorkspaceService(context)
         try:
             return await service.inspect_package(package_id)
@@ -117,7 +127,7 @@ def create_tools_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @router.post("/tools/generated/packages/scaffold", tags=["Tools"], summary="Scaffold Generated Tool Package")
     async def scaffold_generated_tool_package(payload: GeneratedToolPackageScaffoldRequest, request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["tools:write"])
+        await require_tool_user(request, scopes=["tools:write"])
         service = GeneratedToolWorkspaceService(context)
         try:
             result = service.scaffold_package(
@@ -136,7 +146,7 @@ def create_tools_router(context: Optional[ApiContext] = None) -> APIRouter:
 
     @router.post("/tools/generated/packages/publish", tags=["Tools"], summary="Publish Generated Tool")
     async def publish_generated_tool(payload: GeneratedToolPublishRequest, request: Request):
-        await resolve_current_user_if_present(request, context, required_scopes=["tools:write"])
+        await require_tool_user(request, scopes=["tools:write"])
         service = GeneratedToolWorkspaceService(context)
         try:
             tool = await service.publish_tool(

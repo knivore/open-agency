@@ -23,4 +23,5 @@ class ToolORM(TimestampMixin, Base):
     implementation_json: Mapped[dict] = mapped_column(JSON_VARIANT, default=dict)
     security_json: Mapped[dict] = mapped_column(JSON_VARIANT, default=dict)
     mcp_json: Mapped[dict] = mapped_column(JSON_VARIANT, default=dict)
+    routing_json: Mapped[dict | None] = mapped_column(JSON_VARIANT, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)

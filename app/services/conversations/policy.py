@@ -209,6 +209,30 @@ class MainAgentPolicyService:
             return False
         return not any(tag in self._DENY_TAGS for tag in tool.tags)
 
+    def tool_is_visible_to_user(self, tool: ToolDefinition, user_id: str | None) -> bool:
+        """Apply optional per-user restrictions after the agent-level allowlist.
+
+        User policy can only narrow visibility. Keeping this check after agent resolution
+        prevents routing from turning user metadata into a capability-expansion mechanism.
+        """
+        if not self.tool_is_visible(tool):
+            return False
+        metadata = self._tool_metadata(tool)
+        allowed = self._metadata_string_set(metadata, "allowed_user_ids")
+        if allowed and user_id not in allowed:
+            return False
+        denied = self._metadata_string_set(metadata, "denied_user_ids")
+        if user_id in denied:
+            return False
+        return True
+
+    @staticmethod
+    def _metadata_string_set(metadata: dict[str, Any], key: str) -> set[str]:
+        values = metadata.get(key)
+        if not isinstance(values, list):
+            return set()
+        return {value.strip() for value in values if isinstance(value, str) and value.strip()}
+
     def _tool_metadata(self, tool: ToolDefinition) -> dict[str, Any]:
         metadata = dict(tool.framework_hints.metadata)
         config = tool.implementation.config

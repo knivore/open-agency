@@ -24,11 +24,21 @@ from app.runtime.worker_protocol import (
     WORKER_EXIT_CANCELLED,
     WORKER_EXIT_INFRA_FAILED,
     WORKER_EXIT_SUCCESS,
+    WORKER_EXIT_SUSPENDED,
     WORKER_EXIT_WORKFLOW_FAILED,
     worker_exit_reason,
 )
 
-ACTIVE_EXECUTION_STATUSES = {"queued", "running", "waiting_for_approval", "paused", "cancelling"}
+ACTIVE_EXECUTION_STATUSES = {
+    "queued",
+    "running",
+    "waiting_for_input",
+    "waiting_for_approval",
+    "waiting_for_event",
+    "sleeping",
+    "paused",
+    "cancelling",
+}
 TERMINAL_EXECUTION_STATUSES = {"completed", "failed", "cancelled"}
 EXITED_CONTAINER_STATUSES = {"exited", "dead"}
 LIVE_CONTAINER_STATUSES = {"created", "running", "restarting", "paused"}
@@ -270,6 +280,20 @@ class RuntimeReconciler:
         execution.container_exit_code = container.exit_code
         exit_reason = worker_exit_reason(container.exit_code)
         completion_time = execution.container_ended_at or utc_now()
+
+        if container.exit_code == WORKER_EXIT_SUSPENDED:
+            # A durable wait intentionally ends the current worker. Preserve
+            # the execution's waiting state so the wake reconciler can launch
+            # the next worker under the same execution ID.
+            await self.execution_store.update_execution(execution)
+            await self.lifecycle_emitter.emit_container_stopped(
+                state,
+                container,
+                runtime_revision_id=execution.runtime_revision_id,
+                reason=worker_exit_reason(container.exit_code),
+            )
+            return
+
         execution.completed_at = execution.completed_at or completion_time
 
         if container.exit_code == WORKER_EXIT_SUCCESS:
@@ -362,6 +386,12 @@ class RuntimeReconciler:
         execution.container_status = "removed"
         execution.container_ended_at = container.finished_at or execution.container_ended_at or utc_now()
         execution.container_exit_code = container.exit_code
+        if execution.status.value in ACTIVE_EXECUTION_STATUSES:
+            # Suspended executions intentionally have no live worker until a
+            # wake queues the next container. Clearing the link prevents the
+            # next reconciliation pass from treating that gap as a loss.
+            execution.container_id = None
+            execution.container_name = None
         await self.execution_store.update_execution(execution)
         return True
 
