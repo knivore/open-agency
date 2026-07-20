@@ -188,10 +188,13 @@ class ApiContext:
         await ensure_builtin_runtime_adapters(self.runtime_adapter_repo)
 
     async def ensure_builtin_tool_seed_data(self) -> list[ToolDefinition]:
-        """Persist built-in app tools and system tools without overwriting existing records."""
+        """Seed core tools and reconcile authoritative optional-package contracts."""
         # Startup seeding should persist the same builtin registry that CLI discovery and
         # runtime inspection expose, otherwise builtin families can drift between codepaths.
+        from app.modules.registry import OPTIONAL_MODULE_TOOL_OWNER_CONFIG_KEY, optional_module_specs
+
         tools = builtin_tool_definitions()
+        active_optional_module_keys = {spec.key for spec in optional_module_specs() if spec.available()}
         saved: list[ToolDefinition] = []
         seen: set[str] = set()
         for tool in tools:
@@ -199,10 +202,23 @@ class ApiContext:
                 continue
             seen.add(tool.id)
             existing = await self.tool_repo.get(tool.id, include_deleted=True)
+            optional_module_key = tool.implementation.config.get(OPTIONAL_MODULE_TOOL_OWNER_CONFIG_KEY)
             if existing is None:
                 saved.append(await self.tool_repo.create(tool))
+            elif optional_module_key:
+                # Package-owned IDs are stable contracts. Reconcile them so an extracted
+                # module can replace implementation refs persisted by an older core build.
+                saved.append(await self.tool_repo.save(tool))
+                await self.tool_repo.restore(tool.id)
             else:
                 saved.append(existing)
+
+        # Ownership survives package removal in implementation metadata. This lets core hide
+        # absent add-ons without retaining a hard-coded catalog of module-specific tool names.
+        for persisted_tool in await self.tool_repo.list(include_deleted=True):
+            owner_key = persisted_tool.implementation.config.get(OPTIONAL_MODULE_TOOL_OWNER_CONFIG_KEY)
+            if owner_key and owner_key not in active_optional_module_keys:
+                await self.tool_repo.soft_delete(persisted_tool.id)
         return saved
 
     def _host_platform(self) -> str:

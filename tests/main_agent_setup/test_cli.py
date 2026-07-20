@@ -310,6 +310,14 @@ class MainAgentCliTests(unittest.TestCase):
         self.assertIn("read-only judge", prompt)
         self.assertIn("deterministic assertions", prompt)
 
+    def test_default_prompt_requires_execution_evidence_for_run_failures(self) -> None:
+        prompt = extract_prompt_from_doc()
+
+        self.assertIn("agency.execution.get", prompt)
+        self.assertIn("agency.execution.events", prompt)
+        self.assertIn("earliest supporting failure event", prompt)
+        self.assertIn("Do not substitute workflow or agent definitions", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -39,6 +39,9 @@ class BaseCatalogRepository(Generic[T]):
     async def soft_delete(self, item_id: str) -> bool:
         raise NotImplementedError
 
+    async def restore(self, item_id: str) -> bool:
+        raise NotImplementedError
+
 
 class InMemoryCatalogRepository(BaseCatalogRepository[T]):
     def __init__(self, model_cls: Type[T]):
@@ -102,6 +105,14 @@ class InMemoryCatalogRepository(BaseCatalogRepository[T]):
         if not existing or existing.get("_deleted_at"):
             return False
         existing["_deleted_at"] = utc_now().isoformat()
+        existing["_updated_at"] = utc_now().isoformat()
+        return True
+
+    async def restore(self, item_id: str) -> bool:
+        existing = self._items.get(item_id)
+        if not existing:
+            return False
+        existing["_deleted_at"] = None
         existing["_updated_at"] = utc_now().isoformat()
         return True
 
@@ -226,6 +237,13 @@ class MongoCatalogRepository(BaseCatalogRepository[T]):
             {"$set": {"_deleted_at": utc_now().isoformat(), "_updated_at": utc_now().isoformat()}},
         )
         return result.modified_count > 0
+
+    async def restore(self, item_id: str) -> bool:
+        result = await self.collection.update_one(
+            {"id": item_id},
+            {"$set": {"_deleted_at": None, "_updated_at": utc_now().isoformat()}},
+        )
+        return result.matched_count > 0
 
 
 class WorkflowCatalogRepository(MongoCatalogRepository[WorkflowDefinition]):

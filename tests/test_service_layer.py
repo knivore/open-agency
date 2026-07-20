@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import unittest
 import asyncio
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from app.api.context import create_test_api_context
 from app.domain import Execution, ExecutionEvent, ExecutionEventType, ExecutionStatus, \
@@ -206,6 +207,64 @@ class ToolServiceLayerTests(unittest.TestCase):
         self.assertTrue(repaired.security.allow_filesystem)
         self.assertTrue(repaired.security.read_only)
         self.assertFalse(repaired.security.requires_approval)
+
+    def test_builtin_seed_tracks_optional_tool_install_remove_and_reinstall(self):
+        context = create_test_api_context()
+        tools = asyncio.run(context.ensure_builtin_tool_seed_data())
+        command_tool = next(tool for tool in tools if tool.id == "agency.command.run")
+        owned_tool = command_tool.model_copy(
+            update={
+                "implementation": command_tool.implementation.model_copy(
+                    update={
+                        "config": {
+                            **command_tool.implementation.config,
+                            "agency_optional_module_key": "test_pack",
+                        }
+                    }
+                )
+            }
+        )
+        active_spec = SimpleNamespace(key="test_pack", available=lambda: True)
+
+        with patch("app.api.context.builtin_tool_definitions", return_value=[owned_tool]), patch(
+            "app.modules.registry.optional_module_specs",
+            return_value=(active_spec,),
+        ):
+            asyncio.run(context.ensure_builtin_tool_seed_data())
+
+        stale = owned_tool.model_copy(
+            update={"implementation": owned_tool.implementation.model_copy(update={"target": "removed.core.module"})}
+        )
+        asyncio.run(context.tool_repo.save(stale))
+
+        with patch("app.api.context.builtin_tool_definitions", return_value=[owned_tool]), patch(
+            "app.modules.registry.optional_module_specs",
+            return_value=(active_spec,),
+        ):
+            asyncio.run(context.ensure_builtin_tool_seed_data())
+
+        repaired = asyncio.run(context.tool_repo.get(command_tool.id))
+        self.assertIsNotNone(repaired)
+        self.assertEqual(repaired.implementation.target, command_tool.implementation.target)
+
+        with patch("app.api.context.builtin_tool_definitions", return_value=[]), patch(
+            "app.modules.registry.optional_module_specs",
+            return_value=(),
+        ):
+            asyncio.run(context.ensure_builtin_tool_seed_data())
+
+        self.assertIsNone(asyncio.run(context.tool_repo.get(command_tool.id)))
+        self.assertIsNotNone(asyncio.run(context.tool_repo.get(command_tool.id, include_deleted=True)))
+
+        with patch("app.api.context.builtin_tool_definitions", return_value=[owned_tool]), patch(
+            "app.modules.registry.optional_module_specs",
+            return_value=(active_spec,),
+        ):
+            asyncio.run(context.ensure_builtin_tool_seed_data())
+
+        restored = asyncio.run(context.tool_repo.get(command_tool.id))
+        self.assertIsNotNone(restored)
+        self.assertEqual(restored.implementation.target, command_tool.implementation.target)
 
 
 if __name__ == "__main__":

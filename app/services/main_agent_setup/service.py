@@ -66,6 +66,7 @@ class MainAgentSetupConfig:
         default_factory=lambda: {
             "can_answer_directly": True,
             "can_trigger_workflows": True,
+            "can_manage_goals": True,
             "can_create_workflows": False,
             "can_update_workflows": False,
             "can_manage_tools": True,
@@ -397,6 +398,11 @@ class MainAgentSetupService:
         system_tools = await tool_resolver.ensure_workflow_system_tools(
             can_trigger_workflows=config.policy.get("can_trigger_workflows", True)
         )
+        system_tools.extend(
+            await tool_resolver.ensure_goal_system_tools(
+                can_manage_goals=config.policy.get("can_manage_goals", True)
+            )
+        )
         system_tools.extend(await tool_resolver.ensure_default_main_agent_speech_tools())
         system_tools.extend(
             await tool_resolver.ensure_tool_management_system_tools(
@@ -616,6 +622,11 @@ class MainAgentSetupService:
         system_tools = await tool_resolver.ensure_workflow_system_tools(
             can_trigger_workflows=profile.policy.get("can_trigger_workflows", True)
         )
+        system_tools.extend(
+            await tool_resolver.ensure_goal_system_tools(
+                can_manage_goals=profile.policy.get("can_manage_goals", True)
+            )
+        )
         system_tools.extend(await tool_resolver.ensure_default_main_agent_speech_tools())
         system_tools.extend(
             await tool_resolver.ensure_tool_management_system_tools(
@@ -671,6 +682,19 @@ class MainAgentSetupService:
         )
         await self.context.agent_repo.save(updated_agent)
         return profile
+
+    async def ensure_main_agent_tool_access_current(self, profile: MainAgentProfile) -> MainAgentProfile:
+        agent = await self.context.agent_repo.get(profile.agent_id)
+        if agent is None:
+            return profile
+
+        expected_ids = set(AgentToolResolver(self.context).main_agent_default_tool_ids(profile.policy))
+        if expected_ids.issubset(set(agent.tool_ids)):
+            return profile
+
+        # Persisted profiles can outlive newly added system tools, and startup reconciliation may
+        # have failed before a conversation begins. Repair only when the policy-derived grant is stale.
+        return await self.sync_main_agent_tool_access(profile.id) or profile
 
     async def create_provider_and_model_profile(
             self,

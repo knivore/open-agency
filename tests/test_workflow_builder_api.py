@@ -1022,7 +1022,9 @@ class WorkflowBuilderApiTests(unittest.TestCase):
         self.assertTrue(payload["compatible_runtime_adapters"])
         error_codes = {item["code"] for item in payload["validation_errors"]}
         self.assertIn("agent.model_profile.incompatible", error_codes)
-        self.assertIn("tool.security.dangerous", error_codes)
+        # Privileged capabilities are normalized onto a sandbox before the
+        # workflow validator runs, so this tool is guarded rather than invalid.
+        self.assertNotIn("tool.security.dangerous", error_codes)
 
         detail = self.client.get("/workflows/workflow-1")
         self.assertEqual(detail.status_code, 200)

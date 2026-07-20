@@ -17,6 +17,8 @@ from app.domain import (
     ConversationRole,
     CredentialDefinition,
     Execution,
+    ExecutionEvent,
+    ExecutionEventType,
     MCPExposureSettings,
     ExecutionStatus,
     MemoryRecord,
@@ -38,6 +40,7 @@ from app.services.agent_tools import (
     agent_management_system_tool_ids,
     connector_system_tool_ids,
     execution_system_tool_ids,
+    goal_system_tool_ids,
     graph_system_tool_ids,
     memory_system_tool_ids,
     tool_management_system_tool_ids,
@@ -640,6 +643,127 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(profiles), 1)
         self.assertEqual(len([item for item in agents if item.id == "main-agent"]), 1)
         self.assertEqual(len([item for item in workflows if item.id == "main-workflow"]), 1)
+
+    async def test_run_page_self_heals_stale_execution_tool_access_and_reads_failure_evidence(self) -> None:
+        profile = await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Diagnose runs from execution evidence.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+                agent_id="main-agent",
+                workflow_id="main-workflow",
+            )
+        )
+        agent = await self.context.agent_repo.get(profile.agent_id)
+        assert agent is not None
+        await self.context.agent_repo.update(
+            agent.id,
+            {"tool_ids": [tool_id for tool_id in agent.tool_ids if not tool_id.startswith("agency.execution.")]},
+        )
+
+        execution = Execution(
+            id="execution-run-diagnostic",
+            workflow_id="workflow-news",
+            runtime_adapter_id="native",
+            status=ExecutionStatus.FAILED,
+            input_payload={},
+            error="host is not allowlisted: feeds.example.test",
+            created_by="user-1",
+        )
+        await self.context.execution_store.save_execution(execution)
+        await self.context.execution_store.save_event(
+            ExecutionEvent(
+                execution_id=execution.id,
+                workflow_id=execution.workflow_id,
+                task_id="task-research",
+                event_type=ExecutionEventType.TOOL_CALL_FAILED,
+                sequence=1,
+                status="failed",
+                payload={
+                    "tool_id": "agency.http.request",
+                    "error": "host is not allowlisted: feeds.example.test",
+                },
+            )
+        )
+        _FakeModelClient.responses = [
+            ModelResponse(
+                content=None,
+                tool_calls=[
+                    ModelToolCall(
+                        id="tool-call-run-get",
+                        name="get_execution",
+                        arguments={"execution_id": execution.id},
+                    ),
+                    ModelToolCall(
+                        id="tool-call-run-events",
+                        name="list_execution_events",
+                        arguments={"execution_id": execution.id},
+                    ),
+                ],
+                provider="fake",
+                model="fake-model",
+            ),
+            ModelResponse(
+                content="The first actionable error is that feeds.example.test is not allowlisted.",
+                provider="fake",
+                model="fake-model",
+            ),
+        ]
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-run-diagnostic",
+                "created_by_user_id": "user-1",
+                "channel_type": "web",
+            }
+        )
+
+        result = await self.service.post_message(
+            conversation.id,
+            {
+                "message": {
+                    "id": "message-run-diagnostic",
+                    "role": "user",
+                    "message_type": "user_text",
+                    "plain_text": "Explain why this run failed using the first actionable error and evidence.",
+                    "content": {"text": "Explain why this run failed using the first actionable error and evidence."},
+                    "metadata": {
+                        "page_context": {
+                            "surface": "runs.detail",
+                            "selection": {"runId": execution.id},
+                            "entities": [{"type": "run", "id": execution.id, "label": "Selected run"}],
+                        },
+                        "assistant_providers": {
+                            "version": "2026-05-27",
+                            "providers": [
+                                {
+                                    "id": "execution.provider",
+                                    "systemToolIds": [
+                                        "agency.execution.get",
+                                        "agency.execution.events",
+                                    ],
+                                }
+                            ],
+                        },
+                    },
+                },
+            },
+        )
+
+        self.assertIn("feeds.example.test is not allowlisted", result["assistant_message"]["plain_text"])
+        refreshed_agent = await self.context.agent_repo.get(profile.agent_id)
+        assert refreshed_agent is not None
+        self.assertIn("agency.execution.get", refreshed_agent.tool_ids)
+        self.assertIn("agency.execution.events", refreshed_agent.tool_ids)
+        messages = (await self.service.list_messages(conversation.id))["items"]
+        tool_results = [item for item in messages if item["message_type"] == "tool_result"]
+        self.assertEqual(len(tool_results), 2)
+        self.assertEqual(tool_results[0]["content"]["result"]["execution"]["error"], execution.error)
+        self.assertEqual(
+            tool_results[1]["content"]["result"]["items"][0]["payload"]["error"],
+            execution.error,
+        )
 
     async def test_missing_main_agent_setup_raises_clear_error(self) -> None:
         with self.assertRaises(MainAgentSetupRequiredError):
@@ -2333,6 +2457,7 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
             *execution_system_tool_ids(),
             *command_system_tool_ids(),
             *graph_system_tool_ids(),
+            *goal_system_tool_ids(),
         ]
         self.assertEqual(
             sorted(agent.tool_ids),
@@ -2512,6 +2637,70 @@ class MainAgentConversationServiceTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertEqual(messages["items"][1]["content"]["tool_name"], "run_workflow")
+
+    async def test_main_agent_routes_extended_workflow_tools_through_contract_runtime(self) -> None:
+        await self.context.workflow_repo.save(
+            WorkflowDefinition(
+                id="workflow-improvement-review",
+                name="Workflow Improvement Review",
+                description="Workflow with an empty improvement proposal history.",
+                entrypoint="manual",
+                metadata={"visible_to_main_agent": True},
+            )
+        )
+        await self.setup_service.create_main_agent(
+            MainAgentSetupConfig(
+                agent_name="Main Agent",
+                agent_description="Configured for tests.",
+                agent_instructions="Use workflow review tools when helpful.",
+                model_profile_id="profile-fake",
+                profile_id="main-agent-profile",
+                agent_id="main-agent",
+                workflow_id="main-workflow",
+            )
+        )
+        _FakeModelClient.responses = [
+            ModelResponse(
+                content=None,
+                tool_calls=[
+                    ModelToolCall(
+                        id="tool-call-list-improvements",
+                        name="list_workflow_improvement_proposals",
+                        arguments={"workflow_id": "workflow-improvement-review"},
+                    )
+                ],
+                provider="fake",
+                model="fake-model",
+            ),
+            ModelResponse(content="There are no proposals yet.", provider="fake", model="fake-model"),
+        ]
+        conversation = await self.service.create_conversation(
+            {
+                "id": "conversation-workflow-improvement-review",
+                "created_by_user_id": "user-1",
+                "channel_type": "api",
+            }
+        )
+
+        result = await self.service.post_message(
+            conversation.id,
+            {
+                "message": {
+                    "id": "message-workflow-improvement-review",
+                    "role": "user",
+                    "message_type": "user_text",
+                    "plain_text": "List workflow improvement proposals",
+                    "content": {"text": "List workflow improvement proposals"},
+                },
+            },
+        )
+
+        self.assertEqual(result["assistant_message"]["plain_text"], "There are no proposals yet.")
+        messages = await self.service.list_messages(conversation.id)
+        tool_result = next(item for item in messages["items"] if item["message_type"] == "tool_result")
+        self.assertEqual(tool_result["content"]["result"]["status"], "ok")
+        self.assertEqual(tool_result["content"]["result"]["count"], 0)
+        self.assertNotIn("error", tool_result["content"]["result"])
 
     async def test_protected_workflow_tool_call_requests_approval_each_time(self) -> None:
         await self.context.workflow_repo.save(

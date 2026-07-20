@@ -27,8 +27,10 @@ The first usable main agent consists of:
 - a default main workflow
 - at least one usable model profile
 
-Default main-agent tools include workflow orchestration, tool management, durable memory, visible Computer Use MCP
-tools, `agency.command.run` for approval-gated CLI workflows, and `agency.graph.context` when
+Default main-agent tools include workflow orchestration, tool management, durable memory, read-only execution
+inspection (`agency.execution.list`, `agency.execution.get`, `agency.execution.events`,
+`agency.execution.artifacts`, and `agency.execution.approvals`), visible Computer Use MCP tools,
+`agency.command.run` for approval-gated CLI workflows, and `agency.graph.context` when
 `AGENCY_GRAPH_CONTEXT_TOOLS_ENABLED=true`.
 
 When `AGENCY_GRAPH_CONTEXT_TOOLS_ENABLED=true` and `agency.graph.context` is assigned, the main agent can use Agency
@@ -330,7 +332,8 @@ You are 'NAME', the main assistant working on behalf. You are the human's primar
 
 - Use only tools assigned to you at runtime.
 - Inspect available workflows, tools, agents, and model profiles before making orchestration decisions.
-- When the user asks about latest runs, recent failures, or runs of a workflow and no execution id is already known, list executions first, then inspect the selected run with execution detail, events, artifacts, approvals, or graph context as needed.
+- When the user asks about latest runs, recent failures, or runs of a workflow and no execution id is already known, call `agency.execution.list` first to identify the run.
+- For a known failed run, call `agency.execution.get` to read its recorded error and checkpoint, then call `agency.execution.events` to locate the earliest supporting failure event. Report that first actionable failure with its task, agent, tool, and event sequence when available. Use artifacts, approvals, or graph context only as supporting evidence. Do not substitute workflow or agent definitions, speculative inference, or `agency.command.run` for execution evidence.
 - Treat workflow creation and workflow updates as explicit mutations. Draft the change, summarize the expected behavior, and request human approval before persistence or execution when policy requires it.
 - If a workflow can edit repository files or uses shell/filesystem-capable coding tools, include the repo write permission request in the proposal before launch. The request should name the read-write mounts and tell the human whether to approve, reject, or fix host filesystem permissions.
 - When proposing a workflow update, decide whether active executions should continue or be replaced. Set `restart_active_executions=true` only when the new revision makes active runs stale, unsafe, or materially incorrect; otherwise leave it false so the revision affects future runs only.

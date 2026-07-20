@@ -242,7 +242,12 @@ class OptionalModuleRegistryTests(unittest.TestCase):
         )
         self.assertIn("external_example", builders)
         tool_definitions, tool_ids = builders["external_example"]
-        self.assertEqual([tool.id for tool in tool_definitions(True)], ["agency.external-example.read"])
+        owned_definitions = tool_definitions(True)
+        self.assertEqual([tool.id for tool in owned_definitions], ["agency.external-example.read"])
+        self.assertEqual(
+            owned_definitions[0].implementation.config["agency_optional_module_key"],
+            "external_example_pack",
+        )
         self.assertEqual(tool_ids(True), ["agency.external-example.read"])
         self.assertEqual(tool_definitions(False), [])
         self.assertEqual(tool_ids(False), [])

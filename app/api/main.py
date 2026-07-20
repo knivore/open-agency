@@ -85,7 +85,9 @@ def create_app(context: ApiContext | None = None) -> FastAPI:
         daily_summary_task: asyncio.Task | None = None
         main_agent_monitor_task: asyncio.Task | None = None
         discord_gateway_listener_task: asyncio.Task | None = None
-        runtime_context = runtime_context or getattr(app.state, "api_context", None)
+        # Production calls create_app() without injecting a context. Resolve it before
+        # seeding so package-owned tool definitions reconcile during normal startup.
+        runtime_context = runtime_context or getattr(app.state, "api_context", None) or get_default_api_context()
         if runtime_context is not None:
             app.state.api_context = runtime_context
             await runtime_context.ensure_builtin_tool_seed_data()
@@ -113,7 +115,7 @@ def create_app(context: ApiContext | None = None) -> FastAPI:
             try:
                 await MainAgentSetupService(runtime_context).sync_main_agent_tool_access()
             except Exception:
-                pass
+                logger.exception("Startup main-agent tool-access reconciliation failed")
             try:
                 await ConnectorInstallationService(runtime_context).reconcile_startup_integrations()
             except Exception:

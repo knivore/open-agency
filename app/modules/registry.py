@@ -19,6 +19,7 @@ from app.core.config import get_settings
 
 RouteFactory = Callable[[Any], Any]
 OPTIONAL_MODULE_ENTRY_POINT_GROUP = "agency.module_packs"
+OPTIONAL_MODULE_TOOL_OWNER_CONFIG_KEY = "agency_optional_module_key"
 
 
 @dataclass(frozen=True)
@@ -126,7 +127,19 @@ class OptionalModuleSpec:
         # Tool families still use legacy keyword names. The registry adapts that
         # detail so core catalog assembly only sees a consistent bool contract.
         def definitions(enabled: bool) -> list[Any]:
-            return definition_builder(**{self.system_tool_enabled_kwarg: enabled})
+            tools = definition_builder(**{self.system_tool_enabled_kwarg: enabled})
+            owned_tools: list[Any] = []
+            for tool in tools:
+                implementation = tool.implementation.model_copy(
+                    update={
+                        "config": {
+                            **tool.implementation.config,
+                            OPTIONAL_MODULE_TOOL_OWNER_CONFIG_KEY: self.key,
+                        }
+                    }
+                )
+                owned_tools.append(tool.model_copy(update={"implementation": implementation}))
+            return owned_tools
 
         def ids(enabled: bool) -> list[str]:
             return id_builder(**{self.system_tool_enabled_kwarg: enabled})
@@ -783,6 +796,7 @@ __all__ = [
     "OptionalModuleMigration",
     "OptionalModulePersistencePlan",
     "OPTIONAL_MODULE_ENTRY_POINT_GROUP",
+    "OPTIONAL_MODULE_TOOL_OWNER_CONFIG_KEY",
     "hidden_tool_names_for_disabled_modules",
     "optional_module_available",
     "load_optional_module_domain_models",

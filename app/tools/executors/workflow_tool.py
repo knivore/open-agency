@@ -58,7 +58,7 @@ class WorkflowToolExecutor:
             SYSTEM_EXECUTION_ARTIFACTS_TOOL_ID,
         }:
             return await self._execute_system_execution_tool(tool, arguments, context)
-        if tool.implementation.target == SYSTEM_WORKFLOW_TOOL_TARGET or tool.id in {
+        if tool.id in {
             SYSTEM_WORKFLOW_LIST_TOOL_ID,
             SYSTEM_WORKFLOW_GET_TOOL_ID,
             SYSTEM_WORKFLOW_RUN_TOOL_ID,
@@ -69,8 +69,9 @@ class WorkflowToolExecutor:
         if tool.implementation.target == SYSTEM_GRAPH_TOOL_TARGET and tool.id in _GRAPH_WORKING_SET_TOOL_IDS:
             return await self._execute_graph_working_set_tool(tool, arguments, context)
         if tool.implementation.target.startswith(_SYSTEM_TOOL_TARGET_PREFIX):
-            # System targets are routing namespaces owned by ToolRuntimeExecutor,
-            # not persisted workflow IDs that the runtime registry can resolve.
+            # Extended system workflow tools share the workflow routing namespace,
+            # but their implementations live in the API runtime rather than a
+            # persisted workflow that the native registry can execute.
             return await self._execute_api_system_tool(tool, arguments, context)
         if context.runtime_registry is None:
             raise ToolExecutionError(f"Workflow tool '{tool.id}' cannot execute without a runtime registry")

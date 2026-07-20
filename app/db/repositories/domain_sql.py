@@ -421,6 +421,15 @@ class SQLToolRepository(SQLDomainRepositoryBase):
             await session.commit()
             return True
 
+    async def restore(self, item_id: str) -> bool:
+        async with self.session_factory() as session:
+            item = await session.get(ToolORM, item_id)
+            if item is None:
+                return False
+            item.enabled = True
+            await session.commit()
+            return True
+
 
 class SQLConversationRepository(SQLDomainRepositoryBase):
     def _to_domain(self, orm: ConversationORM) -> Conversation:

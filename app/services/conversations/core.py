@@ -2916,9 +2916,6 @@ class ConversationService:
             repair_goal: str | None = None,
     ) -> tuple[WorkflowDefinition, dict[str, Any]]:
         initial_errors = await self._workflow_validation_errors(workflow)
-        if not initial_errors:
-            return workflow, {}
-
         available_tools_by_id = await self._available_workflow_tools_by_id()
         known_tool_ids = {tool.id for tool in workflow.tool_definitions}.union(available_tools_by_id)
         repaired = self._repair_workflow_definition(
@@ -2926,6 +2923,12 @@ class ConversationService:
             known_tool_ids=known_tool_ids,
             available_tools_by_id=available_tools_by_id,
         )
+        # Deterministic policy repair also enforces invariants that schema
+        # validation alone cannot see, such as agent/task tool alignment and
+        # approval hardening for network-capable tools.
+        if not initial_errors and repaired == workflow:
+            return workflow, {}
+
         remaining_errors = await self._workflow_validation_errors(repaired)
         metadata: dict[str, Any] = {
             "validation_repair": {
@@ -3135,7 +3138,10 @@ class ConversationService:
             repaired_nodes = []
             for index, node in enumerate(nodes):
                 updates: dict[str, Any] = {}
-                if node.node_type == NodeType.TASK and not node.task_id:
+                if node.node_type == NodeType.TASK and node.task_id not in task_ids:
+                    # Proposal authors often replace task definitions without
+                    # updating the parallel node reference. Preserve the node
+                    # and bind it deterministically to the replacement task.
                     task_id = task_ids[min(index, len(task_ids) - 1)]
                     updates["task_id"] = task_id
                 if node.tool_id and node.tool_id not in known_tool_ids:
@@ -5081,6 +5087,7 @@ class ConversationService:
             conversation.main_agent_profile_id) if conversation.main_agent_profile_id else None
         if profile is None:
             profile = await setup_service.require_active_main_agent_profile()
+        profile = await setup_service.ensure_main_agent_tool_access_current(profile)
         if conversation.main_agent_profile_id != profile.id:
             await self.context.conversation_repo.update(conversation.id, {"main_agent_profile_id": profile.id})
         return profile
@@ -8713,7 +8720,25 @@ class ConversationService:
                 }
             }
         if tool.id != SYSTEM_WORKFLOW_RUN_TOOL_ID:
-            return {"result": {"status": "error", "error": f"Unknown workflow tool '{tool.name}'."}}
+            # Conversation-owned proposal and execution tools above need local
+            # approval context. Extended workflow tools are contract-backed and
+            # should use the shared runtime so the catalogue cannot outgrow this
+            # dispatcher again.
+            try:
+                result = await self.context.tool_service.tool_registry.execute(
+                    tool,
+                    arguments,
+                    execution_id=f"conversation-tool-{uuid4()}",
+                    workflow_id=None,
+                    agent_id=profile.agent_id,
+                )
+            except Exception as exc:
+                result = {
+                    "status": "error",
+                    "error": str(exc),
+                    "tool_name": tool.name,
+                }
+            return {"result": result}
         workflow_id = arguments.get("workflow_id")
         if not isinstance(workflow_id, str) or not workflow_id.strip():
             return {"result": {"status": "error", "error": "workflow_id is required."}}
