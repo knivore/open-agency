@@ -7,18 +7,41 @@
   "inputs": {
     "type": "object",
     "properties": {
+      "session_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Optional owned browser session identifier."
+      },
       "instruction": {
         "type": "string",
         "minLength": 1,
         "description": "Description of the element to click."
       },
-      "sequence_number": {
-        "type": [
-          "integer",
-          "null"
-        ],
-        "description": "Optional sequence number of the target element."
-      }
+    "sequence_number": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "Optional sequence number of the target element."
+    },
+    "x": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "description": "Optional screenshot-relative X coordinate for manual clicking."
+    },
+    "y": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "description": "Optional screenshot-relative Y coordinate for manual clicking."
+    }
     },
     "required": [
       "instruction"

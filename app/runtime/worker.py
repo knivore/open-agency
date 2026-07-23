@@ -151,7 +151,10 @@ async def run_execution_worker(
             )
         else:
             result = await execution_coro
-        return _exit_code_for_execution(result)
+        exit_code = _exit_code_for_execution(result)
+        if exit_code != WORKER_EXIT_SUSPENDED:
+            await _close_browser_sessions(execution_id)
+        return exit_code
     except asyncio.TimeoutError:
         execution = await context.execution_store.get_execution(execution_id)
         if execution is not None:
@@ -160,8 +163,10 @@ async def run_execution_worker(
                 execution,
                 f"Execution worker timed out after {execution_timeout_seconds} seconds",
             )
+        await _close_browser_sessions(execution_id)
         return WORKER_EXIT_INFRA_FAILED
     except ExecutionNotFoundError:
+        await _close_browser_sessions(execution_id)
         return WORKER_EXIT_BOOTSTRAP_FAILED
     except Exception as exc:
         logger.exception("Execution worker failed for execution '%s'", execution_id)
@@ -179,6 +184,7 @@ async def run_execution_worker(
                 f"Execution worker failed before completion: {exc.__class__.__name__}: {exc}",
             )
         traceback.print_exc()
+        await _close_browser_sessions(execution_id)
         return WORKER_EXIT_INFRA_FAILED
     finally:
         stop_heartbeat.set()
@@ -273,6 +279,27 @@ async def _heartbeat_loop(
         if stop_signal.is_set():
             break
         await context.execution_store.heartbeat(execution_id, worker_id)
+
+
+async def _close_browser_sessions(execution_id: str) -> None:
+    """Best-effort terminal cleanup; durable waits intentionally skip this."""
+
+    if not os.getenv("BROWSER_RUNTIME_EXECUTION_SECRET"):
+        return
+    try:
+        from app.browser_runtime.client import BrowserRuntimeClient
+
+        client = BrowserRuntimeClient()
+        try:
+            await asyncio.to_thread(
+                client.close_execution,
+                execution_id,
+                owner={"execution_id": execution_id},
+            )
+        finally:
+            client.close_client()
+    except Exception:
+        logger.warning("Failed to close browser sessions for terminal execution '%s'", execution_id, exc_info=True)
 
 
 async def _mark_worker_failure(context: ApiContext, execution, error: str) -> None:

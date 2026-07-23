@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+import os
 import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.api.context import create_test_api_context
 from app.core.time import utc_now
@@ -16,6 +18,7 @@ from app.runtime.worker import (
     WORKER_EXIT_SUSPENDED,
     load_worker_environment,
     run_execution_worker,
+    _close_browser_sessions,
 )
 from app.services.execution_classification import classify_execution_staleness
 
@@ -126,6 +129,71 @@ class RuntimeWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current.metadata["worker_context"]["workflow_id"], self.workflow.id)
         self.assertIn("execution.started", [event.event_type.value for event in events])
         self.assertIn("execution.completed", [event.event_type.value for event in events])
+
+    async def test_terminal_worker_closes_execution_browser_sessions(self):
+        execution = await self.context.runtime_registry.create_execution(
+            self.workflow.id,
+            {"topic": "browser cleanup"},
+            {"created_by": "tester"},
+            runtime_adapter_id="native",
+        )
+        execution.runtime_revision_id = "runtime-rev-cleanup"
+        execution.runtime_fingerprint = "fp-cleanup"
+        await self.context.execution_store.update_execution(execution)
+
+        with patch("app.runtime.worker._close_browser_sessions", new_callable=AsyncMock) as close_sessions:
+            exit_code = await run_execution_worker(
+                context=self.context,
+                execution_id=execution.id,
+                workflow_id=execution.workflow_id,
+                runtime_revision_id="runtime-rev-cleanup",
+                runtime_adapter_id="native",
+                worker_id="worker-cleanup",
+            )
+
+        self.assertEqual(exit_code, WORKER_EXIT_SUCCESS)
+        close_sessions.assert_awaited_once_with(execution.id)
+
+    async def test_suspended_worker_preserves_browser_session_for_human_wait(self):
+        workflow = self.workflow.model_copy(deep=True, update={"id": "workflow-worker-browser-wait"})
+        workflow.metadata["execution_lifecycle"] = {
+            "persistent_cycle": {"enabled": True, "interval_seconds": 60}
+        }
+        await self.context.runtime_registry.register_workflow(workflow)
+        execution = await self.context.runtime_registry.create_execution(
+            workflow.id,
+            {"topic": "browser handoff"},
+            {"created_by": "tester"},
+            runtime_adapter_id="native",
+        )
+        execution.runtime_revision_id = "runtime-rev-wait"
+        execution.runtime_fingerprint = "fp-wait"
+        await self.context.execution_store.update_execution(execution)
+
+        with patch("app.runtime.worker._close_browser_sessions", new_callable=AsyncMock) as close_sessions:
+            exit_code = await run_execution_worker(
+                context=self.context,
+                execution_id=execution.id,
+                workflow_id=execution.workflow_id,
+                runtime_revision_id="runtime-rev-wait",
+                runtime_adapter_id="native",
+                worker_id="worker-wait",
+            )
+
+        self.assertEqual(exit_code, WORKER_EXIT_SUSPENDED)
+        close_sessions.assert_not_awaited()
+
+    async def test_worker_cleanup_uses_execution_scoped_runtime_capability(self):
+        client = MagicMock()
+        with patch.dict(os.environ, {"BROWSER_RUNTIME_EXECUTION_SECRET": "execution-secret"}, clear=False), \
+                patch("app.browser_runtime.client.BrowserRuntimeClient", return_value=client):
+            await _close_browser_sessions("execution-1")
+
+        client.close_execution.assert_called_once_with(
+            "execution-1",
+            owner={"execution_id": "execution-1"},
+        )
+        client.close_client.assert_called_once_with()
 
     async def test_runtime_worker_exits_cleanly_when_persistent_cycle_sleeps(self):
         workflow = self.workflow.model_copy(deep=True, update={"id": "workflow-worker-cycle"})

@@ -6,7 +6,15 @@
   "description": "Close the active browser session and return a signed structured result.",
   "inputs": {
     "type": "object",
-    "properties": {},
+    "properties": {
+      "session_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Optional owned browser session identifier."
+      }
+    },
     "additionalProperties": false
   },
   "outputs": {

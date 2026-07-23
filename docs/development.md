@@ -12,8 +12,9 @@ For day-to-day local development, prefer the launcher:
 ```
 
 `./agency` is a thin wrapper around `./run.sh`, so `./run.sh start` and `make start` are equivalent. The launcher
-creates `.env` from `.env.example`, creates `.venv`, installs backend dependencies, installs Playwright browsers,
-starts Docker services, applies migrations, runs headless bootstrap checks for the default main agent, and starts the FastAPI backend. When a sibling
+creates `.env` from `.env.example`, creates `.venv`, installs backend dependencies, generates internal browser-runtime
+identity when needed, builds the dedicated browser image, starts Docker services, applies migrations, runs headless
+bootstrap checks for the default main agent, and starts the FastAPI backend. When a sibling
 `../open-agency-fe` repo exists, it also writes the frontend `.env.local`, installs frontend dependencies, and starts
 Next.js on `0.0.0.0`.
 
@@ -126,8 +127,8 @@ pyenv local 3.12.13
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python -m playwright install
 cp .env.example .env
+./agency start
 ```
 
 Create a local environment on Windows with PowerShell:
@@ -137,8 +138,8 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-python -m playwright install
 Copy-Item .env.example .env
+\.\run-windows.cmd start
 ```
 
 If PowerShell blocks virtual environment activation, allow local scripts for the current user, then activate again:
@@ -158,22 +159,9 @@ winget install Python.Python.3.12
 The requirements file skips Unix-only or unused native packages on Windows, including `uvloop`, `chromadb`,
 `chroma-hnswlib`, and `xattr`.
 
-If Playwright browser installation fails with `unable to verify the first certificate`, your network is probably
-intercepting TLS certificates. Prefer configuring Node with your organization's root CA:
-
-```powershell
-$env:NODE_EXTRA_CA_CERTS = "C:\path\to\your-company-root-ca.pem"
-python -m playwright install
-Remove-Item Env:NODE_EXTRA_CA_CERTS
-```
-
-For a one-time local browser download only, you can bypass Node TLS verification temporarily:
-
-```powershell
-$env:NODE_TLS_REJECT_UNAUTHORIZED = "0"
-python -m playwright install
-Remove-Item Env:NODE_TLS_REJECT_UNAUTHORIZED
-```
+Patchright, Scrapling, and Chromium live only in the `browser-runtime` image; they are not installed into `.venv`.
+Use `make check-browser-runtime` to validate the image contract. If an organization intercepts TLS, install its CA in
+that image rather than disabling verification globally.
 
 ## Recommended Local Environment
 

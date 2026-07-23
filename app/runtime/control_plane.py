@@ -381,12 +381,34 @@ class ExecutionControlPlane:
         execution.status = execution.status.__class__.CANCELLING
         await self.execution_store.update_execution(execution)
         cancelled = await self.runtime_registry.cancel_execution(execution_id)
+        await self._close_browser_sessions(execution_id)
         if preservation:
             metadata = dict(cancelled.metadata or {})
             metadata["partial_result_preservation"] = preservation
             cancelled.metadata = metadata
             cancelled = await self.execution_store.update_execution(cancelled)
         return cancelled
+
+    async def _close_browser_sessions(self, execution_id: str) -> None:
+        master_secret = os.getenv("BROWSER_RUNTIME_SIGNING_SECRET")
+        if not master_secret:
+            return
+        try:
+            from app.browser_runtime.client import BrowserRuntimeClient
+
+            client = BrowserRuntimeClient(signing_secret=master_secret)
+            try:
+                await asyncio.to_thread(
+                    client.close_execution,
+                    execution_id,
+                    owner={"execution_id": execution_id},
+                )
+            finally:
+                client.close_client()
+        except Exception:
+            # Cancellation remains authoritative even when the auxiliary
+            # runtime is unavailable; its TTL reaper is the final safeguard.
+            return
 
     async def _close_pending_waits(
             self,
@@ -883,6 +905,19 @@ class ExecutionControlPlane:
                 **onecli_worker_environment(settings),
                 **({"DATABASE_URL": settings.container_database_url} if settings.container_database_url else {}),
             }
+            browser_runtime_master_secret = os.getenv("BROWSER_RUNTIME_SIGNING_SECRET")
+            if browser_runtime_master_secret:
+                from app.browser_runtime.security import derive_execution_secret
+
+                # Workers receive only an execution-derived key. It cannot mint
+                # a valid capability for another execution or actor scope.
+                container_env.update({
+                    "BROWSER_RUNTIME_URL": os.getenv("BROWSER_RUNTIME_WORKER_URL", "http://browser-runtime:8010"),
+                    "BROWSER_RUNTIME_EXECUTION_SECRET": derive_execution_secret(
+                        browser_runtime_master_secret,
+                        execution.id,
+                    ),
+                })
             if runtime_policy.worker_hard_timeout_seconds is not None:
                 container_env["AGENCY_EXECUTION_TIMEOUT_SECONDS"] = str(runtime_policy.worker_hard_timeout_seconds)
             if execution.goal_id:

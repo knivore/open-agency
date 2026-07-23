@@ -112,9 +112,6 @@ Native persistent monitors use sleep waits between full graph cycles rather than
 completion, failure, and guard events are projected like other execution events; bounded cycle state and recent outcomes
 remain on execution metadata, while the wait row owns the next timer claim.
 
-See [docs/long-running-autonomous-agents-checklist.md](./long-running-autonomous-agents-checklist.md) for implemented
-capabilities, remaining budget and operator-UI work, safety constraints, and acceptance criteria.
-
 ## app/tools
 
 Purpose:
@@ -130,6 +127,18 @@ Main areas:
 - `validation.py`
 - `executors/`
 - `implementations/`
+
+## app/browser_runtime
+
+Purpose:
+
+- owns the authenticated Patchright-first browser sidecar and bounded Scrapling fallback
+- retains multiple owner-scoped live sessions across agent calls and durable human waits
+- applies outbound-host policy, challenge classification, extraction, resource limits, and artifact retention
+- clamps per-open agent resource preferences to local operator-configured limits
+
+The public capability remains the `agency.browser.*` tool family under `app/tools`; raw browser handles, cookies,
+profiles, proxy credentials, and the runtime signing secret never cross that boundary.
 
 ## app/llm
 

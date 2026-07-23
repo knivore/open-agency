@@ -98,6 +98,16 @@ Deployment or release jobs that require specific packs should also set
 ./.venv/bin/python -m unittest tests.test_api_main tests.test_workflow_builder_api tests.test_execution_control_plane tests.test_native_execution_engine tests.test_scheduler
 ```
 
+## Run unified browser checks
+
+```bash
+make check-browser-runtime
+./.venv/bin/python -m pytest -q tests/test_browser_runtime.py tests/test_browser_tool.py
+```
+
+These deterministic checks use fake adapters and stored content. Opt-in live checks should target only explicitly
+approved domains.
+
 Workflow and tool-registry focused checks:
 
 ```bash

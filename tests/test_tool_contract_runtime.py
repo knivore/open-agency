@@ -2081,6 +2081,9 @@ class ToolContractRuntimeTests(unittest.TestCase):
     @patch("app.tools.runtime.executor.open_browser")
     def test_runtime_runs_contract_backed_browser_open(self, mock_open_browser):
         mock_open_browser.return_value = {
+            "session_id": "brs_runtime",
+            "interactive": True,
+            "engine": "playwright",
             "url": "https://example.test",
             "title": "Example",
             "runtime_root": "/tmp/browser-runtime",
@@ -2103,6 +2106,8 @@ class ToolContractRuntimeTests(unittest.TestCase):
             self.assertEqual(len(records), 1)
             self.assertEqual(records[0].tool_name, "agency.browser.open")
             mock_open_browser.assert_called_once()
+            _, call_kwargs = mock_open_browser.call_args
+            self.assertEqual(call_kwargs["_browser_owner"], {"actor": "user-runtime"})
 
     @patch("app.tools.runtime.executor.click_element")
     def test_runtime_denies_contract_backed_browser_mutation_without_approval(self, mock_click):

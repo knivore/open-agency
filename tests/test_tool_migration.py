@@ -590,7 +590,9 @@ class CrewAICompatibilityTests(unittest.TestCase):
 
 
 class ToolImplementationCutoverTests(unittest.TestCase):
-    def test_terminate_browser_is_safe_without_active_session(self):
+    @patch("app.tools.implementations.browser.get_browser_runtime_client")
+    def test_terminate_browser_is_safe_without_active_session(self, mock_get_client):
+        mock_get_client.return_value.status.return_value = {"sessions": []}
         result = terminate_browser()
         self.assertEqual(result["Success Message"], "Driver terminated successfully.")
 

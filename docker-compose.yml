@@ -16,6 +16,9 @@ services:
       REDIS_PORT: "6379"
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       AGENCY_INTERNAL_API_KEY: ${AGENCY_INTERNAL_API_KEY:-}
+      BROWSER_RUNTIME_URL: http://browser-runtime:8010
+      BROWSER_RUNTIME_SIGNING_SECRET: ${BROWSER_RUNTIME_SIGNING_SECRET:?Set BROWSER_RUNTIME_SIGNING_SECRET in .env (32+ characters)}
+      BROWSER_UNIFIED_ENABLED: ${BROWSER_UNIFIED_ENABLED:-true}
       OBSERVABILITY_EXPORTERS: ${OBSERVABILITY_EXPORTERS:-jsonl}
       OBSERVABILITY_REDACT_SECRETS: ${OBSERVABILITY_REDACT_SECRETS:-true}
       OBSERVABILITY_JSONL_PATH: ${OBSERVABILITY_JSONL_PATH:-logs/observability.jsonl}
@@ -93,6 +96,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:rw
       - ${CODEX_HOME_SOURCE:-codex_home}:/codex:rw
     depends_on:
+      browser-runtime:
+        condition: service_healthy
       postgres:
         condition: service_healthy
       redis:
@@ -102,6 +107,52 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
+    networks:
+      - default
+      - onecli_worker_egress
+
+  browser-runtime:
+    image: ${BROWSER_RUNTIME_IMAGE:-open-agency-browser-runtime:latest}
+    build:
+      context: .
+      dockerfile: docker/browser-runtime/Dockerfile
+    container_name: open-agency-browser-runtime
+    environment:
+      APP_ENV: development
+      BROWSER_RUNTIME_SIGNING_SECRET: ${BROWSER_RUNTIME_SIGNING_SECRET:?Set BROWSER_RUNTIME_SIGNING_SECRET in .env (32+ characters)}
+      BROWSER_RUNTIME_RELEASE: ${BROWSER_RUNTIME_RELEASE:-local}
+      BROWSER_RUNTIME_IMAGE_REF: ${BROWSER_RUNTIME_IMAGE:-open-agency-browser-runtime:latest}
+      BROWSER_RUNTIME_ROOT: /var/lib/open-agency-browser
+      BROWSER_SESSION_IDLE_TTL_SECONDS: ${BROWSER_SESSION_IDLE_TTL_SECONDS:-900}
+      BROWSER_SESSION_MAXIMUM_TTL_SECONDS: ${BROWSER_SESSION_MAXIMUM_TTL_SECONDS:-3600}
+      BROWSER_SESSION_MAX_PER_OWNER: ${BROWSER_SESSION_MAX_PER_OWNER:-3}
+      BROWSER_SESSION_MAX_TOTAL: ${BROWSER_SESSION_MAX_TOTAL:-8}
+      BROWSER_NAVIGATION_TIMEOUT_MS: ${BROWSER_NAVIGATION_TIMEOUT_MS:-45000}
+      BROWSER_RESOURCE_CLEANUP_TIMEOUT_SECONDS: ${BROWSER_RESOURCE_CLEANUP_TIMEOUT_SECONDS:-5}
+      BROWSER_PATCHRIGHT_ATTEMPTS: ${BROWSER_PATCHRIGHT_ATTEMPTS:-3}
+      BROWSER_DOMAIN_MAX_CONCURRENCY: ${BROWSER_DOMAIN_MAX_CONCURRENCY:-2}
+      BROWSER_DOMAIN_MIN_INTERVAL_SECONDS: ${BROWSER_DOMAIN_MIN_INTERVAL_SECONDS:-0.25}
+      BROWSER_ARTIFACT_RETENTION_SECONDS: ${BROWSER_ARTIFACT_RETENTION_SECONDS:-86400}
+      BROWSER_CHALLENGE_HANDLING_ENABLED: ${BROWSER_CHALLENGE_HANDLING_ENABLED:-true}
+      BROWSER_UNIFIED_EXTRACTION_ENABLED: ${BROWSER_UNIFIED_EXTRACTION_ENABLED:-true}
+      BROWSER_IGNORE_HTTPS_ERRORS: ${BROWSER_IGNORE_HTTPS_ERRORS:-false}
+      BROWSER_SCRAPLING_ENABLED: ${BROWSER_SCRAPLING_ENABLED:-true}
+      BROWSER_RUNTIME_PROXY_BINDINGS_JSON: ${BROWSER_RUNTIME_PROXY_BINDINGS_JSON:-{}}
+    ports:
+      - "${BROWSER_RUNTIME_BIND_HOST:-127.0.0.1}:${BROWSER_RUNTIME_PORT:-8010}:8010"
+    volumes:
+      - browser_runtime_data:/var/lib/open-agency-browser
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health').read()" ]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+    shm_size: "1gb"
+    mem_limit: ${BROWSER_RUNTIME_MEMORY_LIMIT:-4g}
+    cpus: ${BROWSER_RUNTIME_CPU_LIMIT:-4.0}
+    pids_limit: ${BROWSER_RUNTIME_PIDS_LIMIT:-512}
     networks:
       - default
       - onecli_worker_egress
@@ -453,6 +504,7 @@ services:
       retries: 10
 
 volumes:
+  browser_runtime_data:
   codex_home:
   frontend_node_modules:
   frontend_next:

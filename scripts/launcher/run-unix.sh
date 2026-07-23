@@ -287,6 +287,31 @@ ensure_env_file() {
   fi
 }
 
+ensure_browser_runtime_signing_secret() {
+  local env_file="${ROOT_DIR}/.env"
+  local browser_secret=""
+  local python_bin=""
+
+  browser_secret="$(env_file_value "${env_file}" "BROWSER_RUNTIME_SIGNING_SECRET")"
+  if [ "${#browser_secret}" -ge 32 ]; then
+    export BROWSER_RUNTIME_SIGNING_SECRET="${browser_secret}"
+    return 0
+  fi
+
+  python_bin="$(host_python || true)"
+  if [ -z "${python_bin}" ]; then
+    echo "Python is required to generate BROWSER_RUNTIME_SIGNING_SECRET." >&2
+    return 1
+  fi
+  # Browser control has its own trust boundary; do not reuse the frontend
+  # delegation key as the sidecar's capability-signing authority.
+  browser_secret="$("${python_bin}" -c 'import secrets; print(secrets.token_urlsafe(48))')"
+  upsert_env_value "${env_file}" "BROWSER_RUNTIME_SIGNING_SECRET" "${browser_secret}"
+  rm -f "${env_file}.bak"
+  export BROWSER_RUNTIME_SIGNING_SECRET="${browser_secret}"
+  echo "Generated a browser runtime signing secret in .env."
+}
+
 print_env_guidance() {
   local env_file="${ROOT_DIR}/.env"
   local openai_key=""
@@ -469,6 +494,7 @@ ensure_cloudflared_installed() {
 
 ensure_host_backend_env_files() {
   ensure_env_file
+  ensure_browser_runtime_signing_secret
   mkdir -p "${ROOT_DIR}/.logs"
 }
 
@@ -481,7 +507,6 @@ ensure_host_python_env() {
   local venv_python="${ROOT_DIR}/.venv/bin/python"
   local requirements_hash=""
   local requirements_stamp="${ROOT_DIR}/.venv/.agency-requirements.sha256"
-  local playwright_stamp="${ROOT_DIR}/.venv/.agency-playwright-installed"
 
   if [ ! -x "${venv_python}" ]; then
     python_for_venv="$(find_python_for_venv || true)"
@@ -508,11 +533,6 @@ ensure_host_python_env() {
     printf '%s\n' "${requirements_hash}" >"${requirements_stamp}"
   fi
 
-  if [ "${AGENCY_SKIP_PLAYWRIGHT_INSTALL:-false}" != "true" ] && [ ! -f "${playwright_stamp}" ]; then
-    echo "Installing Playwright browsers..."
-    "${venv_python}" -m playwright install
-    date -u +"%Y-%m-%dT%H:%M:%SZ" >"${playwright_stamp}"
-  fi
 }
 
 ensure_frontend_deps() {

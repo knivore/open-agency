@@ -49,9 +49,12 @@ Current contract-backed tools:
 - `agency.memory.list`, `agency.memory.remember`, `agency.memory.update`, and `agency.memory.delete` expose durable memory CRUD through signed contract responses and use `MemoryService` for ownership and sensitive-confirmation policy.
 - `agency.workflow.propose-create`, `agency.workflow.propose-update`, `agency.tool.propose-create`, and `agency.tool.propose-update` are contracted as approval-mediated proposal tools. Calls with `conversation_id` create approval requests; calls without conversation context return signed `requires_conversation_context` responses.
 - `agency.workflow.run` creates and queues unprotected workflow executions through `ExecutionService`, then returns execution id, workflow id, queued status, and the execution payload in `result`.
-- Browser tools execute through the existing browser session manager. `agency.browser.open` checks the initial URL,
-  DNS answers, redirects, and subresources against the same host policy; click/select/type actions are policy-mediated
-  and warn when the actor is not explicitly approved.
+- Browser tools execute through the durable unified browser runtime. `agency.browser.open` extracts page content and can
+  retain the same owner-scoped Patchright session for interaction; Scrapling 0.4 is an internal last resort. Initial
+  URLs, DNS answers, redirects, frames, popups, and subresources use the same request-scoped host policy, while
+  click/select/type actions remain approval-mediated. Its agent-fillable `runtime_policy` can request shorter session
+  TTLs, lower session/concurrency limits, navigation timeout, retries, pacing, and artifact retention; the runtime clamps
+  every request to the local operator envelope.
 - `agency.human.ask` publishes a prompt to the existing human input channel and waits up to `timeout_seconds` for a reply.
 - Protected workflow runs and proposal tools create real conversation approval requests when `conversation_id` is supplied. Without conversation context, direct contract runs return signed `requires_approval_context` or `requires_conversation_context` responses instead of bypassing human approval.
 

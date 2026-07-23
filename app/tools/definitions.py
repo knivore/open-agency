@@ -140,6 +140,10 @@ def _input_schema_for(tool_id: str, parameters_metadata: dict[str, Any]) -> dict
                     "type": "string",
                     "description": "Artifact directory for the screenshot.",
                 },
+                "session_id": {
+                    "type": ["string", "null"],
+                    "description": "Optional owned browser session identifier.",
+                },
             },
         }
     elif tool_id == "agency.file.write-text":
@@ -205,7 +209,15 @@ def _input_schema_for(tool_id: str, parameters_metadata: dict[str, Any]) -> dict
             "additionalProperties": False,
         }
     elif tool_id == "agency.browser.close":
-        schema = {"type": "object", "properties": {}}
+        schema = {
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": ["string", "null"],
+                    "description": "Optional owned browser session identifier.",
+                }
+            },
+        }
     else:
         schema = schemas.get(tool_id) or _metadata_to_schema(parameters_metadata)
     return _apply_parameter_contract_metadata(schema, parameters_metadata)
@@ -231,7 +243,12 @@ def _string_or_error_schema(*, description: str) -> dict[str, Any]:
 
 
 def _output_schema_for(tool_id: str) -> dict[str, Any]:
-    action_message_schema = _string_or_error_schema(description="Human-readable success or status message.")
+    browser_action_schema = {
+        "oneOf": [
+            {"type": "string"},
+            {"type": "object", "additionalProperties": True},
+        ]
+    }
     spreadsheet_schema = _string_or_error_schema(
         description="Stringified success message when the workbook was updated successfully.",
     )
@@ -460,20 +477,28 @@ def _output_schema_for(tool_id: str) -> dict[str, Any]:
                 {
                     "type": "object",
                     "properties": {
-                        "url": {"type": "string", "description": "Current browser page URL."},
-                        "title": {"type": "string", "description": "Current page title."},
-                        "user_agent": {"type": "string", "description": "Browser user agent used for the session."},
-                        "runtime_root": {"type": "string", "description": "Browser runtime artifact root."},
-                        "trace_path": {
-                            "type": ["string", "null"],
-                            "description": "Trace artifact path when tracing is enabled.",
-                        },
-                        "overlay_dismissed": {"type": ["boolean", "null"]},
-                        "challenge_detected": {"type": ["boolean", "null"]},
-                        "session_state": {"type": "object", "description": "Browser session state and signals."},
-                        "message": {"type": "string", "description": "Human-readable navigation result."},
+                        "version": {"type": "string", "const": "agency.browser.v1"},
+                        "status": {"type": "string", "enum": ["ok", "error", "human_action_required"]},
+                        "url": {"type": ["string", "null"], "description": "Current browser page URL."},
+                        "session_id": {"type": ["string", "null"], "description": "Owned retained browser session id."},
+                        "interactive": {"type": "boolean", "description": "Whether the session has a controllable page."},
+                        "engine": {"type": "string", "description": "Internal browser engine used."},
+                        "title": {"type": ["string", "null"], "description": "Current page title."},
+                        "user_agent": {"type": ["string", "null"], "description": "Browser user agent used for the session."},
+                        "challenge_detected": {"type": ["string", "null"]},
+                        "challenge": {"type": "object", "additionalProperties": True},
+                        "extraction": {"type": ["object", "null"], "additionalProperties": True},
+                        "timings": {"type": "object", "additionalProperties": True},
+                        "message": {"type": ["string", "null"], "description": "Human-readable navigation result."},
                     },
-                    "required": ["url", "title", "user_agent", "runtime_root", "session_state", "message"],
+                    "required": [
+                        "version",
+                        "status",
+                        "interactive",
+                        "engine",
+                        "url",
+                        "challenge",
+                    ],
                     "additionalProperties": True,
                 },
                 {
@@ -486,33 +511,13 @@ def _output_schema_for(tool_id: str) -> dict[str, Any]:
                 },
             ],
         },
-        "agency.browser.screenshot": action_message_schema,
-        "agency.browser.analyze-screenshot": {
-            "type": "string",
-            "description": "Vision-model analysis or fallback page-state summary.",
-        },
-        "agency.browser.extract-screenshot": {
-            "type": "object",
-            "properties": {
-                "page_type": {"type": "string", "description": "Detected page type."},
-                "page_url": {"type": "string", "description": "Current page URL."},
-                "content": {
-                    "type": "object",
-                    "properties": {
-                        "summary": {"type": "string", "description": "Extracted visual summary."},
-                        "text": {"type": "string", "description": "Extracted page text excerpt."},
-                    },
-                    "required": ["summary", "text"],
-                    "additionalProperties": True,
-                },
-            },
-            "required": ["page_type", "page_url", "content"],
-            "additionalProperties": True,
-        },
-        "agency.browser.scroll": action_message_schema,
-        "agency.browser.click": action_message_schema,
-        "agency.browser.select-option": action_message_schema,
-        "agency.browser.type-text": action_message_schema,
+        "agency.browser.screenshot": browser_action_schema,
+        "agency.browser.analyze-screenshot": browser_action_schema,
+        "agency.browser.extract-screenshot": browser_action_schema,
+        "agency.browser.scroll": browser_action_schema,
+        "agency.browser.click": browser_action_schema,
+        "agency.browser.select-option": browser_action_schema,
+        "agency.browser.type-text": browser_action_schema,
         "agency.browser.verify-content": {
             "type": "object",
             "properties": {
@@ -527,9 +532,10 @@ def _output_schema_for(tool_id: str) -> dict[str, Any]:
             "type": "object",
             "properties": {
                 "Success Message": {"type": "string", "description": "Browser shutdown status."},
+                "session_id": {"type": "string", "description": "Closed browser session id."},
             },
             "required": ["Success Message"],
-            "additionalProperties": False,
+            "additionalProperties": True,
         },
     }
     return mapping.get(tool_id, {"type": "object", "description": "Generic object output."})

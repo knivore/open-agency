@@ -1444,6 +1444,7 @@ class ToolRuntimeExecutor:
                 tool_name,
                 payload,
                 allowed_hosts=self.policy_engine.allowed_http_hosts,
+                actor=actor,
             )
             error = _tool_result_error(raw_result)
             return build_tool_run_response(
@@ -5683,6 +5684,7 @@ def _execute_browser_tool(
         payload: dict[str, Any],
         *,
         allowed_hosts: list[str] | None = None,
+        actor: str | None = None,
 ) -> Any:
     handlers = {
         "agency.browser.open": open_browser,
@@ -5699,9 +5701,14 @@ def _execute_browser_tool(
     handler = handlers.get(tool_name)
     if handler is None:
         raise KeyError(f"Browser tool '{tool_name}' is not implemented")
+    owner_context = {"actor": actor or "contract-browser-runtime"}
     if tool_name == "agency.browser.open":
-        return handler(**payload, _allowed_hosts=list(allowed_hosts or []))
-    return handler(**payload)
+        return handler(
+            **payload,
+            _allowed_hosts=list(allowed_hosts or []),
+            _browser_owner=owner_context,
+        )
+    return handler(**payload, _browser_owner=owner_context)
 
 
 def _tool_result_error(raw_result: Any) -> str | None:

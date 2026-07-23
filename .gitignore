@@ -187,5 +187,10 @@ database_exports/*.json
 /docs/*
 !/docs/
 !/docs/long-running-autonomous-agents-checklist.md
+!/docs/unified-browser-capability-checklist.md
+!/docs/unified-browser.md
+!/docs/browser-rollout-evidence-local-2026-07-23.json
+!/docs/adr/
+!/docs/adr/0005-unified-browser-capability.md
 /alembic/archived_versions/
 /AGENTS.md

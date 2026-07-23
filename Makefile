@@ -1,7 +1,7 @@
 PYTHON ?= ./.venv/bin/python
 EVAL_ARGS ?=
 
-.PHONY: test lint eval migrate dev bootstrap start restart stop status doctor check-architecture check-tool-registry check-optional-modules check-module-separation secret-scan setup-local-onboarding sync-recommended-agents setup-main-agent setup-coder-agent setup-embedding-agent setup-evaluation-agent sync-main-agent-prompt check-main-agent setup-chat-channel chat-main-agent validate-runtimes db-export db-import db-export-all db-import-all
+.PHONY: test lint eval migrate dev bootstrap start restart stop status doctor check-architecture check-tool-registry check-browser-runtime check-optional-modules check-module-separation secret-scan setup-local-onboarding sync-recommended-agents setup-main-agent setup-coder-agent setup-embedding-agent setup-evaluation-agent sync-main-agent-prompt check-main-agent setup-chat-channel chat-main-agent validate-runtimes db-export db-import db-export-all db-import-all
 
 test:
 	$(PYTHON) -m unittest
@@ -44,6 +44,10 @@ check-architecture:
 
 check-tool-registry:
 	$(PYTHON) -m unittest tests.test_tool_migration tests.test_tool_cli
+
+check-browser-runtime:
+	docker build -f docker/browser-runtime/Dockerfile -t agency-browser-runtime:test .
+	docker run --rm --shm-size=1gb --memory=4g --cpus=4 --pids-limit=512 agency-browser-runtime:test python -m app.browser_runtime.selftest
 
 check-optional-modules:
 	$(PYTHON) scripts/validate_optional_module_persistence.py --check-paths

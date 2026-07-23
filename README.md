@@ -65,6 +65,7 @@ Open Agency exists for that gap. It is the backend for agents that need to behav
 
 - Register tools with identities, schemas, permissions, and approval policies.
 - Support Open Agency-native tools plus MCP and A2A integration boundaries.
+- Retrieve content or operate the same retained, owner-scoped browser session through the unified browser tool family.
 - Use Docker-backed runtime isolation where stronger execution boundaries are needed.
 
 ### Reach users through multiple surfaces
@@ -374,6 +375,7 @@ Contributor docs:
 - [Testing](./docs/testing.md)
 - [Runtime](./docs/runtime.md)
 - [Tools](./docs/tools.md)
+- [Unified Browser](./docs/unified-browser.md)
 - [Memory](./docs/memory.md)
 - [Persona Factory](./docs/persona-factory.md)
 - [Platform Runbook](./docs/runbook.md)

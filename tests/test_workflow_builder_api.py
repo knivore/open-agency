@@ -8,7 +8,6 @@ from fastapi.testclient import TestClient
 
 from app.api.context import create_test_api_context
 from app.api.routes import create_api_router
-from app.core.config import reset_settings_cache
 from app.domain import (
     AgentDefinition,
     ExecutionArtifact,
@@ -299,6 +298,26 @@ class WorkflowBuilderApiTests(unittest.TestCase):
             enriched.metadata["tool_planning"]["task_tool_matches"][0]["source"],
             "existing_tool_match",
         )
+
+    def test_workflow_builder_routes_web_retrieval_to_unified_browser_tool(self):
+        browser_tool = next(
+            tool for tool in builtin_tool_definitions() if tool.id == "agency.browser.open"
+        )
+        asyncio.run(self.context.tool_repo.save(browser_tool))
+        workflow = self._minimal_workflow_for_tool_planning(
+            task_description="Open the article, read the rendered webpage, and extract its sources."
+        )
+
+        enriched = asyncio.run(
+            WorkflowBuilderService(self.context).enrich_with_existing_tools(
+                workflow=workflow,
+                goal="Research a live webpage and return its content.",
+            )
+        )
+
+        self.assertEqual(enriched.task_definitions[0].tool_ids, ["agency.browser.open"])
+        self.assertEqual(enriched.agent_definitions[0].tool_ids, ["agency.browser.open"])
+        self.assertFalse(enriched.metadata.get("tool_creation_required", False))
 
     def test_workflow_builder_marks_missing_tool_creation_requirement(self):
         workflow = self._minimal_workflow_for_tool_planning(

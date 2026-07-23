@@ -67,8 +67,7 @@ RUN npm install -g "@openai/codex@${CODEX_CLI_VERSION}" && \
 COPY requirements.txt /tmp/requirements.txt
 
 RUN python -m pip install --upgrade pip && \
-    python -m pip install -r /tmp/requirements.txt && \
-    playwright install chromium
+    python -m pip install -r /tmp/requirements.txt
 
 ARG OPENVOICE_COMMIT=74a1d147b17a8c3092dd5430504bd83ef6c7eb23
 

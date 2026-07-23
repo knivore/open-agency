@@ -7,6 +7,26 @@
   "inputs": {
     "type": "object",
     "properties": {
+      "session_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Optional owned browser session to navigate; omit to create a new session."
+      },
+      "goal": {
+        "type": ["string", "null"],
+        "description": "Optional research question or extraction goal."
+      },
+      "extract_mode": {
+        "type": "string",
+        "enum": ["auto", "text", "markdown", "article", "html", "none"],
+        "default": "auto"
+      },
+      "keep_open": {
+        "type": "boolean",
+        "default": true
+      },
       "url": {
         "type": [
           "string",
@@ -41,6 +61,24 @@
       "mobile": {
         "type": "boolean",
         "default": false
+      },
+      "viewport_width": {
+        "type": "integer",
+        "minimum": 320,
+        "maximum": 3840,
+        "default": 1440
+      },
+      "viewport_height": {
+        "type": "integer",
+        "minimum": 240,
+        "maximum": 2160,
+        "default": 900
+      },
+      "device_scale_factor": {
+        "type": "number",
+        "minimum": 0.5,
+        "maximum": 3.0,
+        "default": 1.0
       },
       "locale": {
         "type": [
@@ -78,6 +116,26 @@
         "additionalProperties": {
           "type": "string"
         }
+      },
+      "proxy_binding": {
+        "type": ["string", "null"],
+        "description": "Opaque Agency proxy credential binding."
+      },
+      "runtime_policy": {
+        "type": ["object", "null"],
+        "description": "Per-open resource preferences. The browser runtime clamps these values to its operator-configured limits.",
+        "properties": {
+          "session_idle_ttl_seconds": {"type": ["integer", "null"], "minimum": 30, "maximum": 86400},
+          "session_maximum_ttl_seconds": {"type": ["integer", "null"], "minimum": 60, "maximum": 604800},
+          "max_sessions_per_owner": {"type": ["integer", "null"], "minimum": 1, "maximum": 32},
+          "max_sessions_total": {"type": ["integer", "null"], "minimum": 1, "maximum": 128},
+          "navigation_timeout_ms": {"type": ["integer", "null"], "minimum": 5000, "maximum": 300000},
+          "retry_attempts": {"type": ["integer", "null"], "minimum": 1, "maximum": 3},
+          "domain_max_concurrency": {"type": ["integer", "null"], "minimum": 1, "maximum": 16},
+          "domain_min_interval_seconds": {"type": ["number", "null"], "minimum": 0, "maximum": 60},
+          "artifact_retention_seconds": {"type": ["integer", "null"], "minimum": 60, "maximum": 604800}
+        },
+        "additionalProperties": false
       }
     },
     "additionalProperties": false

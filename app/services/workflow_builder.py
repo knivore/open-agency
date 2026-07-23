@@ -645,6 +645,14 @@ class WorkflowBuilderService:
                 token in task_tokens for token in {"browser", "web", "webpage", "site", "screenshot", "click"}
         ):
             score += 3
+        if tool.id == "agency.browser.open" and any(
+                token in task_tokens
+                for token in {"research", "read", "retrieve", "extract", "crawl", "scrape", "article", "webpage"}
+        ):
+            # The unified open tool is both the retrieval entry point and the
+            # source of retained sessions; workflows should not hunt for a
+            # separate web-retrieve capability.
+            score += 8
         return score
 
     def _task_intent_tokens(self, *, task: TaskDefinition, goal: str) -> set[str]:
@@ -672,7 +680,8 @@ class WorkflowBuilderService:
             tokens.update(part for part in re.split(r"[-_.]", token) if len(part) >= 3)
         synonym_groups = [
             {"webhook", "channel", "message", "send", "post"},
-            {"news", "research", "search", "web", "browser", "fetch", "source", "link"},
+            {"news", "research", "search", "web", "browser", "fetch", "retrieve", "read", "extract", "crawl",
+             "scrape", "article", "webpage", "source", "link"},
             {"email", "mail", "smtp", "send", "message"},
             # Keep `voice` as an intent synonym so older workflow drafts and user
             # prompts still map onto the canonical Agency speech capability.

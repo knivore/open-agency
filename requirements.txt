@@ -154,7 +154,6 @@ pfzy==0.3.4
 pillow==12.3.0
 pkginfo==1.12.1.2
 platformdirs==4.2.2
-playwright==1.49.1
 pluggy==1.5.0
 poetry==2.3.4
 poetry-core==2.3.2

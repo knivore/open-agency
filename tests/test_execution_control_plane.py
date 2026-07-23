@@ -5,7 +5,7 @@ import unittest
 from datetime import timedelta
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from app.api.context import create_test_api_context
 from app.api.routes.executions import create_executions_router
@@ -643,9 +643,14 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
             {"created_by": "tester"},
             runtime_adapter_id="native",
         )
-        await self.context.control_plane.cancel(execution.id)
-        final = await self.context.execution_store.get_execution(execution.id)
-        await self.context.control_plane.cancel(execution.id)
+        with patch.object(
+                self.context.control_plane,
+                "_close_browser_sessions",
+                new_callable=AsyncMock,
+        ) as close_browser_sessions:
+            await self.context.control_plane.cancel(execution.id)
+            final = await self.context.execution_store.get_execution(execution.id)
+            await self.context.control_plane.cancel(execution.id)
         final_events = await self.context.execution_store.list_events(execution.id)
 
         self.assertEqual(final.status.value, "cancelled")
@@ -653,6 +658,7 @@ class ExecutionControlPlaneAsyncTests(unittest.IsolatedAsyncioTestCase):
             [event.event_type for event in final_events].count(ExecutionEventType.EXECUTION_CANCELLED),
             1,
         )
+        close_browser_sessions.assert_awaited_once_with(execution.id)
 
     async def test_cancellation_after_state_reload_keeps_event_sequence(self):
         execution = await self.context.runtime_registry.create_execution(

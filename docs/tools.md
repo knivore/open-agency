@@ -115,6 +115,18 @@ The current architecture supports these categories:
 Each tool should resolve through `implementation.module` and `implementation.function` metadata rather than ad hoc
 import logic.
 
+## Unified Browser Tools
+
+`agency.browser.open` is the single entry point for both page retrieval and live browsing. With `keep_open=false` it
+extracts content and closes browser resources before returning. With `keep_open=true` it returns an owner-scoped
+`session_id` that the screenshot, scroll, click, type, select, verify, repeat-extraction, and close tools operate on.
+Patchright is always the primary engine; Scrapling is an internal last resort rather than a model-selectable tool.
+
+Agents may pass a nested `runtime_policy` to `agency.browser.open` with per-call session TTLs, session limits,
+navigation timeout, retry attempts, domain concurrency/pacing, and artifact retention. These are preferences, not new
+authority: the browser runtime clamps them to the local environment limits. See
+[Unified Browser Capability](./unified-browser.md) for lifecycle, challenge handoff, and security details.
+
 ## Voice And Media Tools
 
 Agency-owned voice generation and media delivery use separate tool boundaries:

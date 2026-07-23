@@ -42,6 +42,14 @@ except Exception:  # pragma: no cover
 class _BaseCompatTool(CrewAIBaseTool):
     model_config = ConfigDict(extra="allow")
 
+    def _browser_owner(self) -> dict[str, str | None]:
+        """Bind compatibility browser sessions to the canonical Crew execution."""
+        process_id = getattr(self, "process_id", None)
+        return {
+            "execution_id": str(process_id) if process_id is not None else None,
+            "actor": f"crewai:{process_id}" if process_id is not None else "crewai:local",
+        }
+
 
 class CustomAPICrewAITool(_BaseCompatTool):
     name: str = "HTTP: Send Request"
@@ -180,6 +188,7 @@ class BrowserOpenCrewAITool(_BaseCompatTool):
             url=params.pop("url", None) or self.url,
             img_directory=params.pop("img_directory", None) or self.img_directory,
             headless_mode=params.pop("headless_mode", None) if "headless_mode" in params else self.headless_mode,
+            _browser_owner=self._browser_owner(),
             **params,
         )
 
@@ -194,8 +203,10 @@ class BrowserScreenshotCrewAITool(_BaseCompatTool):
         return screenshot(
             img_directory=kwargs.get("img_directory") or self.img_directory,
             full_page_screenshot=kwargs.get("full_page_screenshot", self.full_page_screenshot),
+            session_id=kwargs.get("session_id"),
             process_id=getattr(self, "process_id", None),
             run_by=getattr(self, "run_by", None),
+            _browser_owner=self._browser_owner(),
         )
 
 
@@ -211,8 +222,10 @@ class BrowserAnalyseCrewAITool(_BaseCompatTool):
             text=kwargs.get("text", ""),
             img_directory=kwargs.get("img_directory") or self.img_directory,
             full_page_screenshot=kwargs.get("full_page_screenshot", self.full_page_screenshot),
+            session_id=kwargs.get("session_id"),
             process_id=getattr(self, "process_id", None),
             run_by=getattr(self, "run_by", None),
+            _browser_owner=self._browser_owner(),
         )
 
 
@@ -228,8 +241,10 @@ class BrowserExtractCrewAITool(_BaseCompatTool):
             text=kwargs.get("text", ""),
             img_directory=kwargs.get("img_directory") or self.img_directory,
             full_page_screenshot=kwargs.get("full_page_screenshot", self.full_page_screenshot),
+            session_id=kwargs.get("session_id"),
             process_id=getattr(self, "process_id", None),
             run_by=getattr(self, "run_by", None),
+            _browser_owner=self._browser_owner(),
         )
 
 
@@ -239,7 +254,12 @@ class BrowserScrollCrewAITool(_BaseCompatTool):
     args_schema: Type[BaseModel] = BrowserScrollInput
 
     def _run(self, **kwargs: Any) -> Any:
-        return scroll_page(scroll_direction=kwargs.get("scroll_direction", ""), instruction=kwargs.get("instruction"))
+        return scroll_page(
+            scroll_direction=kwargs.get("scroll_direction", ""),
+            instruction=kwargs.get("instruction"),
+            session_id=kwargs.get("session_id"),
+            _browser_owner=self._browser_owner(),
+        )
 
 
 class BrowserClickCrewAITool(_BaseCompatTool):
@@ -248,7 +268,14 @@ class BrowserClickCrewAITool(_BaseCompatTool):
     args_schema: Type[BaseModel] = BrowserClickInput
 
     def _run(self, **kwargs: Any) -> Any:
-        return click_element(instruction=kwargs.get("instruction", ""), sequence_number=kwargs.get("sequence_number"))
+        return click_element(
+            instruction=kwargs.get("instruction", ""),
+            sequence_number=kwargs.get("sequence_number"),
+            x=kwargs.get("x"),
+            y=kwargs.get("y"),
+            session_id=kwargs.get("session_id"),
+            _browser_owner=self._browser_owner(),
+        )
 
 
 class BrowserSelectCrewAITool(_BaseCompatTool):
@@ -257,7 +284,12 @@ class BrowserSelectCrewAITool(_BaseCompatTool):
     args_schema: Type[BaseModel] = BrowserSelectInput
 
     def _run(self, **kwargs: Any) -> Any:
-        return select_dropdown(instruction=kwargs.get("instruction", ""), sequence_number=kwargs.get("sequence_number"))
+        return select_dropdown(
+            instruction=kwargs.get("instruction", ""),
+            sequence_number=kwargs.get("sequence_number"),
+            session_id=kwargs.get("session_id"),
+            _browser_owner=self._browser_owner(),
+        )
 
 
 class BrowserInputCrewAITool(_BaseCompatTool):
@@ -266,7 +298,12 @@ class BrowserInputCrewAITool(_BaseCompatTool):
     args_schema: Type[BaseModel] = BrowserInputText
 
     def _run(self, **kwargs: Any) -> Any:
-        return send_keys(instruction=kwargs.get("instruction", ""), sequence_number=kwargs.get("sequence_number"))
+        return send_keys(
+            instruction=kwargs.get("instruction", ""),
+            sequence_number=kwargs.get("sequence_number"),
+            session_id=kwargs.get("session_id"),
+            _browser_owner=self._browser_owner(),
+        )
 
 
 class BrowserVerifyCrewAITool(_BaseCompatTool):
@@ -275,7 +312,11 @@ class BrowserVerifyCrewAITool(_BaseCompatTool):
     args_schema: Type[BaseModel] = BrowserVerifyInput
 
     def _run(self, **kwargs: Any) -> Any:
-        return verify_content(text=kwargs.get("text", ""))
+        return verify_content(
+            text=kwargs.get("text", ""),
+            session_id=kwargs.get("session_id"),
+            _browser_owner=self._browser_owner(),
+        )
 
 
 class BrowserTerminateCrewAITool(_BaseCompatTool):
@@ -283,7 +324,7 @@ class BrowserTerminateCrewAITool(_BaseCompatTool):
     description: str = "Terminate the current browser session and release browser resources."
 
     def _run(self, **kwargs: Any) -> Any:
-        return terminate_browser(**kwargs)
+        return terminate_browser(**kwargs, _browser_owner=self._browser_owner())
 
 
 def create_crewai_tool(tool_id: str, **params: Any):

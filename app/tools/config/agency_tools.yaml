@@ -617,7 +617,7 @@ app_tools:
     id: "agency.browser.open"
     name: "open_browser"
     display_name: "Open Browser"
-    description: "Start or reuse a Playwright browser session and navigate to a URL. Use this before screenshot, click, type, select, scroll, extract, or verify browser tools. Optional inputs configure HTTP auth, user agent, browser type, mobile mode, locale, timezone, storage state, video recording, tracing, and extra headers. Output includes navigation status and browser artifacts. Side effect: creates browser session state and may load remote web content."
+    description: "Retrieve and extract a page through the unified Agency browser, optionally retaining the same live session for screenshot, click, type, select, scroll, repeat extraction, or human challenge completion. Patchright is primary and Scrapling is an internal last resort; callers do not choose an engine."
     created_by: "agency"
     owned_by: "agency"
     parameters:
@@ -626,6 +626,26 @@ app_tools:
         type: "string"
         filled_by: "user_or_agent"
         description: "URL to open. If omitted, the tool may initialize the browser without navigation."
+      session_id:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Optional owned browser session to navigate; omit to create a new session."
+      goal:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Optional research question or extraction goal."
+      extract_mode:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        description: "Extraction mode: auto, text, markdown, article, html, or none."
+      keep_open:
+        mandatory: false
+        type: "boolean"
+        filled_by: "user_or_agent"
+        description: "Keep the resulting page as an owned live session; defaults to true."
       http_credentials_username:
         mandatory: false
         type: "string"
@@ -634,6 +654,7 @@ app_tools:
       http_credentials_password:
         mandatory: false
         type: "string"
+        input_type: "hidden"
         filled_by: "user_or_agent"
         description: "Optional HTTP basic-auth password."
       user_agent:
@@ -645,12 +666,27 @@ app_tools:
         mandatory: false
         type: "string"
         filled_by: "user_or_agent"
-        description: "Optional browser family to emulate, such as chrome, firefox, safari, or edge."
+        description: "Optional Chromium browser family marker; non-Chromium emulation is rejected to avoid contradictory fingerprints."
       mobile:
         mandatory: false
         type: "boolean"
         filled_by: "user_or_agent"
         description: "Whether to use mobile viewport and user-agent behavior."
+      viewport_width:
+        mandatory: false
+        type: "integer"
+        filled_by: "user_or_agent"
+        description: "Viewport width in pixels."
+      viewport_height:
+        mandatory: false
+        type: "integer"
+        filled_by: "user_or_agent"
+        description: "Viewport height in pixels."
+      device_scale_factor:
+        mandatory: false
+        type: "number"
+        filled_by: "user_or_agent"
+        description: "Device scale factor for the browser context."
       locale:
         mandatory: false
         type: "string"
@@ -682,6 +718,17 @@ app_tools:
         type: "object"
         filled_by: "user_or_agent"
         description: "Optional extra HTTP headers sent with browser requests."
+      proxy_binding:
+        mandatory: false
+        type: "string"
+        input_type: "hidden"
+        filled_by: "user_or_agent"
+        description: "Optional opaque Agency proxy credential binding; raw proxy URLs are not accepted."
+      runtime_policy:
+        mandatory: false
+        type: "object"
+        filled_by: "agent"
+        description: "Optional per-open session TTL, session-limit, navigation-timeout, retry, domain-concurrency, pacing, and artifact-retention preferences. Agency clamps every value to the operator limits configured for the local browser runtime."
       img_directory:
         mandatory: true
         type: "string"
@@ -698,6 +745,11 @@ app_tools:
     created_by: "agency"
     owned_by: "agency"
     parameters:
+      session_id:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Optional owned browser session identifier."
       full_page_screenshot:
         mandatory: false
         type: "boolean"
@@ -719,6 +771,11 @@ app_tools:
     created_by: "agency"
     owned_by: "agency"
     parameters:
+      session_id:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Optional owned browser session identifier."
       text:
         mandatory: true
         type: "string"
@@ -741,10 +798,15 @@ app_tools:
     id: "agency.browser.extract-screenshot"
     name: "extract_screenshot"
     display_name: "Extract Screenshot"
-    description: "Capture the current page screenshot and ask the configured vision model to extract content requested by the agent. Required input: `text`, the extraction instruction. Optional input: `full_page_screenshot`. Output includes extracted content and screenshot artifact metadata. Side effect: captures an image and may call a vision model."
+    description: "Repeat structured DOM extraction from the current retained page after navigation or interaction. The legacy tool ID is preserved for compatibility; screenshot vision remains available through analyze-screenshot."
     created_by: "agency"
     owned_by: "agency"
     parameters:
+      session_id:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Optional owned browser session identifier."
       text:
         mandatory: true
         type: "string"
@@ -771,6 +833,11 @@ app_tools:
     created_by: "agency"
     owned_by: "agency"
     parameters:
+      session_id:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Optional owned browser session identifier."
       instruction:
         mandatory: false
         type: "string"
@@ -786,10 +853,15 @@ app_tools:
     id: "agency.browser.click"
     name: "click_browser"
     display_name: "Click Browser"
-    description: "Click an element on the current page using a natural-language element description or sequence number. Use this for intentional browser interactions after opening the page and inspecting the current state. Required input: `instruction`. Optional input: `sequence_number`. Output reports the click result and updated state. Side effect: mutates browser/page state and may trigger navigation or external actions."
+    description: "Click an element on the current retained page using a description, sequence number, or screenshot-relative x/y coordinates for manual handoff. Browser mutation approval remains enforced."
     created_by: "agency"
     owned_by: "agency"
     parameters:
+      session_id:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Optional owned browser session identifier."
       instruction:
         mandatory: true
         type: "string"
@@ -800,6 +872,16 @@ app_tools:
         type: "integer"
         filled_by: "agent"
         description: "Optional screenshot sequence number to disambiguate a target."
+      x:
+        mandatory: false
+        type: "number"
+        filled_by: "user_or_agent"
+        description: "Optional screenshot-relative X coordinate for a manual click."
+      y:
+        mandatory: false
+        type: "number"
+        filled_by: "user_or_agent"
+        description: "Optional screenshot-relative Y coordinate for a manual click."
       img_directory:
         mandatory: true
         type: "string"
@@ -816,6 +898,11 @@ app_tools:
     created_by: "agency"
     owned_by: "agency"
     parameters:
+      session_id:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Optional owned browser session identifier."
       instruction:
         mandatory: true
         type: "string"
@@ -842,6 +929,11 @@ app_tools:
     created_by: "agency"
     owned_by: "agency"
     parameters:
+      session_id:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Optional owned browser session identifier."
       instruction:
         mandatory: true
         type: "string"
@@ -868,6 +960,11 @@ app_tools:
     created_by: "agency"
     owned_by: "agency"
     parameters:
+      session_id:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Optional owned browser session identifier."
       text:
         mandatory: true
         type: "string"
@@ -885,10 +982,15 @@ app_tools:
     id: "agency.browser.close"
     name: "close_browser"
     display_name: "Close Browser"
-    description: "Terminate the current headless browser session and release browser resources. Use this when browser work is complete or a workflow needs to reset browser state. Input schema is empty. Output reports termination status. Side effect: closes browser state and invalidates the current page session."
+    description: "Terminate an owned browser session and release browser resources. Use this when browser work is complete or a workflow needs to reset browser state. Optional input: `session_id`; omission is allowed only when the owner has one active session. Output reports termination status. Side effect: closes browser state and invalidates the page session."
     created_by: "agency"
     owned_by: "agency"
-    parameters: { }
+    parameters:
+      session_id:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Optional owned browser session identifier."
 
 system_tools:
   workflow:

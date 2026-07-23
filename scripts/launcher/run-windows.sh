@@ -774,6 +774,28 @@ upsert_env_value() {
   fi
 }
 
+ensure_browser_runtime_signing_secret() {
+  local env_file="${ROOT_DIR}/.env"
+  local browser_secret=""
+  local python_bin=""
+
+  browser_secret="$(grep -E '^BROWSER_RUNTIME_SIGNING_SECRET=' "${env_file}" 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
+  if [ "${#browser_secret}" -lt 32 ]; then
+    python_bin="$(host_python || true)"
+    if [ -z "${python_bin}" ]; then
+      echo "Python is required to generate BROWSER_RUNTIME_SIGNING_SECRET." >&2
+      return 1
+    fi
+    # Keep the browser capability-signing authority distinct from the key
+    # used by trusted frontend routes to delegate backend identity.
+    browser_secret="$("${python_bin}" -c 'import secrets; print(secrets.token_urlsafe(48))')"
+    upsert_env_value "${env_file}" "BROWSER_RUNTIME_SIGNING_SECRET" "${browser_secret}"
+    rm -f "${env_file}.bak"
+    echo "Generated a browser runtime signing secret in .env."
+  fi
+  export BROWSER_RUNTIME_SIGNING_SECRET="${browser_secret}"
+}
+
 sync_onecli_gateway_ca_to_host() {
   if [ "${ONECLI_ENABLED:-false}" != "true" ]; then
     return 0
@@ -1076,6 +1098,7 @@ start_background() {
   if [ ! -f .env ]; then
     run_powershell "Copy-Item -LiteralPath '$(cygpath -w "${ROOT_DIR}/.env.example")' -Destination '$(cygpath -w "${ROOT_DIR}/.env")'" >/dev/null
   fi
+  ensure_browser_runtime_signing_secret
   load_dotenv_preserving_cli_tunnel_overrides
   apply_saved_or_detected_tunnel_preference
 
