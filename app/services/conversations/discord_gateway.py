@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 DISCORD_GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json"
 DISCORD_GATEWAY_INTENTS = 1 | 512 | 4096 | 32768
+DISCORD_PROXY_AUTH_RETRY_MIN_SECONDS = 60.0
+DISCORD_PROXY_AUTH_RETRY_MAX_SECONDS = 300.0
 
 
 @dataclass(slots=True)
@@ -156,15 +158,19 @@ class DiscordGatewayListenerService:
         return None
 
     async def _run_listener(self, config: DiscordGatewayListenerConfig) -> None:
+        proxy_auth_failure_count = 0
         while True:
+            retry_delay = max(self.settings.discord_gateway_reconnect_delay_seconds, 1.0)
             try:
                 if config.transport == "rest_poll":
                     await self._run_rest_poll_session(config)
                 else:
                     await self._run_single_gateway_session(config)
+                proxy_auth_failure_count = 0
             except asyncio.CancelledError:
                 raise
             except ConnectionClosed as exc:
+                proxy_auth_failure_count = 0
                 # Discord gateway sessions are long-lived TCP connections; proxies
                 # and Discord can drop them without a close frame. Reconnect without
                 # logging a traceback for this expected transport churn.
@@ -173,12 +179,46 @@ class DiscordGatewayListenerService:
                     config.credential.id,
                     exc,
                 )
+            except httpx.ProxyError as exc:
+                if "407" in str(exc):
+                    proxy_auth_failure_count += 1
+                    retry_delay = min(
+                        max(
+                            self.settings.discord_gateway_reconnect_delay_seconds,
+                            DISCORD_PROXY_AUTH_RETRY_MIN_SECONDS,
+                        ) * (2 ** min(proxy_auth_failure_count - 1, 3)),
+                        DISCORD_PROXY_AUTH_RETRY_MAX_SECONDS,
+                    )
+                    if proxy_auth_failure_count == 1:
+                        logger.error(
+                            "Discord listener proxy authentication failed for credential '%s'. "
+                            "Verify or rotate the owner-scoped OneCLI agent token mapping; "
+                            "retrying with bounded backoff.",
+                            config.credential.id,
+                        )
+                    else:
+                        # The first error contains the operator action. Keep later
+                        # retries at debug level so a static credential fault cannot
+                        # flood production logs every few seconds.
+                        logger.debug(
+                            "Discord listener proxy authentication is still failing for credential '%s'; "
+                            "retrying in %.1f seconds.",
+                            config.credential.id,
+                            retry_delay,
+                        )
+                else:
+                    proxy_auth_failure_count = 0
+                    logger.exception(
+                        "Discord listener proxy failed for credential '%s'; reconnecting.",
+                        config.credential.id,
+                    )
             except Exception:
+                proxy_auth_failure_count = 0
                 logger.exception(
                     "Discord listener failed for credential '%s'; reconnecting.",
                     config.credential.id,
                 )
-            await asyncio.sleep(max(self.settings.discord_gateway_reconnect_delay_seconds, 1.0))
+            await asyncio.sleep(retry_delay)
 
     async def _run_single_gateway_session(self, config: DiscordGatewayListenerConfig) -> None:
         sequence: int | None = None

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import httpx
 import os
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -145,6 +146,58 @@ class DiscordGatewayListenerServiceTests(unittest.TestCase):
 
             log_exception.assert_not_called()
             log_info.assert_called_once()
+
+        asyncio.run(exercise())
+
+    def test_proxy_auth_failure_logs_actionable_error_without_traceback(self) -> None:
+        async def exercise() -> None:
+            credential = CredentialDefinition(
+                id="cred-discord-onecli-auth",
+                owner_user_id="dev-user",
+                name="Discord OneCLI",
+                provider="discord-bot",
+                secret_ref="onecli://users/dev-user/discord-bot/cred-discord-onecli-auth",
+            )
+            config = DiscordGatewayListenerConfig(
+                credential=credential,
+                transport="rest_poll",
+                token=None,
+                bot_user_id=None,
+                onecli_identifier="users/dev-user/discord-bot/cred-discord-onecli-auth",
+                onecli_agent_token_secret_ref="env://ONECLI_AGENT_TOKEN",
+            )
+            service = DiscordGatewayListenerService(self.context, settings=get_settings())
+
+            with (
+                patch.object(
+                    service,
+                    "_run_rest_poll_session",
+                    AsyncMock(
+                        side_effect=[
+                            *[httpx.ProxyError("407 Proxy Authentication Required") for _ in range(5)],
+                            asyncio.CancelledError(),
+                        ]
+                    ),
+                ),
+                patch("app.services.conversations.discord_gateway.logger.error") as log_error,
+                patch("app.services.conversations.discord_gateway.logger.debug") as log_debug,
+                patch("app.services.conversations.discord_gateway.logger.exception") as log_exception,
+                patch(
+                    "app.services.conversations.discord_gateway.asyncio.sleep",
+                    AsyncMock(),
+                ) as sleep,
+            ):
+                with self.assertRaises(asyncio.CancelledError):
+                    await service._run_listener(config)  # noqa: SLF001
+
+            log_error.assert_called_once()
+            self.assertIn("Verify or rotate", log_error.call_args.args[0])
+            self.assertEqual(log_debug.call_count, 4)
+            log_exception.assert_not_called()
+            self.assertEqual(
+                [item.args[0] for item in sleep.await_args_list],
+                [60.0, 120.0, 240.0, 300.0, 300.0],
+            )
 
         asyncio.run(exercise())
 

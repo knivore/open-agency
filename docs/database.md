@@ -24,6 +24,7 @@ Database configuration is environment-driven:
 - `DATABASE_ECHO`
 - `DATABASE_POOL_SIZE`
 - `DATABASE_MAX_OVERFLOW`
+- `POSTGRES_MAX_LOCKS_PER_TRANSACTION` (Compose-managed Postgres; restart required)
 - `REQUIRE_DATABASE`
 
 Example:
@@ -34,6 +35,7 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/agency
 DATABASE_ECHO=false
 DATABASE_POOL_SIZE=5
 DATABASE_MAX_OVERFLOW=10
+POSTGRES_MAX_LOCKS_PER_TRANSACTION=256
 ```
 
 In production, `DATABASE_URL` should be present. In isolated tests, the app can fall back to SQLite-backed test

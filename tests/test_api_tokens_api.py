@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from fastapi.testclient import TestClient
+from unittest.mock import AsyncMock, patch
 
 from app.api.context import create_test_api_context
 from app.api.main import create_app
@@ -173,6 +174,33 @@ class ApiTokensApiTests(unittest.TestCase):
         list_response = self.client.get("/api-tokens", headers=self.owner_headers)
         self.assertEqual(list_response.status_code, 200)
         self.assertIsNotNone(list_response.json()["items"][0]["last_used_at"])
+
+    def test_api_token_usage_write_is_throttled(self) -> None:
+        raw_token = self._create_bearer_token(scopes=["workflows:read"])
+        headers = {"authorization": f"Bearer {raw_token}"}
+        self.assertEqual(self.client.get("/me", headers=headers).status_code, 200)
+
+        with patch.object(self.context.api_token_repo, "update", new_callable=AsyncMock) as update:
+            self.assertEqual(self.client.get("/me", headers=headers).status_code, 200)
+
+        update.assert_not_awaited()
+
+    def test_api_token_usage_write_failure_does_not_reject_valid_token(self) -> None:
+        raw_token = self._create_bearer_token(scopes=["workflows:read"])
+        headers = {"authorization": f"Bearer {raw_token}"}
+
+        with (
+            patch.object(
+                self.context.api_token_repo,
+                "update",
+                AsyncMock(side_effect=RuntimeError("database lock table exhausted")),
+            ),
+            patch("app.api.identity.logger.warning") as warning,
+        ):
+            response = self.client.get("/me", headers=headers)
+
+        self.assertEqual(response.status_code, 200)
+        warning.assert_called_once()
 
     def test_api_tokens_reject_unknown_scopes(self) -> None:
         response = self.client.post(

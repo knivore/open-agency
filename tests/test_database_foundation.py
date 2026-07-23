@@ -3,9 +3,11 @@ from __future__ import annotations
 import importlib.util
 import os
 import unittest
-from fastapi.testclient import TestClient
 from pathlib import Path
 from unittest.mock import patch
+
+import yaml
+from fastapi.testclient import TestClient
 
 from app.api.context import create_test_api_context
 from app.api.main import create_app
@@ -82,6 +84,19 @@ class DatabaseFoundationTests(unittest.IsolatedAsyncioTestCase):
             reset_settings_cache()
             with self.assertRaises(RuntimeError):
                 get_settings().ensure_runtime_requirements()
+
+    def test_compose_postgres_increases_shared_lock_capacity(self) -> None:
+        compose_path = Path(__file__).resolve().parents[1] / "docker-compose.yml"
+        compose = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            compose["services"]["postgres"]["command"],
+            [
+                "postgres",
+                "-c",
+                "max_locks_per_transaction=${POSTGRES_MAX_LOCKS_PER_TRANSACTION:-256}",
+            ],
+        )
 
     async def test_db_session_can_connect_with_sqlite_fallback(self) -> None:
         with patch.dict(

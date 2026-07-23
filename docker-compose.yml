@@ -213,6 +213,9 @@ services:
       context: .
       dockerfile: docker/postgres/Dockerfile
     container_name: open-agency-postgres
+    # The schema spans enough relations that concurrent API, migration, and
+    # projection work can exhaust PostgreSQL's default shared lock table.
+    command: [ "postgres", "-c", "max_locks_per_transaction=${POSTGRES_MAX_LOCKS_PER_TRANSACTION:-256}" ]
     environment:
       POSTGRES_DB: agency
       POSTGRES_USER: postgres

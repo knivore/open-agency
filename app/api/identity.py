@@ -8,13 +8,18 @@ inside each endpoint.
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
+import logging
+from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException, Request, status
 from typing import Iterable
 
 from app.api.context import ApiContext
 from app.core.config import get_settings
 from app.domain import API_TOKEN_SCOPE_DEFINITIONS, ApiTokenDefinition, UserDefinition
+
+logger = logging.getLogger(__name__)
+
+API_TOKEN_LAST_USED_WRITE_INTERVAL = timedelta(minutes=5)
 
 
 def require_active_user(user: UserDefinition) -> None:
@@ -139,6 +144,35 @@ def is_expired(expires_at: datetime | None) -> bool:
     return expires_at <= now
 
 
+def _should_record_token_usage(token: ApiTokenDefinition, used_at: datetime) -> bool:
+    last_used_at = token.last_used_at
+    if last_used_at is None:
+        return True
+    if last_used_at.tzinfo is None:
+        last_used_at = last_used_at.replace(tzinfo=timezone.utc)
+    return used_at - last_used_at >= API_TOKEN_LAST_USED_WRITE_INTERVAL
+
+
+async def _record_token_usage_best_effort(
+        context: ApiContext,
+        token: ApiTokenDefinition,
+        used_at: datetime,
+) -> None:
+    if not _should_record_token_usage(token, used_at):
+        return
+    try:
+        # This timestamp is operational metadata, not part of the authorization
+        # decision. Throttling avoids a database write on every authenticated read,
+        # and a storage-pressure failure must not turn a valid token into a 500.
+        await context.api_token_repo.update(token.id, {"last_used_at": used_at})
+    except Exception as exc:
+        logger.warning(
+            "Unable to update last_used_at for API token '%s'; authentication will continue: %s",
+            token.id,
+            exc,
+        )
+
+
 async def resolve_bearer_token_auth(
         request: Request, context: ApiContext
 ) -> tuple[ApiTokenDefinition, UserDefinition] | None:
@@ -176,7 +210,7 @@ async def resolve_bearer_token_auth(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="API token owner is unavailable")
     require_active_user(user)
     used_at = datetime.now(timezone.utc)
-    await context.api_token_repo.update(token.id, {"last_used_at": used_at})
+    await _record_token_usage_best_effort(context, token, used_at)
     context.runtime_operations.record_action(
         "api_token.used",
         token_id=token.id,

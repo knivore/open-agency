@@ -26,9 +26,11 @@ fi
 pause_on_error() {
   local exit_code="$1"
   local line_no="$2"
+  local failed_command="${3:-unknown}"
 
   echo
   echo "run-windows.sh failed on line ${line_no} with exit code ${exit_code}."
+  echo "Failed command: ${failed_command}"
   echo "Run it from Git Bash with './run-windows.sh start' to see the full output."
   if [ -n "${RUN_DIR:-}" ]; then
     echo "Logs directory: ${RUN_DIR}"
@@ -40,7 +42,7 @@ pause_on_error() {
   exit "${exit_code}"
 }
 
-trap 'pause_on_error "$?" "$LINENO"' ERR
+trap 'exit_code=$?; line_no=$LINENO; failed_command=$BASH_COMMAND; pause_on_error "$exit_code" "$line_no" "$failed_command"' ERR
 
 usage() {
   cat <<'EOF'
@@ -765,12 +767,17 @@ upsert_env_value() {
   local key="$2"
   local value="$3"
 
-  mkdir -p "$(dirname "${file}")"
-  touch "${file}"
+  # Git Bash can fail to update timestamps on an existing Windows file even
+  # when the file itself is writable. Only create the file when it is absent;
+  # callers can decide whether a write failure should be fatal.
+  mkdir -p "$(dirname "${file}")" >/dev/null 2>&1 || return 1
+  if [ ! -e "${file}" ]; then
+    : >"${file}" 2>/dev/null || return 1
+  fi
   if grep -qE "^${key}=" "${file}"; then
-    sed -i.bak -E "s|^${key}=.*|${key}=${value}|" "${file}"
+    sed -i.bak -E "s|^${key}=.*|${key}=${value}|" "${file}" >/dev/null 2>&1 || return 1
   else
-    printf '%s=%s\n' "${key}" "${value}" >>"${file}"
+    printf '%s=%s\n' "${key}" "${value}" >>"${file}" 2>/dev/null || return 1
   fi
 }
 
@@ -789,9 +796,12 @@ ensure_browser_runtime_signing_secret() {
     # Keep the browser capability-signing authority distinct from the key
     # used by trusted frontend routes to delegate backend identity.
     browser_secret="$("${python_bin}" -c 'import secrets; print(secrets.token_urlsafe(48))')"
-    upsert_env_value "${env_file}" "BROWSER_RUNTIME_SIGNING_SECRET" "${browser_secret}"
-    rm -f "${env_file}.bak"
-    echo "Generated a browser runtime signing secret in .env."
+    if upsert_env_value "${env_file}" "BROWSER_RUNTIME_SIGNING_SECRET" "${browser_secret}"; then
+      rm -f "${env_file}.bak" 2>/dev/null || true
+      echo "Generated a browser runtime signing secret in .env."
+    else
+      echo "Warning: .env is not writable; using a generated browser runtime signing secret for this launch only." >&2
+    fi
   fi
   export BROWSER_RUNTIME_SIGNING_SECRET="${browser_secret}"
 }
