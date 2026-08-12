@@ -86,6 +86,15 @@ Challenge results identify the kind, confidence, evidence indicators, HTTP statu
 terminal state, and whether human action is required. Recovery is bounded: normal Patchright load, a focused visible
 checkbox attempt, fresh Patchright contexts, then Scrapling. There is no infinite retry loop.
 
+Protection detection considers the loaded DOM and top-level response headers for Cloudflare, Akamai, Imperva,
+DataDome, PerimeterX, Kasada, Queue-it, and AWS WAF signals. It discounts ordinary article prose that merely mentions
+those services. A `429` or `Retry-After` response does not immediately retry: the domain is cooled down for the
+publisher-supplied interval, bounded by `BROWSER_DOMAIN_MAX_COOLDOWN_SECONDS`.
+
+The runtime records the newest main-document response after an interstitial resolves, so an initial challenge response
+does not override a successfully loaded page. Confirmed 404s are terminal `missing_source` results, and Scrapling's
+fallback navigation is bounded by the same Agency-owned wall-clock budget as other browser navigation.
+
 Agency does not promise universal CAPTCHA solving. Visual puzzles, OTPs, account verification, and device confirmation
 return `human_action_required`. When `keep_open=true`, the response contains the same live `session_id`, an owner-scoped
 screenshot artifact, expiry time, instructions, and `agency.human.ask` as the pause/handoff tool. After the operator

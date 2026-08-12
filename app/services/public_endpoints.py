@@ -63,3 +63,8 @@ class PublicEndpointService:
             last_seen_at=datetime.now(timezone.utc),
         )
         return await self.context.public_endpoint_repo.create(record)
+
+    async def clear_webhook_base_url(self) -> None:
+        """Remove a stale tunnel URL after the launcher switches to local-only mode."""
+        if hasattr(self.context.public_endpoint_repo, "deactivate_active"):
+            await self.context.public_endpoint_repo.deactivate_active("webhook_base_url")

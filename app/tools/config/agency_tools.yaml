@@ -1,4 +1,81 @@
 app_tools:
+  agency.document.ocr:
+    id: "agency.document.ocr"
+    name: "recognize_document"
+    display_name: "Recognize Document"
+    description: "Extract structured text from a document or image through Agency's interchangeable OCR provider boundary. The initial provider is Baidu Unlimited-OCR (`baidu/Unlimited-OCR`), which returns Markdown and a structured-result URL for supported PDFs, images, and office documents. Required input: exactly one of `file_path`, `file_base64`, or `file_url`; `filename` is required for base64 and URL sources. Sending a document to a hosted OCR provider requires approval because its contents leave Agency."
+    created_by: "agency"
+    owned_by: "agency"
+    tags: [ "catalog", "document", "ocr", "agent_assignable", "risk:medium" ]
+    security:
+      requires_approval: true
+      allow_network: true
+      read_only: true
+      allowlisted_domains: [ "aip.baidubce.com", "*.bcebos.com", "*.baidubce.com" ]
+    parameters:
+      file_path:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Local document path accessible to the backend."
+      file_base64:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Base64 encoded document bytes; data URLs are accepted."
+      file_url:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Public document URL that Baidu can fetch. Do not use for private or access-controlled files."
+      filename:
+        mandatory: false
+        type: "string"
+        filled_by: "agent"
+        description: "Filename including its extension; required for file_base64 and file_url."
+      provider:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        default: "baidu_unlimited_ocr"
+        description: "OCR provider adapter. Currently baidu_unlimited_ocr."
+      model:
+        mandatory: false
+        type: "string"
+        filled_by: "user_or_agent"
+        default: "baidu/Unlimited-OCR"
+        description: "OCR model identifier. The current provider supports baidu/Unlimited-OCR."
+      wait_for_completion:
+        mandatory: false
+        type: "boolean"
+        filled_by: "agent"
+        default: true
+        description: "Wait for the asynchronous OCR task to finish."
+      timeout_seconds:
+        mandatory: false
+        type: "integer"
+        filled_by: "user_or_agent"
+        default: 300
+        description: "Maximum seconds to wait for the OCR task."
+      poll_interval_seconds:
+        mandatory: false
+        type: "number"
+        filled_by: "agent"
+        default: 5
+        description: "Seconds between OCR task-status checks."
+      include_markdown:
+        mandatory: false
+        type: "boolean"
+        filled_by: "agent"
+        default: true
+        description: "Download the generated Markdown into the tool response."
+      max_markdown_chars:
+        mandatory: false
+        type: "integer"
+        filled_by: "agent"
+        default: 250000
+        description: "Maximum Markdown characters returned inline; the source URL is always retained."
+
   agency.human.ask:
     id: "agency.human.ask"
     name: "ask_human"

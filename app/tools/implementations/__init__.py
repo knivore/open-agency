@@ -14,6 +14,7 @@ from .documents import save_markdown_to_word
 from .http_integrations import execute_custom_api
 from .human_input import request_human_input
 from .media import publish_media, send_media
+from .ocr import recognize_document
 from .spreadsheets import write_excel_image, write_excel_json, write_excel_text
 from .voice import generate_voice
 
@@ -23,6 +24,7 @@ __all__ = [
     "generate_voice",
     "open_browser",
     "publish_media",
+    "recognize_document",
     "request_human_input",
     "save_markdown_to_word",
     "send_media",

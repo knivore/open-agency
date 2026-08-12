@@ -80,6 +80,7 @@ class BrowserRuntimeService:
                 success=response.status in {"ok", "human_action_required"},
                 challenge=response.challenge.kind,
                 fallback=response.engine == self.fallback.name,
+                cooldown_seconds=response.challenge.retry_after_seconds,
             )
             return response
         except Exception:
@@ -710,8 +711,8 @@ class BrowserRuntimeService:
             else:
                 storage_state_reader = getattr(self.primary, "storage_state", None)
                 primary_state = await storage_state_reader(session) if storage_state_reader else None
-                expected_cookies = {item.get("name") for item in (fallback_state or {}).get("cookies", [])}
-                actual_cookies = {item.get("name") for item in (primary_state or {}).get("cookies", [])}
+                expected_cookies = self._cookie_entries(fallback_state)
+                actual_cookies = self._cookie_entries(primary_state)
                 expected_storage = self._storage_entries(fallback_state)
                 actual_storage = self._storage_entries(primary_state)
                 cookies_preserved = expected_cookies.issubset(actual_cookies)
@@ -798,3 +799,17 @@ class BrowserRuntimeService:
                 entries.add((origin_url, str(item.get("name") or ""), str(item.get("value") or "")))
         return entries
 
+    @staticmethod
+    def _cookie_entries(state: dict[str, Any] | None) -> set[tuple[str, str, str, str]]:
+        """Compare full cookie identities without exposing their values in diagnostics."""
+
+        return {
+            (
+                str(item.get("name") or ""),
+                str(item.get("value") or ""),
+                str(item.get("domain") or ""),
+                str(item.get("path") or "/"),
+            )
+            for item in (state or {}).get("cookies", [])
+            if item.get("name")
+        }

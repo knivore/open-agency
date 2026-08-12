@@ -15,6 +15,7 @@ class SetupOnboardingApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.preference_path = Path(self.temp_dir.name) / "tunnel-preference.json"
+        self.runtime_control_path = Path(self.temp_dir.name) / "tunnel-runtime-control.json"
         self.openvoice_root = Path(self.temp_dir.name) / "openvoice"
         self.openvoice_checkpoints = Path(self.temp_dir.name) / "checkpoints"
         self.openvoice_settings = Path(self.temp_dir.name) / "openvoice-settings.json"
@@ -27,6 +28,7 @@ class SetupOnboardingApiTests(unittest.TestCase):
             os.environ,
             {
                 "AGENCY_TUNNEL_PREFERENCE_PATH": str(self.preference_path),
+                "AGENCY_TUNNEL_RUNTIME_CONTROL_PATH": str(self.runtime_control_path),
                 "AGENCY_OPENVOICE_ROOT": str(self.openvoice_root),
                 "AGENCY_OPENVOICE_CHECKPOINTS_DIR": str(self.openvoice_checkpoints),
                 "AGENCY_OPENVOICE_SETTINGS_PATH": str(self.openvoice_settings),
@@ -226,3 +228,17 @@ class SetupOnboardingApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["provider"], "auto")
         self.assertIsNone(response.json()["custom_domain"])
+
+    def test_setup_can_request_an_immediate_tunnel_apply(self) -> None:
+        response = self.client.put(
+            "/setup/tunnel-preference",
+            headers=self.auth_headers,
+            json={"provider": "cloudflare", "custom_domain": None, "apply_now": True},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        control = response.json()["runtime_control"]
+        self.assertEqual(control["state"], "requested")
+        self.assertEqual(control["provider"], "cloudflare")
+        self.assertTrue(control["request_id"])
+        self.assertTrue(self.runtime_control_path.exists())

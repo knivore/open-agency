@@ -366,6 +366,8 @@ class Settings(BaseSettings):
         default="whisper-1",
         alias="OPENAI_REALTIME_TRANSCRIPTION_MODEL",
     )
+    baidu_ocr_api_key: str | None = Field(default=None, alias="BAIDU_OCR_API_KEY", repr=False)
+    baidu_ocr_secret_key: str | None = Field(default=None, alias="BAIDU_OCR_SECRET_KEY", repr=False)
     sandbox_edit_allowed_repos: str = Field(
         default="",
         alias="SANDBOX_EDIT_ALLOWED_REPOS",

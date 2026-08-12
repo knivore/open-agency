@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import tempfile
@@ -16,7 +17,7 @@ from ..challenges import classify_challenge
 from ..contracts import ActionRequest, BrowserOptions, ChallengeResult, ExtractMode, ExtractionResult
 from ..extraction import extract_document
 from ..proxy import ProxyResolver, ResolvedProxy
-from .base import EngineUnavailableError
+from .base import EngineNavigationError, EngineUnavailableError
 
 
 @dataclass(slots=True)
@@ -29,6 +30,7 @@ class ScraplingSession:
     html: str = ""
     final_url: str = ""
     status: int | None = None
+    headers: dict[str, str] | None = None
     storage_state: dict[str, Any] | None = None
     closed: bool = False
 
@@ -93,7 +95,7 @@ class ScraplingAdapter:
         return ScraplingSession(engine=self.name, context_manager=manager, client=client, runtime_dir=runtime_dir)
 
     async def navigate(self, session: ScraplingSession, url: str, *, timeout_ms: int) -> dict[str, Any]:
-        response = await session.client.fetch(
+        fetch_task = asyncio.create_task(session.client.fetch(
             url,
             solve_cloudflare=True,
             disable_resources=False,
@@ -102,7 +104,15 @@ class ScraplingAdapter:
             network_idle=False,
             retries=1,
             retry_delay=1.0,
-        )
+        ))
+        done, _ = await asyncio.wait({fetch_task}, timeout=max(0.1, timeout_ms / 1_000))
+        if not done:
+            fetch_task.cancel()
+            # A compatibility-layer solver can ignore cancellation briefly;
+            # consume its eventual result without extending Agency's budget.
+            fetch_task.add_done_callback(_consume_task_result)
+            raise EngineNavigationError(f"Scrapling navigation exceeded {timeout_ms} ms")
+        response = fetch_task.result()
         body = getattr(response, "body", b"")
         if isinstance(body, bytes):
             session.html = body.decode(getattr(response, "encoding", None) or "utf-8", errors="replace")
@@ -110,6 +120,11 @@ class ScraplingAdapter:
             session.html = str(body or getattr(response, "html_content", "") or "")
         session.final_url = str(getattr(response, "url", None) or url)
         session.status = getattr(response, "status", None) or getattr(response, "status_code", None)
+        raw_headers = getattr(response, "headers", None) or {}
+        try:
+            session.headers = {str(key): str(value) for key, value in raw_headers.items()}
+        except AttributeError:
+            session.headers = {}
         session.storage_state = await self._storage_state(session.client, response)
         extracted = extract_document(session.html, final_url=session.final_url, mode="text", max_chars=2_000)
         return {
@@ -137,6 +152,7 @@ class ScraplingAdapter:
             final_url=session.final_url,
             http_status=http_status if http_status is not None else session.status,
             engine=self.name,
+            response_headers=session.headers,
         )
 
     async def action(self, session: ScraplingSession, request: ActionRequest) -> dict[str, Any]:
@@ -190,3 +206,9 @@ class ScraplingAdapter:
             }
         return None
 
+
+def _consume_task_result(task: asyncio.Task[Any]) -> None:
+    try:
+        task.result()
+    except (asyncio.CancelledError, Exception):
+        pass

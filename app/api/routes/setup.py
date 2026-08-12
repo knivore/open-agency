@@ -18,6 +18,7 @@ from app.services.openvoice_setup import OpenVoiceSetupService
 from app.services.public_endpoints import PublicEndpointService
 from app.services.setup_onboarding import SetupOnboardingService
 from app.services.tunnel_preferences import TunnelPreferenceService, TunnelProvider
+from app.services.tunnel_runtime_control import TunnelRuntimeControlService
 from app.tools.implementations.voice import generate_voice
 
 
@@ -42,6 +43,7 @@ class SetupRecommendedAgentsRequest(BaseModel):
 class SetupTunnelPreferenceRequest(BaseModel):
     provider: TunnelProvider
     custom_domain: str | None = None
+    apply_now: bool = False
 
 
 class SetupOpenVoiceSettingsRequest(BaseModel):
@@ -64,16 +66,21 @@ def create_setup_router(context: Optional[ApiContext] = None) -> APIRouter:
     context = context or get_default_api_context()
     service = SetupOnboardingService(context)
     tunnel_service = TunnelPreferenceService()
+    tunnel_runtime_control = TunnelRuntimeControlService()
     endpoint_service = PublicEndpointService(context)
     openvoice_service = OpenVoiceSetupService()
     router = APIRouter(prefix="/setup", tags=["Setup"])
 
     async def tunnel_preference_payload():
         preference = tunnel_service.get()
+        runtime_control = tunnel_runtime_control.status()
+        runtime_payload = runtime_control.model_dump(mode="json")
+        runtime_payload["supervisor_available"] = runtime_control.supervisor_available
         return {
             **preference.model_dump(mode="json"),
             "current_public_url": await endpoint_service.get_current_webhook_base_url(),
             "requirements": tunnel_service.requirements(preference),
+            "runtime_control": runtime_payload,
         }
 
     @router.get("/tunnel-preference", summary="Get Saved Tunnel Preference")
@@ -84,11 +91,15 @@ def create_setup_router(context: Optional[ApiContext] = None) -> APIRouter:
     async def save_tunnel_preference(payload: SetupTunnelPreferenceRequest, request: Request):
         await resolve_current_user(request, context, required_scopes=["integrations:write"])
         try:
-            tunnel_service.save(
+            preference = tunnel_service.save(
                 provider=payload.provider,
                 custom_domain=payload.custom_domain,
                 source="browser",
             )
+            if payload.apply_now:
+                tunnel_runtime_control.request_apply(preference)
+            else:
+                tunnel_runtime_control.clear()
         except (ValueError, OSError) as exc:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
         return await tunnel_preference_payload()

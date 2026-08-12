@@ -141,6 +141,7 @@ class ChallengeResult(BaseModel):
     terminal: bool = False
     human_action_required: bool = False
     instructions: str | None = None
+    retry_after_seconds: int | None = Field(default=None, ge=0)
 
 
 class LinkResult(BaseModel):
@@ -223,4 +224,3 @@ class HealthResult(BaseModel):
     free_bytes: int | None = None
     release: dict[str, str] = Field(default_factory=dict)
     metrics: dict[str, Any] = Field(default_factory=dict)
-

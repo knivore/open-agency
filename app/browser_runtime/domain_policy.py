@@ -86,7 +86,16 @@ class DomainPolicyStore:
             await lease.release()
             raise
 
-    def record(self, domain: str, *, engine: str, success: bool, challenge: str = "none", fallback: bool = False) -> None:
+    def record(
+            self,
+            domain: str,
+            *,
+            engine: str,
+            success: bool,
+            challenge: str = "none",
+            fallback: bool = False,
+            cooldown_seconds: int | None = None,
+    ) -> None:
         now = self.clock()
         self.prune(now=now)
         item = self._history.setdefault(domain, DomainHistory(domain=domain))
@@ -109,7 +118,11 @@ class DomainPolicyStore:
         if challenge != "none":
             item.challenges += 1
             item.last_challenge = challenge
-            item.cooldown_until = now + self.cooldown_seconds
+            # Honor publisher-provided retry windows but cap them so stale or
+            # malicious headers cannot pin a domain indefinitely.
+            requested_cooldown = cooldown_seconds if cooldown_seconds is not None else self.cooldown_seconds
+            maximum_cooldown = max(self.cooldown_seconds, int(os.getenv("BROWSER_DOMAIN_MAX_COOLDOWN_SECONDS", "3600")))
+            item.cooldown_until = now + min(max(self.cooldown_seconds, requested_cooldown), maximum_cooldown)
         self._save()
 
     def get(self, domain: str) -> DomainHistory | None:
@@ -156,4 +169,3 @@ class DomainLease:
             async with self._state.condition:
                 self._state.active_limits.pop(self._token, None)
                 self._state.condition.notify_all()
-

@@ -21,6 +21,7 @@ NGROK_LOG_FILE="${ROOT_DIR}/.logs/agency-ngrok.log"
 NGROK_API_URL="${AGENCY_NGROK_API_URL:-http://127.0.0.1:4040}"
 CLOUDFLARED_PID_FILE="${ROOT_DIR}/.logs/agency-cloudflared.pid"
 CLOUDFLARED_LOG_FILE="${ROOT_DIR}/.logs/agency-cloudflared.log"
+TUNNEL_SUPERVISOR_PID_FILE="${ROOT_DIR}/.logs/agency-tunnel-supervisor.pid"
 ONECLI_GATEWAY_CA_HOST_PATH_DEFAULT="${ROOT_DIR}/certs/onecli-gateway-ca.pem"
 ONECLI_BACKEND_CA_HOST_PATH_DEFAULT="${ROOT_DIR}/.data/onecli/worker-ca-plus-onecli.pem"
 . "${LAUNCHER_DIR}/common.sh"
@@ -28,7 +29,7 @@ ONECLI_BACKEND_CA_HOST_PATH_DEFAULT="${ROOT_DIR}/.data/onecli/worker-ca-plus-one
 usage() {
   cat <<'EOF'
 Usage:
-  ./run.sh [start|restart|stop|status|logs|doctor|bootstrap] [tunnel option]
+  ./run.sh [start|restart|stop|status|logs|doctor|bootstrap|tunnel-reload] [tunnel option]
 
 Commands:
   start      Start Open Agency in the background. This is the default.
@@ -38,6 +39,7 @@ Commands:
   logs       Stream backend and launcher-managed frontend logs.
   doctor     Check local prerequisites without changing the environment.
   bootstrap  Create local env files and install backend/frontend dependencies.
+  tunnel-reload  Restart only the selected public tunnel without interrupting Agency.
 
 Start runs the full local setup in the background:
   - creates .env from .env.example when needed
@@ -1132,6 +1134,54 @@ stop_public_tunnel() {
   stop_cloudflared || true
 }
 
+reload_public_tunnel() {
+  local public_url=""
+
+  load_dotenv_preserving_cli_tunnel_overrides
+  apply_saved_or_detected_tunnel_preference
+  stop_public_tunnel
+  start_public_tunnel
+
+  public_url="$(public_tunnel_url || true)"
+  if [ -n "${public_url}" ]; then
+    record_public_endpoint_if_present "${public_url}" docker compose exec -T backend python
+  else
+    clear_public_endpoint docker compose exec -T backend python
+  fi
+
+  case "$(public_tunnel_provider_mode)" in
+    none) return 0 ;;
+    ngrok|cloudflare) [ -n "${public_url}" ] ;;
+    *) return 1 ;;
+  esac
+}
+
+start_tunnel_supervisor() {
+  local supervisor_script="${LAUNCHER_DIR}/tunnel-supervisor.sh"
+
+  if [ -f "${TUNNEL_SUPERVISOR_PID_FILE}" ]; then
+    local supervisor_pid=""
+    supervisor_pid="$(cat "${TUNNEL_SUPERVISOR_PID_FILE}" 2>/dev/null || true)"
+    if process_alive "${supervisor_pid}"; then return 0; fi
+    rm -f "${TUNNEL_SUPERVISOR_PID_FILE}"
+  fi
+
+  mkdir -p "${ROOT_DIR}/.logs"
+  nohup bash "${supervisor_script}" "${LAUNCHER_DIR}/run-unix.sh" \
+    >"${ROOT_DIR}/.logs/agency-tunnel-supervisor.log" 2>&1 </dev/null &
+  printf '%s\n' "$!" >"${TUNNEL_SUPERVISOR_PID_FILE}"
+}
+
+stop_tunnel_supervisor() {
+  local supervisor_pid=""
+
+  if [ -f "${TUNNEL_SUPERVISOR_PID_FILE}" ]; then
+    supervisor_pid="$(cat "${TUNNEL_SUPERVISOR_PID_FILE}" 2>/dev/null || true)"
+    if process_alive "${supervisor_pid}"; then kill "${supervisor_pid}" >/dev/null 2>&1 || true; fi
+    rm -f "${TUNNEL_SUPERVISOR_PID_FILE}"
+  fi
+}
+
 print_public_tunnel_summary() {
   local provider=""
   local public_url=""
@@ -1333,6 +1383,7 @@ start_background() {
   sync_codex_oauth_to_volume
 
   start_public_tunnel
+  start_tunnel_supervisor
   public_url="$(public_tunnel_url || true)"
   if [ -n "${public_url}" ]; then
     echo "Export AGENCY_PUBLIC_WEBHOOK_BASE_URL as ${public_url}"
@@ -1514,6 +1565,7 @@ stop_all() {
   stop_backend_port || true
 
   echo "Stopping public tunnel..."
+  stop_tunnel_supervisor
   stop_public_tunnel
 }
 
@@ -1749,6 +1801,9 @@ main() {
     bootstrap)
       bootstrap_local
       print_env_guidance
+      ;;
+    tunnel-reload)
+      reload_public_tunnel
       ;;
     -h|--help|help)
       usage

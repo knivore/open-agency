@@ -159,6 +159,16 @@ async def _public_endpoint_current(args) -> int:
     return 0
 
 
+async def _public_endpoint_clear(args) -> int:
+    context = get_default_api_context()
+    await PublicEndpointService(context).clear_webhook_base_url()
+    if args.json:
+        _print_json({"cleared": True})
+    else:
+        print("Cleared the current public endpoint.")
+    return 0
+
+
 async def _chat_main_agent(*, conversation_id: str, title: str, user_id: str) -> int:
     context = get_default_api_context()
     setup_service = MainAgentSetupService(context)
@@ -1461,6 +1471,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     public_endpoint_current_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
 
+    public_endpoint_clear_parser = public_endpoint_subparsers.add_parser(
+        "clear",
+        help="Clear the current public webhook base URL.",
+    )
+    public_endpoint_clear_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+
     graph_projection_parser = subparsers.add_parser(
         "graph-projection",
         help="Inspect and replay graph projection outbox events.",
@@ -1682,6 +1698,8 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_public_endpoint_record(args))
         if args.public_endpoint_command == "current":
             return asyncio.run(_public_endpoint_current(args))
+        if args.public_endpoint_command == "clear":
+            return asyncio.run(_public_endpoint_clear(args))
         parser.error(f"Unknown public-endpoint command: {args.public_endpoint_command}")
     if args.command == "graph-projection":
         if args.graph_projection_command == "status":

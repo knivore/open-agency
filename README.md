@@ -68,6 +68,17 @@ Open Agency exists for that gap. It is the backend for agents that need to behav
 - Retrieve content or operate the same retained, owner-scoped browser session through the unified browser tool family.
 - Use Docker-backed runtime isolation where stronger execution boundaries are needed.
 
+### Parse documents with OCR
+
+`agency.document.ocr` is a provider-neutral OCR tool. Its first adapter uses Baidu Unlimited-OCR (`baidu/Unlimited-OCR`) and returns parsed Markdown plus time-limited structured-result links. Configure the hosted adapter server-side in `.env`:
+
+```dotenv
+BAIDU_OCR_API_KEY=your-baidu-api-key
+BAIDU_OCR_SECRET_KEY=your-baidu-secret-key
+```
+
+Provide one source per call: a backend file path, base64 document bytes, or a public URL (the latter two need a filename). The service receives the document, so Agency requires approval before execution. The provider/model fields are explicit so future OCR adapters can use the same tool contract.
+
 ### Reach users through multiple surfaces
 
 - Power browser, API, and CLI flows from the same backend.
@@ -200,7 +211,7 @@ Tunnel behavior:
 - The setup UI can save local-only, ngrok, Cloudflare, or automatic mode.
 - A browser-saved tunnel preference becomes the default on later launches.
 - Custom domains can be stored for ngrok or Cloudflare-managed tunnel setups.
-- Selecting ngrok or Cloudflare in the setup UI saves the preference; the next restart automatically installs a missing selected provider through WinGet on Windows or Homebrew on macOS. Fresh starts also attempt the default Cloudflare provider. For ngrok, set `AGENCY_NGROK_AUTHTOKEN` when required (interactive startup can prompt once). Cloudflare quick tunnels need no token; managed/custom Cloudflare tunnels require `AGENCY_CLOUDFLARE_TUNNEL_TOKEN` and a public URL. If an executable is not on `PATH`, set `AGENCY_NGROK_BIN` or `AGENCY_CLOUDFLARE_TUNNEL_BIN` to its verified path. Set `AGENCY_TUNNEL_AUTO_INSTALL=false` to disable automatic installation.
+- Selecting ngrok or Cloudflare in Setup saves the preference; Profile also lets you apply a provider switch immediately. The launcher restarts only the public tunnel process, so the Agency containers remain online. Fresh starts and selected provider changes automatically install a missing provider through WinGet on Windows or Homebrew on macOS. For ngrok, set `AGENCY_NGROK_AUTHTOKEN` when required (interactive startup can prompt once). Cloudflare quick tunnels need no token; managed/custom Cloudflare tunnels require `AGENCY_CLOUDFLARE_TUNNEL_TOKEN` and a public URL. If an executable is not on `PATH`, set `AGENCY_NGROK_BIN` or `AGENCY_CLOUDFLARE_TUNNEL_BIN` to its verified path. Set `AGENCY_TUNNEL_AUTO_INSTALL=false` to disable automatic installation.
 
 ## Example Usage
 

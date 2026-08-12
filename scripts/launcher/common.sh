@@ -324,6 +324,10 @@ record_public_endpoint_if_present() {
     --url "${public_url}" >/dev/null || true
 }
 
+clear_public_endpoint() {
+  "$@" -m app.cli public-endpoint clear >/dev/null || true
+}
+
 run_startup_onboarding_sync() {
   local backend_only_hint="$1"
   local operator_hint="$2"

@@ -25,6 +25,7 @@ from app.tools.implementations.documents import SaveMarkdownToWordToolSchema
 from app.tools.implementations.http_integrations import CustomAPIInput
 from app.tools.implementations.human_input import HumanInputRequest
 from app.tools.implementations.media import MediaPublishInput, MediaSendInput
+from app.tools.implementations.ocr import OCRDocumentInput
 from app.tools.implementations.speech import SpeechContinueInput, SpeechListenInput, SpeechSpeakInput
 from app.tools.implementations.spreadsheets import ExcelImageInput, ExcelJSONInput, ExcelTextInput
 from app.tools.implementations.voice import VoiceGenerateInput
@@ -105,6 +106,7 @@ def _apply_parameter_contract_metadata(
 
 def _input_schema_for(tool_id: str, parameters_metadata: dict[str, Any]) -> dict[str, Any]:
     schemas: dict[str, dict[str, Any]] = {
+        "agency.document.ocr": OCRDocumentInput.model_json_schema(),
         "agency.human.ask": HumanInputRequest.model_json_schema(),
         "agency.speech.listen": SpeechListenInput.model_json_schema(),
         "agency.speech.speak": SpeechSpeakInput.model_json_schema(),
@@ -253,6 +255,22 @@ def _output_schema_for(tool_id: str) -> dict[str, Any]:
         description="Stringified success message when the workbook was updated successfully.",
     )
     mapping: dict[str, dict[str, Any]] = {
+        "agency.document.ocr": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "description": "submitted, pending, running, success, or failed."},
+                "provider": {"type": "string", "description": "OCR provider adapter that processed the document."},
+                "model": {"type": "string", "description": "OCR model identifier used by the adapter."},
+                "task_id": {"type": "string", "description": "Provider task id for the asynchronous parse job."},
+                "markdown": {"type": "string", "description": "Parsed Markdown when requested and available."},
+                "markdown_truncated": {"type": "boolean", "description": "Whether inline Markdown was capped."},
+                "markdown_url": {"type": ["string", "null"], "description": "Time-limited provider Markdown URL."},
+                "parse_result_url": {"type": ["string", "null"], "description": "Time-limited provider structured-result URL."},
+                "task_error": {"type": ["string", "null"], "description": "Provider failure detail when status is failed."},
+            },
+            "required": ["status", "provider", "model", "task_id"],
+            "additionalProperties": False,
+        },
         "agency.human.ask": {
             "type": "object",
             "properties": {
@@ -543,6 +561,7 @@ def _output_schema_for(tool_id: str) -> dict[str, Any]:
 
 def _default_implementation_for(tool_id: str) -> ToolImplementationReference:
     mapping = {
+        "agency.document.ocr": ("app.tools.implementations.ocr", "recognize_document"),
         "agency.human.ask": ("app.tools.implementations.human_input", "request_human_input"),
         "agency.speech.listen": ("app.tools.implementations.speech", "listen_speech"),
         "agency.speech.speak": ("app.tools.implementations.speech", "speak_speech"),
@@ -585,6 +604,7 @@ def _implementation_for(tool_id: str, config: dict[str, Any]) -> ToolImplementat
 
 def _default_security_for(tool_id: str, implementation: ToolImplementationReference) -> SecuritySettings:
     network_tools = {
+        "agency.document.ocr",
         "agency.speech.listen",
         "agency.media.publish",
         "agency.media.send",
@@ -633,6 +653,7 @@ def _default_security_for(tool_id: str, implementation: ToolImplementationRefere
         "agency.browser.type-text",
     } | external_mutation_tools
     read_only_tools = {
+        "agency.document.ocr",
         "agency.speech.listen",
         "agency.speech.speak",
         "agency.browser.open",

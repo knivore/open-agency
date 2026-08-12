@@ -155,6 +155,30 @@ class BrowserRoutePolicyTests(unittest.IsolatedAsyncioTestCase):
                     timeout=0.5,
                 )
 
+    async def test_document_response_tracking_ignores_captcha_frame_responses(self):
+        main_frame = object()
+        page = type("Page", (), {"main_frame": main_frame})()
+        session = type("Session", (), {"page": page, "last_status": None, "last_headers": None})()
+        adapter = PatchrightAdapter()
+        widget_response = type("Response", (), {
+            "request": type("Request", (), {"resource_type": "document"})(),
+            "frame": object(),
+            "status": 403,
+            "headers": {"cf-mitigated": "challenge"},
+        })()
+        document_response = type("Response", (), {
+            "request": type("Request", (), {"resource_type": "document"})(),
+            "frame": main_frame,
+            "status": 200,
+            "headers": {"content-type": "text/html"},
+        })()
+
+        adapter._record_document_response(session, widget_response)
+        adapter._record_document_response(session, document_response)
+
+        self.assertEqual(session.last_status, 200)
+        self.assertEqual(session.last_headers, {"content-type": "text/html"})
+
 
 class BrowserArtifactTests(unittest.TestCase):
     def test_artifact_access_is_owner_scoped(self):
@@ -205,6 +229,50 @@ class BrowserChallengeTests(unittest.TestCase):
         self.assertEqual(result.kind, "turnstile")
         self.assertTrue(result.human_action_required)
         self.assertGreater(result.confidence, 0.8)
+
+    def test_header_only_provider_signal_is_classified_when_the_response_is_blocked(self):
+        result = classify_challenge(
+            title="Access denied",
+            html="<html><body>Request blocked</body></html>",
+            http_status=403,
+            response_headers={"X-Iinfo": "12-1234-0 NNNN", "Server": "Imperva"},
+        )
+
+        self.assertEqual(result.kind, "imperva")
+        self.assertIn("x-iinfo", result.indicators)
+
+    def test_article_with_weak_rate_limit_prose_is_not_rate_limited(self):
+        result = classify_challenge(
+            title="How to slow down safely",
+            body_text="A normal article about keeping a slow down warning visible to drivers.",
+            html='<article class="article-body"><p>Slow down near schools.</p></article>',
+            http_status=200,
+        )
+
+        self.assertEqual(result.kind, "none")
+
+    def test_retry_after_stops_immediate_retries_and_exposes_the_cooldown(self):
+        result = classify_challenge(
+            title="Too many requests",
+            html="<html><body>Try later</body></html>",
+            http_status=429,
+            response_headers={"Retry-After": "120"},
+        )
+
+        self.assertEqual(result.kind, "rate_limited")
+        self.assertFalse(result.retryable)
+        self.assertEqual(result.retry_after_seconds, 120)
+
+    def test_confirmed_404_is_a_terminal_missing_source(self):
+        result = classify_challenge(
+            title="Not found",
+            html="<html><body>The requested page does not exist.</body></html>",
+            http_status=404,
+        )
+
+        self.assertEqual(result.kind, "missing_source")
+        self.assertTrue(result.terminal)
+        self.assertFalse(result.retryable)
 
 
 class BrowserExtractionTests(unittest.TestCase):
@@ -270,6 +338,26 @@ class ScraplingCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(health["enabled"])
         self.assertEqual(health["reason"], "kill switch disabled")
 
+    async def test_scrapling_navigation_has_an_agency_owned_wall_clock_timeout(self):
+        from app.browser_runtime.adapters.scrapling import ScraplingAdapter, ScraplingSession
+
+        async def never_finishes(*_args, **_kwargs):
+            await asyncio.Future()
+
+        client = type("Client", (), {"fetch": never_finishes})()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = ScraplingSession(
+                engine="scrapling",
+                context_manager=unittest.mock.MagicMock(),
+                client=client,
+                runtime_dir=Path(temp_dir),
+            )
+            with self.assertRaisesRegex(EngineNavigationError, "exceeded 50 ms"):
+                await asyncio.wait_for(
+                    ScraplingAdapter().navigate(session, "https://example.com", timeout_ms=50),
+                    timeout=0.5,
+                )
+
 
 class BrowserDomainPolicyTests(unittest.TestCase):
     def test_history_persists_and_expires_without_stale_lock_in(self):
@@ -294,6 +382,16 @@ class BrowserDomainPolicyTests(unittest.TestCase):
             history = store.get("example.com")
             self.assertEqual(history.engine_successes, {"scrapling": 1})
             self.assertEqual(history.strategy_successes, {"fallback": 1})
+
+    def test_rate_limit_retry_after_extends_cooldown_within_operator_cap(self):
+        now = [100.0]
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+                "os.environ", {"BROWSER_DOMAIN_CHALLENGE_COOLDOWN_SECONDS": "60", "BROWSER_DOMAIN_MAX_COOLDOWN_SECONDS": "300"}, clear=False
+        ):
+            store = DomainPolicyStore(Path(tmp) / "domains.json", clock=lambda: now[0])
+            store.record("example.com", engine="patchright", success=False, challenge="rate_limited", cooldown_seconds=1_000)
+
+            self.assertEqual(store.get("example.com").cooldown_until, 400.0)
 
 
 class BrowserDomainPolicyAsyncTests(unittest.IsolatedAsyncioTestCase):
@@ -516,6 +614,16 @@ class BrowserRuntimeServiceTests(unittest.IsolatedAsyncioTestCase):
             BrowserRuntimeService._storage_entries(state),
             {("https://example.com", "challenge", "cleared")},
         )
+
+    def test_handoff_cookie_identity_includes_the_secret_value_without_exposing_it(self):
+        expected = BrowserRuntimeService._cookie_entries({
+            "cookies": [{"name": "cf_clearance", "value": "earned", "domain": "example.com", "path": "/"}],
+        })
+        substituted = BrowserRuntimeService._cookie_entries({
+            "cookies": [{"name": "cf_clearance", "value": "different", "domain": "example.com", "path": "/"}],
+        })
+
+        self.assertFalse(expected.issubset(substituted))
 
     @patch("app.browser_runtime.service.validate_public_url", return_value="https://example.com")
     async def test_keep_open_returns_controllable_owner_scoped_session(self, _):

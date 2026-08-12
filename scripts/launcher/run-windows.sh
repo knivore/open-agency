@@ -55,6 +55,7 @@ Commands:
   stop       Stop the frontend, backend, Docker services, and public tunnel.
   status     Show Docker services, backend health, port listeners, and frontend env.
   logs       Stream backend and launcher-managed frontend logs.
+  tunnel-reload  Restart only the selected public tunnel without interrupting Agency.
 
 start:
   Starts all services including the FastAPI backend inside Docker so no
@@ -589,6 +590,50 @@ stop_cloudflared() {
 stop_public_tunnel() {
   stop_ngrok || true
   stop_cloudflared || true
+}
+
+reload_public_tunnel() {
+  local public_url=""
+
+  load_dotenv_preserving_cli_tunnel_overrides
+  apply_saved_or_detected_tunnel_preference
+  stop_public_tunnel
+  start_public_tunnel
+
+  public_url="$(public_tunnel_url || true)"
+  if [ -n "${public_url}" ]; then
+    record_public_endpoint_if_present "${public_url}" docker compose exec backend python
+  else
+    clear_public_endpoint docker compose exec backend python
+  fi
+
+  case "$(public_tunnel_provider_mode)" in
+    none)
+      return 0
+      ;;
+    ngrok|cloudflare)
+      [ -n "${public_url}" ]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+tunnel_supervisor_pid_file() {
+  printf '%s\n' "${RUN_DIR}/agency-tunnel-supervisor.pid"
+}
+
+start_tunnel_supervisor() {
+  local pid_file=""
+  pid_file="$(tunnel_supervisor_pid_file)"
+  if pid_is_running "${pid_file}"; then
+    return 0
+  fi
+  rm -f "${pid_file}"
+  nohup "${LAUNCHER_DIR}/tunnel-supervisor.sh" "${LAUNCHER_DIR}/run-windows.sh" \
+    >"${RUN_DIR}/agency-tunnel-supervisor.log" 2>&1 </dev/null &
+  printf '%s\n' "$!" >"${pid_file}"
 }
 
 start_ngrok_tunnel() {
@@ -1131,6 +1176,7 @@ start_background() {
   sync_codex_oauth_to_volume
 
   start_public_tunnel
+  start_tunnel_supervisor
   public_url="$(public_tunnel_url || true)"
   if [ -n "${public_url}" ]; then
     echo "Export AGENCY_PUBLIC_WEBHOOK_BASE_URL as ${public_url}"
@@ -1187,6 +1233,7 @@ stop_all() {
   cd "${ROOT_DIR}"
 
   stop_pid_file "frontend" "${RUN_DIR}/frontend.pid"
+  stop_pid_file "tunnel supervisor" "$(tunnel_supervisor_pid_file)"
   stop_public_tunnel
 
   echo "Stopping Agency containers..."
@@ -1311,6 +1358,9 @@ case "${COMMAND}" in
     ;;
   logs|log)
     stream_logs
+    ;;
+  tunnel-reload)
+    reload_public_tunnel
     ;;
   -h|--help|help)
     usage

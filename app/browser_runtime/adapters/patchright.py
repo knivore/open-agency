@@ -23,10 +23,6 @@ from ..security import validate_public_url
 from .base import EngineNavigationError, EngineUnavailableError
 
 
-_CHROME_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
 _PATCHRIGHT_INTERNAL_INIT_HOST = "patchright-init-script-inject.internal"
 
 
@@ -41,6 +37,7 @@ class PatchrightSession:
     trace_path: Path | None = None
     trace_mode: str = "off"
     last_status: int | None = None
+    last_headers: dict[str, str] | None = None
     closed: bool = False
     crashed: bool = False
     on_close: Callable[[], None] | None = None
@@ -179,6 +176,7 @@ class PatchrightAdapter:
                     pass
 
             context.on("page", lambda new_page: asyncio.create_task(adopt_popup(new_page)))
+            context.on("response", lambda response: self._record_document_response(session, response))
             self._protect_downloads(page)
             if options.trace_mode != "off":
                 await context.tracing.start(screenshots=True, snapshots=True, sources=False)
@@ -198,6 +196,8 @@ class PatchrightAdapter:
             raise
 
     async def navigate(self, session: PatchrightSession, url: str, *, timeout_ms: int) -> dict[str, Any]:
+        session.last_status = None
+        session.last_headers = None
         try:
             goto_task = asyncio.create_task(
                 session.page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
@@ -211,7 +211,8 @@ class PatchrightAdapter:
                 goto_task.add_done_callback(_consume_task_result)
                 raise TimeoutError(f"Browser navigation exceeded {timeout_ms} ms")
             response = goto_task.result()
-            session.last_status = response.status if response else None
+            if response:
+                self._record_document_response(session, response)
             await self._bounded_human_dwell(session.page)
             return {
                 "requested_url": url,
@@ -232,6 +233,31 @@ class PatchrightAdapter:
                 if stopped is not _BOUNDED_FAILURE:
                     diagnostics["trace"] = "trace.zip"
             raise EngineNavigationError(str(exc), diagnostics=diagnostics) from exc
+
+    @staticmethod
+    def _record_document_response(session: PatchrightSession, response: Any) -> None:
+        """Keep the newest top-level response, not an interstitial's first 403.
+
+        Managed challenges often load a 403 document before navigating the
+        same page to content. Frames belonging to CAPTCHA widgets must not
+        overwrite the page's verdict.
+        """
+
+        try:
+            request = response.request
+            if getattr(request, "resource_type", "document") != "document":
+                return
+            frame = getattr(response, "frame", None)
+            main_frame = getattr(session.page, "main_frame", None)
+            if frame is not None and main_frame is not None and frame is not main_frame:
+                return
+            status = response.status
+            session.last_status = status() if callable(status) else status
+            session.last_headers = {str(key): str(value) for key, value in (response.headers or {}).items()}
+        except Exception:
+            # Browser response events are supplemental diagnostics; navigation
+            # remains usable when a compatibility wrapper lacks one attribute.
+            return
 
     async def extract(
             self,
@@ -261,6 +287,7 @@ class PatchrightAdapter:
             final_url=session.page.url,
             http_status=http_status if http_status is not None else session.last_status,
             engine=self.name,
+            response_headers=session.last_headers,
         )
 
     async def recover_challenge(self, session: PatchrightSession, *, budget_ms: int = 8_000) -> bool:
@@ -476,4 +503,3 @@ async def _bounded_result(awaitable: Any, *, timeout: float) -> Any:
         return task.result()
     except (asyncio.CancelledError, Exception):
         return _BOUNDED_FAILURE
-
