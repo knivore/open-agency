@@ -3,7 +3,7 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    BROWSER_RUNTIME_ROOT=/var/lib/agency-browser \
+    BROWSER_RUNTIME_ROOT=/var/lib/open-agency-browser \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 WORKDIR /app
@@ -44,8 +44,8 @@ RUN python -m pip install --upgrade pip && \
     python -m patchright install chromium
 
 RUN useradd --create-home --uid 10001 browser && \
-    mkdir -p /var/lib/agency-browser /ms-playwright && \
-    chown -R browser:browser /var/lib/agency-browser /ms-playwright /home/browser
+    mkdir -p /var/lib/open-agency-browser /ms-playwright && \
+    chown -R browser:browser /var/lib/open-agency-browser /ms-playwright /home/browser
 
 COPY app/__init__.py /app/app/__init__.py
 COPY app/browser_runtime /app/app/browser_runtime
@@ -55,4 +55,3 @@ USER browser
 EXPOSE 8010
 
 CMD ["uvicorn", "app.browser_runtime.server:app", "--host", "0.0.0.0", "--port", "8010", "--no-access-log"]
-

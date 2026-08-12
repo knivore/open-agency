@@ -851,6 +851,12 @@ ensure_browser_runtime_signing_secret() {
   export BROWSER_RUNTIME_SIGNING_SECRET="${browser_secret}"
 }
 
+repair_browser_runtime_volume_permissions() {
+  echo "Preparing browser runtime data volume..."
+  docker compose run --rm --no-deps --user root browser-runtime sh -lc \
+    'mkdir -p /var/lib/open-agency-browser && chown -R 10001:10001 /var/lib/open-agency-browser'
+}
+
 sync_onecli_gateway_ca_to_host() {
   if [ "${ONECLI_ENABLED:-false}" != "true" ]; then
     return 0
@@ -1170,9 +1176,10 @@ start_background() {
   sync_onecli_gateway_ca_to_host || true
 
   if [ "${AGENCY_HOST_BUILD_RUNTIME_IMAGE:-true}" = "true" ]; then
-    echo "Building backend and graph-projector images..."
-    docker compose build backend graph-projector
+    echo "Building backend, browser-runtime, and graph-projector images..."
+    docker compose build backend browser-runtime graph-projector
   fi
+  repair_browser_runtime_volume_permissions
   sync_codex_oauth_to_volume
 
   start_public_tunnel
