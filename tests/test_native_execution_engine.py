@@ -187,6 +187,16 @@ class FakeModelClient:
                 )
             return ModelResponse(content="Artifact created", provider=self.profile.provider, model=self.profile.model,
                                  latency_ms=1)
+        if self.scenario == "finalization_grace":
+            if self.calls <= 2:
+                return ModelResponse(
+                    content="Use tool before finalizing",
+                    tool_calls=[ModelToolCall(id=f"tool-echo-{self.calls}", name="Echo Tool", arguments={"text": "finalize"})],
+                    provider=self.profile.provider,
+                    model=self.profile.model,
+                    latency_ms=1,
+                )
+            return ModelResponse(content="Final answer", provider=self.profile.provider, model=self.profile.model, latency_ms=1)
         if self.scenario == "max_iterations":
             return ModelResponse(
                 content="Use tool again",
@@ -3271,6 +3281,33 @@ class NativeExecutionEngineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.status.value, "failed")
         self.assertIn("Max iterations reached", result.error)
+
+    async def test_tool_call_at_iteration_limit_gets_finalization_turn(self):
+        client = FakeModelClient(self.profile, None, scenario="finalization_grace")
+        self.model_registry.register(
+            "fake",
+            lambda profile, env: client,
+        )
+        tool = ToolDefinition(
+            id="tool-echo",
+            name="Echo Tool",
+            description="Echoes text",
+            input_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+            output_schema={"type": "object"},
+            implementation=ToolImplementationReference(target="tests.native_test_tools", callable_name="echo_tool"),
+            security=_native_test_python_security(),
+            mcp_exposure=MCPExposureSettings(),
+        )
+        workflow = self._workflow(tool=tool, max_iterations=2)
+        await self.runtime_registry.register_workflow(workflow)
+        execution = await self.runtime_registry.create_execution(workflow.id, {}, {"source": "test"})
+
+        result = await self.runtime_registry.start_execution(execution.id)
+
+        self.assertEqual(result.status, ExecutionStatus.COMPLETED)
+        self.assertEqual(result.output_payload["final_output"], "Final answer")
+        self.assertEqual(client.calls, 3)
+        self.assertFalse(client.last_tools)
 
     async def test_event_sequence_validation(self):
         self.model_registry.register("fake", lambda profile, env: FakeModelClient(profile, env, scenario="artifact"))

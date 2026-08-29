@@ -722,7 +722,7 @@ app_tools:
         mandatory: false
         type: "boolean"
         filled_by: "user_or_agent"
-        description: "Keep the resulting page as an owned live session; defaults to true."
+        description: "Keep the resulting page as an owned live session; defaults to false for extraction-only opens. Set true only when a later browser action must reuse the page."
       http_credentials_username:
         mandatory: false
         type: "string"

@@ -107,6 +107,24 @@ class RepoInspectToolTest(unittest.TestCase):
         self.assertTrue(any(hit["path"] == "app/029.py" for hit in result["todo_hits"]))
         self.assertTrue(any(hit["path"] == "app/029.py" for hit in result["query_hits"]))
 
+    def test_inspect_repo_always_returns_focused_file_excerpt(self) -> None:
+        repo = self._create_repo("focused-target")
+        app_dir = repo / "app"
+        target = app_dir / "api" / "physical-devices" / "[deviceId]" / "state" / "route.ts"
+        target.parent.mkdir(parents=True)
+        (repo / "README.md").write_text("TODO: unrelated repository cleanup\n", encoding="utf-8")
+        target.write_text("export const graph = 'stream';\n", encoding="utf-8")
+        self._git(repo, "add", "README.md", "app/api/physical-devices/[deviceId]/state/route.ts")
+        self._git(repo, "commit", "-m", "seed focused target")
+
+        os.environ["SANDBOX_EDIT_ALLOWED_REPOS"] = str(repo)
+        get_settings.cache_clear()
+
+        result = inspect_repo(repo="focused-target", focus_paths=["app/api/physical-devices/[deviceId]/state/route.ts"], max_files=1, max_hits=12)
+
+        self.assertEqual(result["scanned_files"], ["app/api/physical-devices/[deviceId]/state/route.ts"])
+        self.assertEqual([item["path"] for item in result["file_excerpts"]][0], "app/api/physical-devices/[deviceId]/state/route.ts")
+        self.assertIn("export const graph", result["file_excerpts"][0]["excerpt"])
     def _create_repo(self, name: str) -> Path:
         repo = self.temp_dir / name
         repo.mkdir()

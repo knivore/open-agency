@@ -47,7 +47,7 @@ class BrowserRuntimeClient:
             owner: OwnerClaims | dict[str, Any],
             goal: str | None = None,
             extract_mode: ExtractMode = "auto",
-            keep_open: bool = True,
+            keep_open: bool = False,
             session_id: str | None = None,
             allowed_hosts: list[str] | None = None,
             options: BrowserOptions | dict[str, Any] | None = None,

@@ -23,7 +23,13 @@ class BrowserOpenInput(BaseModel):
     extract_mode: Literal["auto", "text", "markdown", "article", "html", "none"] = Field(
         default="auto", description="Extraction mode: auto, text, markdown, article, html, or none."
     )
-    keep_open: bool = Field(default=True, description="Keep a live interactive session after retrieval.")
+    keep_open: bool = Field(
+        default=False,
+        description=(
+            "Keep a live interactive session after retrieval. Set true only when a later browser action "
+            "must reuse this page; extraction-only opens are transient by default."
+        ),
+    )
     http_credentials_username: str | None = Field(default=None, description="Optional HTTP auth username.")
     http_credentials_password: str | None = Field(default=None, description="Optional HTTP auth password.")
     user_agent: str | None = Field(default=None, description="Optional specific user agent to use.")
@@ -212,7 +218,7 @@ def open_browser(
         session_id: str | None = None,
         goal: str | None = None,
         extract_mode: str = "auto",
-        keep_open: bool = True,
+        keep_open: bool = False,
         http_credentials_username: str | None = None,
         http_credentials_password: str | None = None,
         user_agent: str | None = None,

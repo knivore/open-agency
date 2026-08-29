@@ -25,7 +25,8 @@
       },
       "keep_open": {
         "type": "boolean",
-        "default": true
+        "default": false,
+        "description": "Keep a live session only when a later browser action must reuse the page; extraction-only opens are transient by default."
       },
       "url": {
         "type": [

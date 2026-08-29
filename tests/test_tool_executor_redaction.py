@@ -51,6 +51,54 @@ class _ApprovingManager:
 
 
 class ToolExecutorRedactionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tool_executor_normalizes_single_string_for_string_array_input(self) -> None:
+        tool = ToolDefinition(
+            id="repo-inspect",
+            name="inspect_repo",
+            description="Inspect a repository",
+            tool_type=ToolType.PYTHON_FUNCTION,
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "focus_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+            },
+            output_schema={"type": "object"},
+            implementation=ToolImplementationReference(
+                implementation_type="python_function",
+                target="tests.native_test_tools",
+                callable_name="echo_tool",
+            ),
+        )
+        workflow = WorkflowDefinition(
+            id="workflow-repo-inspect-normalization",
+            name="Repo inspect normalization",
+            entrypoint="unused",
+            tool_definitions=[tool],
+        )
+        approval_manager = _ApprovingManager()
+        executor = ToolExecutor(approval_manager)
+        executor.tool_registry.execute = AsyncMock(return_value={"status": "ok"})
+        emitter = _RecordingEmitter()
+        state = NativeExecutionState(execution_id="execution-repo-inspect-normalization", workflow_id=workflow.id)
+
+        await executor.execute(
+            workflow,
+            state,
+            emitter,
+            tool_id="repo-inspect",
+            arguments={"focus_paths": "lib/api/backend/graphStream.ts"},
+        )
+
+        executor.tool_registry.execute.assert_awaited_once()
+        self.assertEqual(
+            executor.tool_registry.execute.await_args.args[1],
+            {"focus_paths": ["lib/api/backend/graphStream.ts"]},
+        )
+
     async def test_tool_executor_redacts_arguments_and_output_before_persistence(self) -> None:
         secret = "typed-password-value"
         tool = ToolDefinition(

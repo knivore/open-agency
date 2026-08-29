@@ -28,6 +28,31 @@ from .executors import (
 from .routing import compact_tool_groups, resolve_tool_groups, tool_catalogue_version
 
 
+def normalize_tool_arguments(tool: ToolDefinition, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Normalize safe scalar shorthand emitted for string-array arguments."""
+    if not isinstance(arguments, dict) or not isinstance(tool.input_schema, dict):
+        return arguments
+
+    properties = tool.input_schema.get("properties")
+    if not isinstance(properties, dict):
+        return arguments
+
+    normalized = dict(arguments)
+    for name, property_schema in properties.items():
+        if not isinstance(property_schema, dict):
+            continue
+        value = arguments.get(name)
+        items_schema = property_schema.get("items")
+        field_type = property_schema.get("type")
+        is_array = field_type == "array" or (
+            isinstance(field_type, list) and "array" in field_type
+        )
+        is_string_item = isinstance(items_schema, dict) and items_schema.get("type") == "string"
+        if is_array and is_string_item and isinstance(value, str):
+            normalized[name] = [value]
+    return normalized
+
+
 class ToolRegistry:
     """Validate tool inputs and route executions to the matching executor implementation."""
 
@@ -114,6 +139,7 @@ class ToolRegistry:
             tool_call_id: str | None = None,
             connector_binding: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        arguments = normalize_tool_arguments(tool, arguments)
         self.validate_input(tool, arguments)
         executor = self._executors.get(tool.tool_type)
         if executor is None:

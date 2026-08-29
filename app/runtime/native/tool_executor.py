@@ -13,7 +13,7 @@ from app.runtime.native.events import ExecutionEventEmitter
 from app.runtime.native.state import NativeExecutionState
 from app.tools.cli_discovery import list_builtin_tool_definitions
 from app.tools.names import tool_matches_call_name
-from app.tools.registry import ToolRegistry
+from app.tools.registry import ToolRegistry, normalize_tool_arguments
 from app.tools.risk import risk_labels_for_tool_definition
 
 
@@ -218,6 +218,7 @@ class ToolExecutor:
             tool_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         tool = self.resolve_tool(workflow, tool_id, tool_name=tool_name)
+        arguments = normalize_tool_arguments(tool, arguments)
         validate(instance=arguments, schema=tool.input_schema or {"type": "object"})
         connector_binding = self._resolve_connector_binding(
             workflow=workflow,

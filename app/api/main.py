@@ -50,6 +50,32 @@ PUBLIC_API_PATHS = {
 DOCUMENTATION_PATHS = {"/docs", "/openapi.json", "/redoc"}
 
 
+async def _recover_stale_local_executions(
+        runtime_context: ApiContext,
+        *,
+        execution_isolation_enabled: bool,
+) -> None:
+    """Restart local runs stranded by a process reload or unexpected shutdown."""
+    if execution_isolation_enabled:
+        return
+
+    active_executions = await runtime_context.execution_store.list_active_executions()
+    for execution in active_executions:
+        metadata = execution.metadata if isinstance(execution.metadata, dict) else {}
+        if execution.container_id or metadata.get("execution_host") == "docker":
+            continue
+        tasks = getattr(runtime_context.control_plane, "_tasks", {})
+        local_task = tasks.get(execution.id) if isinstance(tasks, dict) else None
+        if local_task is not None and not local_task.done():
+            continue
+        repaired = await runtime_context.control_plane.repair_stale_executions(execution_id=execution.id)
+        if not any(item.get("repair_action") == "requeued" for item in repaired):
+            continue
+        try:
+            await runtime_context.control_plane.queue_start(execution.id)
+        except Exception:
+            logger.exception("Failed to restart stale local execution %s", execution.id)
+
 def _is_public_http_request(request: Request) -> bool:
     """Keep only bootstrap, diagnostics, docs, and signed webhooks outside the API auth boundary."""
 
@@ -85,6 +111,7 @@ def create_app(context: ApiContext | None = None) -> FastAPI:
         daily_summary_task: asyncio.Task | None = None
         main_agent_monitor_task: asyncio.Task | None = None
         discord_gateway_listener_task: asyncio.Task | None = None
+        stale_execution_recovery_task: asyncio.Task | None = None
         # Production calls create_app() without injecting a context. Resolve it before
         # seeding so package-owned tool definitions reconcile during normal startup.
         runtime_context = runtime_context or getattr(app.state, "api_context", None) or get_default_api_context()
@@ -132,6 +159,27 @@ def create_app(context: ApiContext | None = None) -> FastAPI:
             logger.exception("Startup execution wait reconciliation failed")
 
         execution_wait_service = ExecutionWaitService(runtime_context)
+
+        try:
+            await _recover_stale_local_executions(
+                runtime_context,
+                execution_isolation_enabled=settings.execution_isolation_enabled,
+            )
+        except Exception:
+            logger.exception("Startup stale local execution recovery failed")
+
+        async def stale_execution_recovery_loop() -> None:
+            while True:
+                await asyncio.sleep(10.0)
+                try:
+                    await _recover_stale_local_executions(
+                        runtime_context,
+                        execution_isolation_enabled=settings.execution_isolation_enabled,
+                    )
+                except Exception:
+                    logger.exception("Stale local execution recovery loop failed")
+
+        stale_execution_recovery_task = asyncio.create_task(stale_execution_recovery_loop())
 
         async def execution_wait_loop() -> None:
             # Durable continuations are required for local and isolated runs, so
@@ -266,6 +314,12 @@ def create_app(context: ApiContext | None = None) -> FastAPI:
                 execution_wait_task.cancel()
                 try:
                     await execution_wait_task
+                except asyncio.CancelledError:
+                    pass
+            if stale_execution_recovery_task is not None:
+                stale_execution_recovery_task.cancel()
+                try:
+                    await stale_execution_recovery_task
                 except asyncio.CancelledError:
                     pass
             if reconcile_task is not None:

@@ -151,6 +151,7 @@ def execute_custom_api(
                 fallback_secret_ref,
             )
             proxies = {"http": proxy_url, "https": proxy_url}
+        # OneCLI proxy presents its own certificate chain for tunneled HTTPS.
         if ca_bundle_path is None:
             ca_bundle_path = settings.onecli_gateway_ca_bundle_path
         resolved_headers = {
@@ -168,19 +169,30 @@ def execute_custom_api(
     # the most actionable denial, but validate the destination before any I/O.
     validate_outbound_http_url(resolved_url, allowed_hosts=settings.parsed_tool_http_allowed_hosts)
 
+    # Discord rejects message content over 2,000 characters. Models can
+    # occasionally miscount escaped JSON content, so split the exact content
+    # at the transport boundary for the channel-message endpoint. This keeps
+    # delivery lossless while preserving the normal one-call behavior for all
+    # other HTTP APIs.
+    discord_chunks = _discord_message_chunks(resolved_url, resolved_method, resolved_body)
+    responses = []
     try:
-        response = requests.request(
-            method=resolved_method,
-            url=resolved_url,
-            headers=resolved_headers,
-            auth=auth,
-            params=resolved_query_params,
-            json=resolved_body,
-            verify=ca_bundle_path or verify_ssl,
-            proxies=proxies,
-            allow_redirects=False,
-            timeout=30,
-        )
+        for request_body in discord_chunks or [resolved_body]:
+            response = requests.request(
+                method=resolved_method,
+                url=resolved_url,
+                headers=resolved_headers,
+                auth=auth,
+                params=resolved_query_params,
+                json=request_body,
+                verify=ca_bundle_path or verify_ssl,
+                proxies=proxies,
+                allow_redirects=False,
+                timeout=30,
+            )
+            responses.append(response)
+            if response.status_code >= 400:
+                break
     except Exception as exc:
         if onecli_metadata is not None and emit_onecli_events:
             fail_closed = resolved_credential_mode == "onecli" and settings.app_env == "production"
@@ -192,9 +204,12 @@ def execute_custom_api(
             )
         raise
 
+    response = responses[-1]
     content_type = response.headers.get("Content-Type", "")
     payload = response.json() if "application/json" in content_type else response.text
     result = {"status_code": response.status_code, "response": payload}
+    if discord_chunks and response.status_code < 400:
+        result["discord_chunks_sent"] = len(responses)
     if onecli_metadata is not None:
         if emit_onecli_events:
             lifecycle_type = (
@@ -211,6 +226,23 @@ def execute_custom_api(
         result["credential_mode"] = "onecli"
         result["onecli"] = onecli_metadata
     return result
+
+
+def _discord_message_chunks(url: str, method: str, body: Any) -> list[dict[str, str]] | None:
+    """Return lossless Discord content chunks when a model overfills a message."""
+    parsed = urlparse(url)
+    if (
+        method != "POST"
+        or parsed.hostname != "discord.com"
+        or not re.fullmatch(r"/api/v\d+/channels/\d+/messages", parsed.path)
+        or not isinstance(body, dict)
+        or set(body) != {"content"}
+        or not isinstance(body.get("content"), str)
+        or len(body["content"]) <= 2000
+    ):
+        return None
+    content = body["content"]
+    return [{"content": content[index:index + 1900]} for index in range(0, len(content), 1900)]
 
 
 def _reject_onecli_direct_credentials(

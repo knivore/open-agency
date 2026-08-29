@@ -1034,10 +1034,12 @@ class AgentExecutor:
             iteration: int,
             model_request_id: str,
             log_prompts: bool,
+            force_empty_tools: bool = False,
             attempt: int = 1,
             retry_after_compaction: bool = False,
     ):
         counted_input_tokens = model_client.count_tokens(messages) or context_health.estimated_prompt_tokens
+        model_tools = tool_payload if tool_payload else ([] if force_empty_tools else None)
         await emitter.emit(
             state,
             ExecutionEventType.LLM_REQUEST_CREATED,
@@ -1071,14 +1073,14 @@ class AgentExecutor:
                 messages,
                 temperature=profile.temperature,
                 max_tokens=profile.max_tokens,
-                tools=tool_payload if tool_payload else None,
+                tools=model_tools,
             )
         return await asyncio.to_thread(
             model_client.generate_text,
             messages,
             temperature=profile.temperature,
             max_tokens=profile.max_tokens,
-            tools=tool_payload if tool_payload else None,
+            tools=model_tools,
         )
 
     @staticmethod
@@ -1310,6 +1312,8 @@ class AgentExecutor:
 
         first_iteration = 1
         structured_output_repair = False
+        finalization_grace = False
+        finalization_prompt_added = False
         continuation = self._approval_continuation(execution, task)
         if continuation is not None:
             persisted_messages = continuation.get("messages")
@@ -1358,10 +1362,12 @@ class AgentExecutor:
             )
             first_iteration = resumed_iteration + 1
 
-        # One schema-only repair turn is allowed beyond the ordinary tool loop.
-        # It receives no tools, preventing a formatting correction from replaying side effects.
+        # Allow one tool-free finalization turn after the ordinary loop uses its
+        # last iteration for a tool call, plus one schema-only repair turn.
+        # Neither turn receives tools, preventing follow-up formatting or finalization
+        # from replaying side effects.
         for iteration in range(first_iteration, max_iterations + 2):
-            if iteration > max_iterations and not structured_output_repair:
+            if iteration > max_iterations and not structured_output_repair and not finalization_grace:
                 break
             self._assert_not_interrupted(state)
             model_request_id = str(uuid4())
@@ -1400,6 +1406,11 @@ class AgentExecutor:
                     failure_reason="compaction_failed",
                 )
 
+            if finalization_grace and not finalization_prompt_added:
+                messages.append(
+                    ModelMessage(role="user", content="The tool budget is exhausted. Write the final structured output now; do not call any tools.")
+                )
+                finalization_prompt_added = True
             try:
                 response = await self._request_model_response(
                     agent=agent,
@@ -1409,11 +1420,12 @@ class AgentExecutor:
                     state=state,
                     emitter=emitter,
                     messages=messages,
-                    tool_payload=[] if structured_output_repair else tool_payload,
+                    tool_payload=[] if structured_output_repair or finalization_grace else tool_payload,
                     context_health=context_health,
                     iteration=iteration,
                     model_request_id=model_request_id,
                     log_prompts=log_prompts,
+                    force_empty_tools=finalization_grace,
                 )
             except Exception as exc:
                 if isinstance(exc, ModelFallbackExhaustedError):
@@ -1465,10 +1477,11 @@ class AgentExecutor:
                     state=state,
                     emitter=emitter,
                     messages=messages,
-                    tool_payload=[] if structured_output_repair else tool_payload,
+                    tool_payload=[] if structured_output_repair or finalization_grace else tool_payload,
                     context_health=context_health,
                     iteration=iteration,
                     model_request_id=model_request_id,
+                    force_empty_tools=finalization_grace,
                     log_prompts=log_prompts,
                     attempt=2,
                     retry_after_compaction=True,
@@ -1616,6 +1629,8 @@ class AgentExecutor:
             )
 
             if response.tool_calls:
+                if finalization_grace:
+                    raise MaxIterationsReachedError(f"Max iterations reached for task '{task.id}'")
                 normalized_tool_calls = [
                     (tool_call, tool_call.id or f"tool-call-{uuid4()}")
                     for tool_call in response.tool_calls
@@ -1635,6 +1650,8 @@ class AgentExecutor:
                         ],
                     )
                 )
+                if iteration >= max_iterations and not structured_output_repair:
+                    finalization_grace = True
                 if response.content:
                     await emitter.emit(
                         state,

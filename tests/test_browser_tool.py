@@ -37,6 +37,7 @@ class BrowserOpenToolTests(unittest.TestCase):
 
         result = open_browser(
             url="https://example.com/path",
+            keep_open=True,
             trace_mode="on",
             record_video=True,
             locale="en-US",
@@ -67,6 +68,29 @@ class BrowserOpenToolTests(unittest.TestCase):
         self.assertEqual(kwargs["runtime_policy"].session_idle_ttl_seconds, 120)
         self.assertEqual(kwargs["runtime_policy"].navigation_timeout_ms, 10_000)
         self.assertEqual(kwargs["runtime_policy"].retry_attempts, 1)
+
+    @patch("app.tools.implementations.browser.get_browser_runtime_client")
+    def test_open_browser_defaults_to_transient_session(self, mock_get_client):
+        mock_client = MagicMock()
+        mock_client.open.return_value = {
+            "version": "agency.browser.v1",
+            "status": "ok",
+            "session_id": None,
+            "interactive": False,
+            "engine": "patchright",
+            "requested_url": "https://example.com/path",
+            "final_url": "https://example.com/path",
+            "title": "Example",
+            "challenge": {"kind": "none"},
+            "extraction": {"mode": "text", "text": "Example content"},
+        }
+        mock_get_client.return_value = mock_client
+
+        result = open_browser(url="https://example.com/path")
+
+        self.assertIsNone(result["session_id"])
+        _, kwargs = mock_client.open.call_args
+        self.assertFalse(kwargs["keep_open"])
 
     @patch("app.tools.implementations.browser.get_browser_runtime_client")
     def test_unified_browser_kill_switch_fails_before_runtime_access(self, runtime_client):

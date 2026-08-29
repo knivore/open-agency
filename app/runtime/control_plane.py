@@ -93,7 +93,8 @@ def onecli_worker_environment(settings) -> dict[str, str]:
     if node_bootstrap_path:
         env["NODE_OPTIONS"] = f"{node_options} --require {node_bootstrap_path}".strip()
         env["ONECLI_NODE_PROXY_BOOTSTRAP_PATH"] = node_bootstrap_path
-    if settings.onecli_gateway_ca_bundle_path:
+    # Only HTTPS gateways need their private CA injected into worker clients.
+    if settings.onecli_gateway_ca_bundle_path and settings.onecli_gateway_url.lower().startswith("https://"):
         ca_path = settings.onecli_gateway_ca_bundle_container_path
         env.update(
             {

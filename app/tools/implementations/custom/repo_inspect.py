@@ -90,6 +90,7 @@ TEXT_FILE_SUFFIXES = {
     ".yml",
 }
 TODO_MARKERS = ("TODO", "FIXME", "HACK", "XXX", "BUG")
+STATUS_PREVIEW_LIMIT = 80
 
 
 def inspect_repo(
@@ -142,13 +143,19 @@ def inspect_repo(
         for relative_path in excerpt_paths
     ]
 
+    status_short = _git_lines(repo_path, "status", "--short", "--branch")
     return {
         "status": "ok",
         "repo_id": repo_id,
         "repo_path": str(repo_path),
         "branch": _git_stdout(repo_path, "branch", "--show-current"),
         "head_commit": _git_stdout(repo_path, "rev-parse", "HEAD"),
-        "status_short": _git_lines(repo_path, "status", "--short", "--branch"),
+        # A dirty checkout can contain hundreds of generated or unrelated changes.
+        # Keep the inspection result useful to the model without allowing git status
+        # to crowd the actual source excerpts out of the context window.
+        "status_short": status_short[:STATUS_PREVIEW_LIMIT],
+        "status_short_total": len(status_short),
+        "status_short_truncated": len(status_short) > STATUS_PREVIEW_LIMIT,
         "recent_commits": _recent_commits(repo_path),
         "tracked_file_count": len(tracked_files),
         "untracked_file_count": len(untracked_files),
@@ -287,11 +294,11 @@ def _filter_repo_files(
 
 def _prioritize_files(files: list[str], *, focus_paths: list[str], query: str | None) -> list[str]:
     query_lower = (query or "").strip().lower()
-    focus_patterns = [pattern.strip() for pattern in focus_paths if pattern.strip()]
+    focus_patterns = [pattern.strip().replace("\\", "/") for pattern in focus_paths if pattern.strip()]
 
     def score(path: str) -> tuple[int, str]:
         value = 0
-        if any(fnmatch.fnmatch(path, pattern) for pattern in focus_patterns):
+        if any(path == pattern or fnmatch.fnmatch(path, pattern) for pattern in focus_patterns):
             value += 100
         if any(fnmatch.fnmatch(path, pattern) for pattern in DEFAULT_PRIORITY_FILES):
             value += 25
@@ -342,18 +349,21 @@ def _excerpt_paths(
 ) -> list[str]:
     ordered: list[str] = []
     seen: set[str] = set()
-    for item in [*query_hits, *todo_hits]:
-        path = str(item.get("path") or "")
-        if path and path not in seen:
-            seen.add(path)
-            ordered.append(path)
+    # Always return the files the caller explicitly asked to scan first. A focused
+    # inspection must contain its target even when unrelated TODOs were found in
+    # files elsewhere in the repository.
     for path in scan_files:
         if path in seen:
             continue
         seen.add(path)
         ordered.append(path)
         if len(ordered) >= 6:
-            break
+            return ordered
+    for item in [*query_hits, *todo_hits]:
+        path = str(item.get("path") or "")
+        if path and path not in seen:
+            seen.add(path)
+            ordered.append(path)
     return ordered[:6]
 
 

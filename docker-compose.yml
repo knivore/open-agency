@@ -71,8 +71,6 @@ services:
       ONECLI_API_URL: ${AGENCY_BACKEND_ONECLI_API_URL:-http://onecli:10254}
       ONECLI_GATEWAY_URL: ${AGENCY_BACKEND_ONECLI_GATEWAY_URL:-http://onecli:10255}
       ONECLI_GATEWAY_CA_BUNDLE_PATH: ${AGENCY_BACKEND_ONECLI_GATEWAY_CA_BUNDLE_PATH:-/app/data/onecli/gateway/ca.pem}
-      SSL_CERT_FILE: ${AGENCY_BACKEND_ONECLI_GATEWAY_CA_BUNDLE_PATH:-/app/data/onecli/gateway/ca.pem}
-      REQUESTS_CA_BUNDLE: ${AGENCY_BACKEND_ONECLI_GATEWAY_CA_BUNDLE_PATH:-/app/data/onecli/gateway/ca.pem}
       ONECLI_AGENT_TOKEN_SECRET_REF: ${ONECLI_AGENT_TOKEN_SECRET_REF:-}
       ONECLI_AGENT_TOKEN: ${ONECLI_AGENT_TOKEN:-}
       # The backend uses this owner-independent key only for read-only setup verification.
