@@ -7778,7 +7778,19 @@ class ConversationService:
                             "tool_count": len(tool_payload),
                         },
                     )
-                    if model_profile.supports_streaming and hasattr(client, "stream_generate_text"):
+                    # Codex authentication reads the async provider repository, so keep
+                    # that client on the request loop instead of invoking its sync stream
+                    # bridge from a worker thread and binding the repository to a new loop.
+                    uses_async_codex_generation = (
+                        str(getattr(client, "provider_key", "")).strip().lower().replace("-", "_")
+                        == "openai_codex"
+                        and hasattr(client, "agenerate_text")
+                    )
+                    if (
+                            model_profile.supports_streaming
+                            and hasattr(client, "stream_generate_text")
+                            and not uses_async_codex_generation
+                    ):
                         response, streamed_text = await self._stream_direct_reply_model_response(
                             client=client,
                             messages=messages,

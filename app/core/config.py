@@ -203,6 +203,92 @@ class Settings(BaseSettings):
         alias="MAIN_AGENT_WORKFLOW_MUTATION_ENABLED",
     )
     main_agent_tool_mutation_enabled: bool = Field(default=True, alias="MAIN_AGENT_TOOL_MUTATION_ENABLED")
+    # Router controls are opt-in and bounded so a missing rollout configuration
+    # keeps the legacy main-agent path available while still supporting routing.
+    main_agent_router_enabled: bool = Field(default=False, alias="MAIN_AGENT_ROUTER_ENABLED")
+    main_agent_router_shadow_mode: bool = Field(default=True, alias="MAIN_AGENT_ROUTER_SHADOW_MODE")
+    main_agent_router_model_profile_id: str | None = Field(default=None, alias="MAIN_AGENT_ROUTER_MODEL_PROFILE_ID")
+    main_agent_router_timeout_ms: int = Field(default=3000, ge=100, le=30000, alias="MAIN_AGENT_ROUTER_TIMEOUT_MS")
+    main_agent_router_min_confidence: float = Field(
+        default=0.70,
+        ge=0.0,
+        le=1.0,
+        alias="MAIN_AGENT_ROUTER_MIN_CONFIDENCE",
+    )
+    main_agent_router_max_tool_groups: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        alias="MAIN_AGENT_ROUTER_MAX_TOOL_GROUPS",
+    )
+    main_agent_router_max_tool_iterations: int = Field(
+        default=4,
+        ge=1,
+        le=20,
+        alias="MAIN_AGENT_ROUTER_MAX_TOOL_ITERATIONS",
+    )
+    main_agent_router_max_token_budget: int = Field(
+        default=8192,
+        ge=128,
+        le=200000,
+        alias="MAIN_AGENT_ROUTER_MAX_TOKEN_BUDGET",
+    )
+    main_agent_router_direct_response_enabled: bool = Field(
+        default=False,
+        alias="MAIN_AGENT_ROUTER_DIRECT_RESPONSE_ENABLED",
+    )
+    main_agent_router_selective_write_tools_enabled: bool = Field(
+        default=False,
+        alias="MAIN_AGENT_ROUTER_SELECTIVE_WRITE_TOOLS_ENABLED",
+    )
+    main_agent_router_safe_fallback_groups: str = Field(
+        default="",
+        alias="MAIN_AGENT_ROUTER_SAFE_FALLBACK_GROUPS",
+    )
+    main_agent_router_cache_enabled: bool = Field(default=True, alias="MAIN_AGENT_ROUTER_CACHE_ENABLED")
+    main_agent_router_cache_ttl_seconds: int = Field(
+        default=300,
+        ge=1,
+        le=86400,
+        alias="MAIN_AGENT_ROUTER_CACHE_TTL_SECONDS",
+    )
+    main_agent_router_cache_max_entries: int = Field(
+        default=1024,
+        ge=1,
+        le=100000,
+        alias="MAIN_AGENT_ROUTER_CACHE_MAX_ENTRIES",
+    )
+    main_agent_router_rollout_percent: int = Field(
+        default=100,
+        ge=0,
+        le=100,
+        alias="MAIN_AGENT_ROUTER_ROLLOUT_PERCENT",
+    )
+    main_agent_router_user_allowlist: str = Field(default="", alias="MAIN_AGENT_ROUTER_USER_ALLOWLIST")
+    main_agent_router_specialist_enabled: bool = Field(
+        default=False,
+        alias="MAIN_AGENT_ROUTER_SPECIALIST_ENABLED",
+    )
+    main_agent_router_recent_message_limit: int = Field(
+        default=12,
+        ge=2,
+        le=100,
+        alias="MAIN_AGENT_ROUTER_RECENT_MESSAGE_LIMIT",
+    )
+    main_agent_router_context_token_budget: int = Field(
+        default=4000,
+        ge=128,
+        le=100000,
+        alias="MAIN_AGENT_ROUTER_CONTEXT_TOKEN_BUDGET",
+    )
+    main_agent_router_fast_path_enabled: bool = Field(
+        default=True,
+        alias="MAIN_AGENT_ROUTER_FAST_PATH_ENABLED",
+    )
+    main_agent_router_fast_path_rules: str = Field(
+        default="greeting,acknowledgement,previous_response_edit,continuation",
+        alias="MAIN_AGENT_ROUTER_FAST_PATH_RULES",
+    )
     main_agent_external_channel_daily_message_budget: int = Field(
         default=100,
         alias="MAIN_AGENT_EXTERNAL_CHANNEL_DAILY_MESSAGE_BUDGET",
