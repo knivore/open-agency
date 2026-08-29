@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import requests
+import re
+import json
 from pydantic import BaseModel, Field
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -10,7 +12,7 @@ from app.core.config import get_settings
 from app.core.outbound_http import validate_outbound_http_url
 from app.core.onecli_http import ONECLI_BLOCKED_HEADER_NAMES, ONECLI_BLOCKED_QUERY_PARAM_NAMES
 from app.integrations.onecli import build_onecli_proxy_url
-from app.tools.input_mapping import convert_str_to_dict, interpolate
+from app.tools.input_mapping import convert_str_to_dict
 
 ONECLI_CORRELATION_HEADER_NAMES = {
     "X-Agency-OneCLI-Correlation-ID",
@@ -21,6 +23,44 @@ ONECLI_CORRELATION_HEADER_NAMES = {
     "X-Agency-Agent-ID",
     "X-Agency-Tool-Call-ID",
 }
+
+_KNOWN_TEMPLATE_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]+\])?)\}")
+
+
+def _interpolate_http_value(value: Any, context: dict[str, Any]) -> Any:
+    """Replace known connector placeholders without treating literal JSON as a template."""
+    if isinstance(value, str):
+        def replace(match: re.Match[str]) -> str:
+            token = match.group(1)
+            if token in context:
+                return str(context[token])
+            if token.startswith("target_scope[") and token.endswith("]"):
+                key = token[len("target_scope["):-1].strip("'\"")
+                target_scope = context.get("target_scope")
+                if isinstance(target_scope, dict) and key in target_scope:
+                    return str(target_scope[key])
+            return match.group(0)
+
+        return _KNOWN_TEMPLATE_PATTERN.sub(replace, value)
+    if isinstance(value, dict):
+        return {key: _interpolate_http_value(item, context) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_interpolate_http_value(item, context) for item in value]
+    return value
+
+
+def _coerce_json_body(value: Any) -> Any:
+    """Accept model-produced JSON strings while leaving ordinary text bodies unchanged."""
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped.startswith(("{", "[")):
+        return value
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return value
+    return parsed if isinstance(parsed, (dict, list)) else value
 
 
 class CustomAPIInput(BaseModel):
@@ -61,22 +101,15 @@ def execute_custom_api(
         )
     interpolation_context = {**kwargs, **trusted_context}
 
-    resolved_url = interpolate(str(url).rstrip("/"), interpolation_context)
+    resolved_url = _interpolate_http_value(str(url).rstrip("/"), interpolation_context)
     resolved_method = method.upper()
     resolved_headers = {**convert_str_to_dict(headers or {}), **convert_str_to_dict(kwargs.get("headers") or {})}
-    resolved_headers = interpolate(resolved_headers, interpolation_context)
-    resolved_query_params = interpolate(
+    resolved_headers = _interpolate_http_value(resolved_headers, interpolation_context)
+    resolved_query_params = _interpolate_http_value(
         {**(query_params or {}), **(kwargs.get("query_params") or {})},
         interpolation_context,
     )
-    resolved_body = body
-    if isinstance(resolved_body, list):
-        resolved_body = [
-            {key: interpolate(value, interpolation_context) for key, value in item.items()}
-            for item in resolved_body
-        ]
-    else:
-        resolved_body = interpolate(resolved_body, interpolation_context)
+    resolved_body = _interpolate_http_value(_coerce_json_body(body), interpolation_context)
 
     settings = get_settings()
     resolved_credential_mode = str(credential_mode or "").strip().lower()

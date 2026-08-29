@@ -60,6 +60,12 @@ class Settings(BaseSettings):
     agency_expected_optional_modules: str = Field(default="", alias="AGENCY_EXPECTED_OPTIONAL_MODULES")
     workflow_scheduler_enabled: bool = Field(default=False, alias="WORKFLOW_SCHEDULER_ENABLED")
     workflow_scheduler_interval_seconds: int = Field(default=30, alias="WORKFLOW_SCHEDULER_INTERVAL_SECONDS")
+    # Durable waits are checked independently of the workflow scheduler so a
+    # resumed execution does not need to wait for the scheduler's cadence.
+    execution_wait_poll_interval_seconds: float = Field(
+        default=1.0,
+        alias="EXECUTION_WAIT_POLL_INTERVAL_SECONDS",
+    )
     workflow_restart_active_executions_on_revision_change: bool = Field(
         default=False,
         alias="WORKFLOW_RESTART_ACTIVE_EXECUTIONS_ON_REVISION_CHANGE",
@@ -261,6 +267,12 @@ class Settings(BaseSettings):
         alias="AGENT_CONTEXT_COMPACTION_PERSIST_CONTEXT_PACK_DEFAULT",
     )
     llm_request_timeout_seconds: float = Field(default=15.0, alias="LLM_REQUEST_TIMEOUT_SECONDS")
+    # Local Ollama/OpenAI-compatible endpoints are intentionally opt-in by
+    # host, keeping provider URL validation fail-closed for arbitrary hosts.
+    model_provider_allowed_hosts: str = Field(
+        default="host.docker.internal",
+        alias="MODEL_PROVIDER_ALLOWED_HOSTS",
+    )
     codex_cli_timeout_seconds: int = Field(default=1800, alias="CODEX_CLI_TIMEOUT_SECONDS")
     memory_vector_retrieval_enabled: bool = Field(default=True, alias="MEMORY_VECTOR_RETRIEVAL_ENABLED")
     memory_embedding_model_profile_id: str | None = Field(default=None, alias="MEMORY_EMBEDDING_MODEL_PROFILE_ID")
@@ -398,6 +410,16 @@ class Settings(BaseSettings):
         alias="ONECLI_GATEWAY_CA_BUNDLE_CONTAINER_PATH",
     )
     onecli_agent_token_secret_ref: str | None = Field(default=None, alias="ONECLI_AGENT_TOKEN_SECRET_REF")
+    # Keep setup-session expiry configurable so connector setup can calculate a
+    # bounded verification window without relying on an undeclared setting.
+    onecli_setup_session_ttl_seconds: int = Field(
+        default=1800,
+        alias="ONECLI_SETUP_SESSION_TTL_SECONDS",
+    )
+    onecli_control_api_key_secret_ref: str | None = Field(
+        default=None,
+        alias="ONECLI_CONTROL_API_KEY_SECRET_REF",
+    )
     onecli_force_for_http_tools: bool = Field(default=False, alias="ONECLI_FORCE_FOR_HTTP_TOOLS")
     onecli_force_for_isolated_workers: bool = Field(default=False, alias="ONECLI_FORCE_FOR_ISOLATED_WORKERS")
     onecli_allow_global_agent_token_fallback: bool = Field(
@@ -493,6 +515,10 @@ class Settings(BaseSettings):
         return [item.strip().lower() for item in self.tool_http_allowed_hosts.split(",") if item.strip()]
 
     @property
+    def parsed_model_provider_allowed_hosts(self) -> list[str]:
+        return [item.strip().lower() for item in self.model_provider_allowed_hosts.split(",") if item.strip()]
+
+    @property
     def parsed_agency_allowed_origins(self) -> list[str]:
         return [_normalize_origin(item) for item in self.agency_allowed_origins.split(",") if item.strip()]
 
@@ -524,6 +550,7 @@ class Settings(BaseSettings):
             "gateway_ca_bundle_configured": bool(self.onecli_gateway_ca_bundle_path),
             "gateway_ca_bundle_container_path": self.onecli_gateway_ca_bundle_container_path,
             "agent_token_secret_ref_configured": bool(self.onecli_agent_token_secret_ref),
+            "control_api_key_secret_ref_configured": bool(self.onecli_control_api_key_secret_ref),
             "force_for_http_tools": self.onecli_force_for_http_tools,
             "force_for_isolated_workers": self.onecli_force_for_isolated_workers,
             "allow_global_agent_token_fallback": self.onecli_allow_global_agent_token_fallback,
@@ -613,6 +640,8 @@ class Settings(BaseSettings):
             raise RuntimeError("PERSONA_FACTORY_LLM_RETRY_ATTEMPTS must be zero or greater")
         if self.workflow_scheduler_interval_seconds <= 0:
             raise RuntimeError("WORKFLOW_SCHEDULER_INTERVAL_SECONDS must be greater than zero")
+        if self.execution_wait_poll_interval_seconds <= 0:
+            raise RuntimeError("EXECUTION_WAIT_POLL_INTERVAL_SECONDS must be greater than zero")
         if self.memory_daily_summary_target_hour < 0 or self.memory_daily_summary_target_hour > 23:
             raise RuntimeError("MEMORY_DAILY_SUMMARY_TARGET_HOUR must be between 0 and 23")
         if self.memory_daily_summary_target_minute < 0 or self.memory_daily_summary_target_minute > 59:

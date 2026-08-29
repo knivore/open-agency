@@ -9,7 +9,7 @@ from urllib.parse import urlparse, urlunparse
 
 from app.core.config import get_settings
 from app.domain import ModelProfileDefinition
-from app.llm.base import ModelMessage, ModelResponse
+from app.llm.base import ModelMessage, ModelResponse, ModelToolCall
 from app.llm.registry import LLMEnvironmentConfig
 
 
@@ -56,13 +56,20 @@ class OllamaModelClient:
             max_tokens: Optional[int],
             stream: bool,
             format_schema: Optional[Dict[str, Any]] = None,
+            tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "model": self.profile.model,
-            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "messages": self._to_ollama_messages(messages),
             "stream": stream,
             "options": {},
         }
+        # Ollama's chat API accepts the same function-tool shape used by the
+        # OpenAI-compatible adapters. Preserve tool calls/results across turns
+        # so local models can actually invoke Agency tools instead of emitting
+        # textual pseudo-calls.
+        if tools:
+            payload["tools"] = tools
         if temperature is not None or self.profile.temperature is not None:
             payload["options"]["temperature"] = temperature if temperature is not None else self.profile.temperature
         if max_tokens is not None or self.profile.max_tokens is not None:
@@ -74,6 +81,31 @@ class OllamaModelClient:
             think = self.profile.parameters.get("enable_thinking")
         if think is not None:
             payload["think"] = bool(think)
+        return payload
+
+    @staticmethod
+    def _to_ollama_messages(messages: List[ModelMessage]) -> List[Dict[str, Any]]:
+        payload: List[Dict[str, Any]] = []
+        for message in messages:
+            item: Dict[str, Any] = {
+                "role": message.role,
+                "content": message.content,
+            }
+            if message.name:
+                item["name"] = message.name
+            if message.tool_call_id:
+                item["tool_call_id"] = message.tool_call_id
+            if message.tool_calls:
+                item["tool_calls"] = [
+                    {
+                        "function": {
+                            "name": tool_call.name,
+                            "arguments": tool_call.arguments or {},
+                        }
+                    }
+                    for tool_call in message.tool_calls
+                ]
+            payload.append(item)
         return payload
 
     def generate_text(
@@ -94,15 +126,37 @@ class OllamaModelClient:
                 max_tokens=max_tokens,
                 stream=False,
                 format_schema=format_schema,
+                tools=kwargs.get("tools"),
             ),
             timeout=self.timeout_seconds,
             trust_env=False,
         )
         response.raise_for_status()
         data = response.json()
+        message = data.get("message", {})
+        tool_calls: List[ModelToolCall] = []
+        for index, tool_call in enumerate(message.get("tool_calls", []) or []):
+            function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+            name = function.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            arguments = function.get("arguments", {})
+            if not isinstance(arguments, dict):
+                try:
+                    arguments = json.loads(arguments)
+                except (TypeError, json.JSONDecodeError):
+                    arguments = {"raw": str(arguments)}
+            tool_calls.append(
+                ModelToolCall(
+                    id=str(tool_call.get("id") or f"ollama-call-{index}"),
+                    name=name,
+                    arguments=arguments,
+                    raw=tool_call,
+                )
+            )
         return ModelResponse(
-            content=data.get("message", {}).get("content"),
-            tool_calls=[],
+            content=message.get("content"),
+            tool_calls=tool_calls,
             usage={},
             raw_response=data,
             provider=self.profile.provider,
@@ -119,12 +173,15 @@ class OllamaModelClient:
             max_tokens: Optional[int] = None,
             **kwargs: Any,
     ) -> ModelResponse:
+        request_kwargs = dict(kwargs)
+        tools = request_kwargs.pop("tools", None)
         response = self.generate_text(
             messages,
             temperature=temperature,
             max_tokens=max_tokens,
             format=schema,
-            **kwargs,
+            tools=tools,
+            **request_kwargs,
         )
         if isinstance(response.raw_response, dict):
             content = response.raw_response.get("message", {}).get("content")
